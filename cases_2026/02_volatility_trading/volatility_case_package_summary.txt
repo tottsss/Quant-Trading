@@ -1,0 +1,49 @@
+RITC 2026 — Volatility Trading Case (Case Package Summary)
+
+Source: RITC 2026 Case Package (Rotman FRT-Lab). Paraphrased summary for team use.
+
+1) Big picture
+- Trade RTM ETF options to exploit volatility mispricing.
+- Focus on delta-hedged strategies within delta limits.
+
+2) Structure / timing
+- 2 heats; each heat has 8 sub-heats.
+- Sub-heat: 5 minutes, representing 1 month (20 trading days).
+- RIT API + RTD enabled.
+
+3) Instruments
+- Underlying: RTM ETF (non-dividend).
+- Options: European calls/puts at strikes 45–54 (10 strikes; 20 contracts total).
+
+4) Market dynamics
+- Market maker quotes 2-cent spreads; large liquidity.
+- RTM follows random walk: P_t = P_{t-1} * (1 + r_t), r_t ~ N(0, sigma).
+- Options priced with Black-Scholes and zero variance risk premium.
+- Analysts provide realized vol updates; market maker may lag.
+
+5) Delta limits and penalties
+- Delta limit and penalty rate announced via news each sub-heat.
+- Penalty per second when |delta| exceeds limit:
+  (|delta| - delta_limit) * rate
+
+6) Limits / fees
+- RTM ETF: gross 50,000 shares; net 50,000 shares; max trade size 10,000 shares.
+- Options: gross 2,500 contracts; net 1,000 contracts; max trade size 100 contracts.
+- Fees: $0.01 per RTM share; $1.00 per option contract.
+- Each option contract represents 100 shares.
+
+7) Close-out
+- RTM closed at last traded price at end of sub-heat.
+- Options cash-settled at expiration: Call max(0, S-K); Put max(0, K-S).
+
+8) Objectives (paraphrased)
+- Forecast volatility from news; identify mispriced options.
+- Use Greeks to manage exposure and hedge delta.
+
+Assessment / Scoring (competition-wide)
+- Case weights: Liquidity Risk 20%, Volatility Trading 20%, GBE Electricity 20%, Merger Arbitrage 20%, Algo Market Making 20%.
+- Liquidity / Volatility / Merger: team P&Ls summed per sub-heat, ranked, then average rank -> case rank.
+- GBE Electricity: team members' P&Ls summed per sub-heat, ranked, then average rank -> case rank.
+- Algo MM: only one team member trades; heat ranks averaged -> case rank.
+- Case ranks map to points (higher is better). Final weighted score ranks teams.
+- Ties are broken by variance of case scores (lower variance wins). Top 5 cash awards.

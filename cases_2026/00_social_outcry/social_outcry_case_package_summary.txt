@@ -1,0 +1,39 @@
+RITC 2026 — Social Outcry Case (Case Package Summary)
+
+Source: RITC 2026 Case Package (Rotman FRT-Lab). Paraphrased summary for team use.
+
+1) Big picture
+- Open-outcry futures trading to break the ice; manual trading.
+- This case does NOT count toward final competition scoring.
+
+2) Structure / timing
+- One 30-minute trading heat.
+- Participants start with a neutral futures position.
+
+3) Market dynamics
+- Instrument: RT100 index futures.
+- Futures price set by transactions; spot price follows a stochastic path influenced by qualitative news.
+- News can move spot immediately or with lags.
+
+4) Limits / fees
+- Max 5 contracts per ticket.
+- Contract multiplier: 10.
+- No commissions; no net position limits.
+
+5) Settlement and scoring (case only)
+- All trades settle at the closing spot price.
+- P&L ranking based on total session P&L.
+
+6) Rules / conduct
+- Verbal commitments are binding.
+- Tickets must be complete, legible, and delivered (white copy) to market agents.
+- English only; staff can break unreasonable trades.
+- Brief tutorial/demo before the session.
+
+Assessment / Scoring (competition-wide)
+- Case weights: Liquidity Risk 20%, Volatility Trading 20%, GBE Electricity 20%, Merger Arbitrage 20%, Algo Market Making 20%.
+- Liquidity / Volatility / Merger: team P&Ls summed per sub-heat, ranked, then average rank -> case rank.
+- GBE Electricity: team members' P&Ls summed per sub-heat, ranked, then average rank -> case rank.
+- Algo MM: only one team member trades; heat ranks averaged -> case rank.
+- Case ranks map to points (higher is better). Final weighted score ranks teams.
+- Ties are broken by variance of case scores (lower variance wins). Top 5 cash awards.

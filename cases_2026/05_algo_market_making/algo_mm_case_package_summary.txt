@@ -1,0 +1,42 @@
+RITC 2026 — Algorithmic Market Making Case (Case Package Summary)
+
+Source: RITC 2026 Case Package (Rotman FRT-Lab). Paraphrased summary for team use.
+
+1) Big picture
+- Algorithmic market making in four stocks under position limits.
+- Provide liquidity, manage inventory risk, and adapt to news-driven volatility.
+
+2) Structure / timing
+- 12 heats; 1 team member trades all heats.
+- Each heat: 5 minutes, representing one trading week (5 days).
+- Algorithmic trading only; no manual trading during heats.
+- 2 minutes between heats to reload algorithm.
+- RIT API + RTD enabled.
+
+3) Instruments
+- Stocks: SPNG, SMMR, ATMN, WNTR (CAD), start price $25 each.
+- Market order fee: $0.02 per share.
+- Passive rebates: SPNG 0.01; SMMR 0.02; ATMN 0.015; WNTR 0.025.
+- Max order size: 10,000 shares.
+
+4) Aggregate position limit
+- Limit announced at start of each heat.
+- Penalty: $10 per share above limit, assessed each minute.
+
+5) Additional trading limits
+- Gross / net position limits apply; penalty $5 per share for exceeding.
+
+6) Close-out
+- All positions closed at end of heat at last traded price.
+
+7) Objectives (paraphrased)
+- Quote both sides to earn spread while avoiding excessive inventory.
+- Manage aggregate exposure and flatten near limits.
+
+Assessment / Scoring (competition-wide)
+- Case weights: Liquidity Risk 20%, Volatility Trading 20%, GBE Electricity 20%, Merger Arbitrage 20%, Algo Market Making 20%.
+- Liquidity / Volatility / Merger: team P&Ls summed per sub-heat, ranked, then average rank -> case rank.
+- GBE Electricity: team members' P&Ls summed per sub-heat, ranked, then average rank -> case rank.
+- Algo MM: only one team member trades; heat ranks averaged -> case rank.
+- Case ranks map to points (higher is better). Final weighted score ranks teams.
+- Ties are broken by variance of case scores (lower variance wins). Top 5 cash awards.

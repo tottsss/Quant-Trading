@@ -1,0 +1,56 @@
+RITC 2026 — GBE Energy Electricity Trading Case (Case Package Summary)
+
+Source: RITC 2026 Case Package (Rotman FRT-Lab). Paraphrased summary for team use.
+
+1) Big picture
+- Role-based team case in a regulated electricity market.
+- Produce, distribute, and trade electricity while managing penalties.
+
+2) Structure / timing
+- 2 heats; each heat has 4 sub-heats.
+- Sub-heat: 15 minutes, representing 5 trading days (first week of August).
+- RIT API order submission disabled; RTD enabled.
+- Roles: Producer (1), Distributor (1), Traders (2).
+
+3) Markets and instruments
+- ELEC-dayX (spot): 100 MWh per contract, day-specific.
+- ELEC-F (forward): 500 MWh per contract, delivers next day.
+- NG (natural gas): 100 MMBtu per contract; Producers only.
+
+4) Production and demand models
+- Solar output (contracts): ELEC_solar = 6 * hours_of_sunshine. No cost.
+- Gas conversion: 800 MMBtu -> 100 MWh (8 NG -> 1 ELEC-dayX).
+- Distributor demand (contracts):
+  Demand = 200 - 15*AT + 0.8*AT^2 - 0.01*AT^3
+  AT = expected average temperature (C).
+- Weather forecasts update 3x per day; final evening update is accurate.
+
+5) Regulatory spot market (RAE)
+- RAE sets spot price + volumes for ELEC-dayX; two bulletins per day.
+- Spot volume is limited; forward market preferred for risk control.
+
+6) Penalties
+- Disposal penalty: $20,000 per contract for excess electricity at end of day.
+- Distributor shortfall penalty: $20,000 per contract of unmet demand.
+
+7) Limits / fees
+- Max trade size: ELEC-F 10 contracts; NG 80 contracts.
+- Max net positions: ELEC-dayX 300; NG 80 (Producer); ELEC-F 60.
+- No transaction costs for ELEC-F and NG; ELEC-F quotes are integer prices.
+
+8) Close-out
+- ELEC-day2..day5: closed at $0; $20,000 penalty per contract for long or short.
+- ELEC-day6: closed at final RAE price on day 5; no fines.
+
+9) Objectives (paraphrased)
+- Model supply/demand from news and coordinate across roles.
+- Optimize production, procurement, and tender response as a team.
+- Practice sessions require enough participants to be realistic.
+
+Assessment / Scoring (competition-wide)
+- Case weights: Liquidity Risk 20%, Volatility Trading 20%, GBE Electricity 20%, Merger Arbitrage 20%, Algo Market Making 20%.
+- Liquidity / Volatility / Merger: team P&Ls summed per sub-heat, ranked, then average rank -> case rank.
+- GBE Electricity: team members' P&Ls summed per sub-heat, ranked, then average rank -> case rank.
+- Algo MM: only one team member trades; heat ranks averaged -> case rank.
+- Case ranks map to points (higher is better). Final weighted score ranks teams.
+- Ties are broken by variance of case scores (lower variance wins). Top 5 cash awards.

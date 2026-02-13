@@ -1,0 +1,50 @@
+RITC 2026 — Liquidity Risk Case (Case Package Summary)
+
+Source: RITC 2026 Case Package (Rotman FRT-Lab). Paraphrased summary for team use.
+
+1) Big picture
+- Evaluate tender offers under liquidity risk; monetize tender vs market price gaps.
+- Penalizes speculative/front-running trades; focus is tender evaluation and risk-managed unwind.
+
+2) Structure / timing
+- 2 heats; each heat has 5 sub-heats.
+- Sub-heat: 10 minutes, representing 1 month (20 trading days).
+- RIT API + RTD enabled.
+
+3) Tender types
+- Private tenders: routed to one participant; fixed price + quantity.
+- Competitive auction: everyone submits a price; any price better than hidden reserve fills.
+- Winner-take-all: best price wins if it beats hidden reserve.
+
+4) Sub-heat parameters (security, start price, commission, tender window, vol, liquidity)
+- Sub-heat 1: RITC $50 (0.02, 30s, low vol, medium liq); COMP $40 (0.02, 30s, medium vol, high liq)
+- Sub-heat 2: TRNT $15 (0.01, 30s, high vol, medium liq); MTRL $30 (0.01, 30s, low vol, low liq)
+- Sub-heat 3: BLU $10 (0.04, 30s, high vol, high liq); RED $25 (0.03, 30s, low vol, medium liq); GRN $30 (0.02, 30s, medium vol, medium liq)
+- Sub-heat 4: WDY $12 (0.02, 20s, medium vol, high liq); BZZ $18 (0.02, 20s, high vol, medium liq); BNN $24 (0.03, 20s, medium vol, medium liq)
+- Sub-heat 5: VNS $20 (0.02, 20s, high vol, medium liq); MRS $75 (0.02, 20s, medium vol, high liq); JPTR $35 (0.02, 20s, low vol, medium liq); STRN $50 (0.02, 20s, high vol, medium liq)
+
+5) Penalties
+- Speculative/front-running shares: $1 per share up to 5,000; $2 per share beyond 5,000.
+- Uncovered shares at end of iteration: $10 per share.
+
+6) Limits / fees
+- Gross limit 250,000 shares; net limit 150,000 shares.
+- Max order size 10,000 shares.
+- Commissions per sub-heat table above; no commissions on tenders.
+
+7) Close-out
+- Open positions closed at end of each sub-heat at last traded price.
+- Market makers add liquidity late to prevent manipulation.
+
+8) Objectives (paraphrased)
+- Accept profitable tenders; reject bad ones.
+- Bid competitively while preserving edge.
+- Use order types to manage liquidity risk and reduce exposure.
+
+Assessment / Scoring (competition-wide)
+- Case weights: Liquidity Risk 20%, Volatility Trading 20%, GBE Electricity 20%, Merger Arbitrage 20%, Algo Market Making 20%.
+- Liquidity / Volatility / Merger: team P&Ls summed per sub-heat, ranked, then average rank -> case rank.
+- GBE Electricity: team members' P&Ls summed per sub-heat, ranked, then average rank -> case rank.
+- Algo MM: only one team member trades; heat ranks averaged -> case rank.
+- Case ranks map to points (higher is better). Final weighted score ranks teams.
+- Ties are broken by variance of case scores (lower variance wins). Top 5 cash awards.

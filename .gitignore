@@ -1,0 +1,14 @@
+.DS_Store
+.ghconfig/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+
+# Local credentials and secrets
+**/creds/rit_rest.json
+**/creds/rit_rest.local.json
+**/creds/local.*
