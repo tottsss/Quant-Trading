@@ -1,4 +1,4 @@
-Liquidity Risk — 5 baseline algorithms
+Liquidity Risk — 6 baseline algorithms
 
 These are practical baselines you can run on the simulator. Each is intentionally simple, safe, and tunable.
 All scripts use the RIT REST API via cases_2026/_shared/rit_api.py.
@@ -27,6 +27,10 @@ Algorithms
 5) volatility_shading.py
    - Big picture: demand larger edge when recent trade volatility is high.
    - Logic: uses recent time-and-sales to set edge.
+
+6) depth_twap_hybrid.py
+   - Big picture: accept tenders using depth-adjusted pricing, then hedge with TWAP slices.
+   - Logic: fair-price acceptance from multi-level book + queued market-slice hedge execution.
 
 Notes
 - These are not “optimal.” They are safe baselines you can improve.
