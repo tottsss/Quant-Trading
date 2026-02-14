@@ -18,6 +18,7 @@ These files are standalone versions meant for quick testing on a Windows machine
 
 ## Files
 - `00_social_outcry_pnl_tracker_standalone.py`
+- `01_liquidity_apex_standalone.py` (recommended for Liquidity Risk)
 - `01_liquidity_depth_twap_hybrid_standalone.py`
 - `02_volatility_news_arb_standalone.py`
 - `03_gbe_planner_standalone.py`
