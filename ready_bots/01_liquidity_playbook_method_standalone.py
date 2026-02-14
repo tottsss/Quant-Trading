@@ -454,10 +454,6 @@ def evaluate_tender_playbook(
     if not is_fixed and (FIXED_ONLY_MODE or not ENABLE_AUCTION_BIDS):
         return None, "auction disabled"
 
-    ok_risk, rr = projected_risk_ok(positions, ticker, my_action, qty, gross_limit, net_limit)
-    if not ok_risk:
-        return None, rr
-
     book = book_by_ticker.get(ticker)
     if not isinstance(book, dict):
         return None, "book unavailable"
@@ -487,6 +483,10 @@ def evaluate_tender_playbook(
         elif tp < mid - edge_hint:
             my_action = "BUY"
     hedge_action = "BUY" if my_action == "SELL" else "SELL"
+
+    ok_risk, rr = projected_risk_ok(positions, ticker, my_action, qty, gross_limit, net_limit)
+    if not ok_risk:
+        return None, rr
 
     label_vol, label_liq = SEC_LABELS.get(ticker, ("Medium", "Medium"))
     expires = tender.get("expires")
