@@ -63,6 +63,8 @@ AUCTION_BID_TICKS_LEFT = 6
 LOG_HOLD_EVERY_SECS = 3.0
 STOP_NEW_TENDERS_TICKS_LEFT = 8
 FORCE_FLATTEN_TICKS_LEFT = 4
+DECLINE_FIXED_IMMEDIATELY = True
+DECLINE_DISABLED_AUCTIONS_IMMEDIATELY = True
 
 # Hedge controls
 TWAP_SLICES = 8
@@ -253,6 +255,18 @@ def infer_my_action(tender: dict) -> str:
     return "BUY"
 
 
+def tender_fill_confirmed(resp) -> bool:
+    if not isinstance(resp, dict):
+        return True
+    status = str(resp.get("status") or "").upper()
+    if any(flag in status for flag in ("TRADING_LIMIT", "REJECT", "DECLIN", "ERROR", "CANCEL")):
+        return False
+    if status and not any(ok in status for ok in ("ACCEPT", "WON", "FILL", "SUCCESS", "COMPLETE")):
+        # Unknown explicit status: treat as not confirmed.
+        return False
+    return True
+
+
 def build_candidate_tickers(ticker: str, valid_tickers: set[str]) -> list[str]:
     cands = [ticker]
     if ticker.endswith("_M") or ticker.endswith("_A"):
@@ -268,6 +282,18 @@ def build_candidate_tickers(ticker: str, valid_tickers: set[str]) -> list[str]:
             seen.add(c)
             out.append(c)
     return out
+
+
+def unresolved_tender_tickers(tenders: list[dict], processed_tenders: set[int], valid_tickers: set[str]) -> set[str]:
+    blocked = set()
+    for t in tenders:
+        tid = t.get("tender_id")
+        if tid in processed_tenders:
+            continue
+        tk = infer_ticker(t, valid_tickers)
+        if tk:
+            blocked.add(tk)
+    return blocked
 
 
 def parse_levels_for_side(book: dict, side: str):
@@ -525,11 +551,21 @@ def schedule_hedge(hedges: list[HedgeJob], ticker: str, action: str, qty: float,
     )
 
 
-def process_hedges(client: RITClient, hedges: list[HedgeJob], throttle: OrderThrottle) -> list[HedgeJob]:
+def process_hedges(
+    client: RITClient,
+    hedges: list[HedgeJob],
+    throttle: OrderThrottle,
+    blocked_tickers: set[str] | None = None,
+) -> list[HedgeJob]:
     now = time.time()
     still = []
+    blocked_tickers = blocked_tickers or set()
     for h in hedges:
         if h.remaining <= 0:
+            continue
+        if h.ticker in blocked_tickers:
+            h.next_time = now + max(h.interval, POLL_SECS)
+            still.append(h)
             continue
         if now < h.next_time:
             still.append(h)
@@ -617,8 +653,6 @@ def main():
         except Exception:
             gross_limit, net_limit = FALLBACK_GROSS_LIMIT, FALLBACK_NET_LIMIT
 
-        hedges = process_hedges(client, hedges, throttle)
-
         if case_ticks_left is not None and case_ticks_left <= FORCE_FLATTEN_TICKS_LEFT:
             print(f"ENDGAME flatten mode: case_ticks_left={case_ticks_left}")
             flatten_positions_step(client, positions, sec_by_ticker, throttle)
@@ -638,7 +672,11 @@ def main():
                 continue
 
             if case_ticks_left is not None and case_ticks_left <= STOP_NEW_TENDERS_TICKS_LEFT:
-                print(f"SKIP tender {tid}: endgame (case_ticks_left={case_ticks_left})")
+                try:
+                    client.decline_tender(tid)
+                    print(f"DECLINE tender {tid}: endgame (case_ticks_left={case_ticks_left})")
+                except Exception as exc:
+                    print(f"ENDGAME DECLINE ERROR {tid}: {exc}")
                 processed_tenders.add(tid)
                 continue
 
@@ -663,11 +701,18 @@ def main():
                 ticks_left = int(expires) - current_tick
 
             if decision is None:
-                if ticks_left is not None and ticks_left <= FIXED_DECLINE_TICKS_LEFT and tender.get("is_fixed_bid"):
+                is_fixed = bool(tender.get("is_fixed_bid"))
+                immediate_decline = False
+                if is_fixed and DECLINE_FIXED_IMMEDIATELY:
+                    immediate_decline = True
+                if (not is_fixed) and DECLINE_DISABLED_AUCTIONS_IMMEDIATELY and "auction disabled" in reason:
+                    immediate_decline = True
+
+                if immediate_decline or (ticks_left is not None and ticks_left <= FIXED_DECLINE_TICKS_LEFT and is_fixed):
                     try:
                         client.decline_tender(tid)
                         processed_tenders.add(tid)
-                        print(f"DECLINE fixed tender {tid}: {reason}")
+                        print(f"DECLINE tender {tid}: {reason}")
                     except Exception as exc:
                         print(f"DECLINE ERROR {tid}: {exc}")
                 else:
@@ -684,7 +729,7 @@ def main():
             try:
                 if decision.is_fixed:
                     if not decision.fixed_accept:
-                        if ticks_left is not None and ticks_left <= FIXED_DECLINE_TICKS_LEFT:
+                        if DECLINE_FIXED_IMMEDIATELY or (ticks_left is not None and ticks_left <= FIXED_DECLINE_TICKS_LEFT):
                             client.decline_tender(tid)
                             processed_tenders.add(tid)
                             print(
@@ -701,8 +746,11 @@ def main():
                                 last_hold_log_at[tid] = now
                         continue
 
-                    client.accept_tender(tid)
+                    resp = client.accept_tender(tid)
                     processed_tenders.add(tid)
+                    if not tender_fill_confirmed(resp):
+                        print(f"SKIP HEDGE fixed tender {tid}: tender status not confirmed as filled ({resp})")
+                        continue
                     print(
                         f"ACCEPT fixed tender {tid} ticker={decision.ticker} qty={decision.qty:.0f} "
                         f"my_action={decision.my_action} hedge={decision.hedge_action} "
@@ -725,8 +773,11 @@ def main():
                         print(f"DECLINE auction {tid}: invalid submit_price={decision.submit_price:.2f}")
                         continue
 
-                    client.accept_tender(tid, price=decision.submit_price)
+                    resp = client.accept_tender(tid, price=decision.submit_price)
                     processed_tenders.add(tid)
+                    if not tender_fill_confirmed(resp):
+                        print(f"SKIP HEDGE auction tender {tid}: tender status not confirmed as filled ({resp})")
+                        continue
                     print(
                         f"BID auction tender {tid} ticker={decision.ticker} qty={decision.qty:.0f} "
                         f"price={decision.submit_price:.2f} my_action={decision.my_action}"
@@ -736,6 +787,10 @@ def main():
                 schedule_hedge(hedges, decision.ticker, decision.hedge_action, decision.qty, max_order_qty)
             except Exception as exc:
                 print(f"TENDER ACTION ERROR {tid}: {exc}")
+
+        # Safety rule from case text: avoid trading a ticker while a tender on that ticker is still open.
+        blocked_tickers = unresolved_tender_tickers(tenders, processed_tenders, valid_tickers)
+        hedges = process_hedges(client, hedges, throttle, blocked_tickers=blocked_tickers)
 
         time.sleep(POLL_SECS)
 
