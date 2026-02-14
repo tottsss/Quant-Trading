@@ -14,7 +14,8 @@ HEADERS = {"X-API-key": API_KEY}
 SHUTDOWN = False
 
 # Strategy params
-MIN_EDGE = float(os.environ.get("RIT_FINAL_MIN_EDGE", "0.12"))
+MIN_EDGE = float(os.environ.get("RIT_FINAL_MIN_EDGE", "0.15"))
+VOL_FACTOR = float(os.environ.get("RIT_FINAL_VOL_FACTOR", "1.2"))
 MAX_ATTEMPTS = int(os.environ.get("RIT_FINAL_MAX_ATTEMPTS", "8"))
 EVAL_DELAY = float(os.environ.get("RIT_FINAL_EVAL_DELAY", "1.0"))
 ORDER_DELAY = float(os.environ.get("RIT_FINAL_ORDER_DELAY", "0.15"))
@@ -207,13 +208,23 @@ def unwind_inventory(session, ticker, inventory):
 
 
 def _action_edge_ok(action, tender_price, vwap_bid, vwap_ask, bid_volume, ask_volume):
-    # Keep same method style but require stricter edge sign.
+    """
+    Hybrid accept rule:
+    1) Primary rule: same as sparsh-style method that already worked for you.
+    2) Fallback economic edge check: protect against action semantic mismatch in some feeds.
+    """
     if action == "BUY":
-        # Institution buys from us (we sell), then we buy hedge.
-        return tender_price >= (vwap_ask + MIN_EDGE) and ask_volume * 1.1 >= bid_volume
+        # Sparsh-style condition
+        cond_primary = (tender_price < (vwap_bid + MIN_EDGE)) and (bid_volume * VOL_FACTOR > ask_volume)
+        # Economic fallback (if action semantics are inverted in this server feed)
+        cond_fallback = (tender_price - vwap_ask) >= MIN_EDGE
+        return cond_primary or cond_fallback
     if action == "SELL":
-        # Institution sells to us (we buy), then we sell hedge.
-        return tender_price <= (vwap_bid - MIN_EDGE) and bid_volume * 1.1 >= ask_volume
+        # Sparsh-style condition
+        cond_primary = (tender_price > (vwap_ask - MIN_EDGE)) and (ask_volume * VOL_FACTOR > bid_volume)
+        # Economic fallback
+        cond_fallback = (vwap_bid - tender_price) >= MIN_EDGE
+        return cond_primary or cond_fallback
     return False
 
 
@@ -271,7 +282,10 @@ def evaluate_tender(session, tender):
                 if abs(delta) > 0:
                     unwind_inventory(session, ticker, delta)
             break
-        print(f"Evaluating tender {tid} ({i + 1}/{attempts})")
+        print(
+            f"Evaluating tender {tid} ({i + 1}/{attempts}) "
+            f"px={tender_price:.2f} vb={ob['vwap_bid']:.2f} va={ob['vwap_ask']:.2f}"
+        )
 
     if not accepted:
         decline_tender(session, tender)
