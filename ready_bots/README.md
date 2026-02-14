@@ -22,6 +22,7 @@ These files are standalone versions meant for quick testing on a Windows machine
 - `00_social_outcry_pnl_tracker_standalone.py`
 - `01_liquidity_apex_standalone.py` (recommended for Liquidity Risk)
   - Uses anti-fine safeguards: immediate decline of bad fixed tenders, no hedge trading on tickers with unresolved tenders, and endgame flatten.
+- `01_liquidity_simple_profit_standalone.py` (simple safer alternative)
 - `01_liquidity_depth_twap_hybrid_standalone.py`
 - `02_volatility_news_arb_standalone.py`
 - `03_gbe_planner_standalone.py`
