@@ -1,0 +1,230 @@
+"""Merger Arbitrage: multi-deal bot (standalone)."""
+
+import os
+import re
+import time
+
+import requests
+
+API_KEY = os.environ.get("RIT_API_KEY", "YOUR_API_KEY")
+BASE_URL = os.environ.get("RIT_BASE_URL", "http://localhost:9999/v1")
+
+POLL_SECS = 0.5
+PRICE_THRESHOLD = 0.20
+ORDER_QTY = 1000
+
+CATEGORY_MULT = {
+    "REG": 1.25,
+    "FIN": 1.00,
+    "SHR": 0.90,
+    "ALT": 1.40,
+    "PRC": 0.70,
+}
+
+DEAL_MULT = {
+    "D1": 1.00,
+    "D2": 1.05,
+    "D3": 1.10,
+    "D4": 1.30,
+    "D5": 1.15,
+}
+
+BASE_IMPACT = {
+    ("POS", "S"): 0.03,
+    ("POS", "M"): 0.07,
+    ("POS", "L"): 0.14,
+    ("NEG", "S"): -0.04,
+    ("NEG", "M"): -0.09,
+    ("NEG", "L"): -0.18,
+}
+
+DEALS = {
+    "D1": {"target": "TGX", "acquirer": "PHR", "structure": "CASH", "cash": 50.0, "ratio": 0.0, "p0": 0.70, "target_p0": 43.70, "acq_p0": 47.50},
+    "D2": {"target": "BYL", "acquirer": "CLD", "structure": "STOCK", "cash": 0.0, "ratio": 0.75, "p0": 0.55, "target_p0": 43.50, "acq_p0": 79.30},
+    "D3": {"target": "GGD", "acquirer": "PNR", "structure": "MIXED", "cash": 33.0, "ratio": 0.20, "p0": 0.50, "target_p0": 31.50, "acq_p0": 59.80},
+    "D4": {"target": "FSR", "acquirer": "ATB", "structure": "CASH", "cash": 40.0, "ratio": 0.0, "p0": 0.38, "target_p0": 30.50, "acq_p0": 62.20},
+    "D5": {"target": "SPK", "acquirer": "EEC", "structure": "STOCK", "cash": 0.0, "ratio": 1.20, "p0": 0.45, "target_p0": 52.80, "acq_p0": 48.00},
+}
+
+CATEGORY_KEYWORDS = {
+    "REG": ["regulator", "antitrust", "doj", "cma", "competition", "approval", "remedy", "litigation"],
+    "FIN": ["financing", "funding", "credit", "debt", "loan", "capital", "leverage", "liquidity"],
+    "SHR": ["shareholder", "proxy", "vote", "board", "activist", "tender"],
+    "ALT": ["competing", "rival", "bid", "topping", "alternative", "renegotiate"],
+    "PRC": ["timeline", "delay", "extension", "process", "condition", "closing", "deadline"],
+}
+
+POS_WORDS = ["approve", "approved", "clear", "cleared", "positive", "support", "agreement", "progress"]
+NEG_WORDS = ["block", "blocked", "reject", "rejected", "lawsuit", "terminate", "withdraw", "delay"]
+SEV_L = ["major", "significant", "material", "terminate", "blocked"]
+SEV_M = ["concern", "review", "challenge", "risk"]
+
+
+class RITClient:
+    def __init__(self, api_key: str, base_url: str = "http://localhost:9999/v1", timeout: float = 3.0):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({"X-API-key": api_key})
+
+    def _get(self, path: str, params: dict | None = None):
+        return self.session.get(self.base_url + path, params=params, timeout=self.timeout)
+
+    def _post(self, path: str, params: dict | None = None):
+        return self.session.post(self.base_url + path, params=params, timeout=self.timeout)
+
+    def get_case(self):
+        r = self._get("/case")
+        r.raise_for_status()
+        return r.json()
+
+    def get_news(self, since: int | None = None):
+        params = {"since": since} if since is not None else None
+        r = self._get("/news", params=params)
+        r.raise_for_status()
+        return r.json()
+
+    def get_securities(self):
+        r = self._get("/securities")
+        r.raise_for_status()
+        return r.json()
+
+    def get_book(self, ticker: str):
+        r = self._get("/securities/book", {"ticker": ticker})
+        r.raise_for_status()
+        return r.json()
+
+    def place_order(self, ticker: str, order_type: str, quantity: float, action: str, price: float | None = None):
+        params = {"ticker": ticker, "type": order_type, "quantity": quantity, "action": action}
+        if price is not None:
+            params["price"] = price
+        r = self._post("/orders", params=params)
+        r.raise_for_status()
+        return r.json()
+
+
+def wait_until_active(client: RITClient, poll_s: float = 0.5):
+    while True:
+        case = client.get_case()
+        if case.get("status") == "ACTIVE":
+            return
+        time.sleep(poll_s)
+
+
+def detect_category(text):
+    for cat, words in CATEGORY_KEYWORDS.items():
+        for w in words:
+            if w in text:
+                return cat
+    return None
+
+
+def detect_direction(text):
+    if any(w in text for w in POS_WORDS):
+        return "POS"
+    if any(w in text for w in NEG_WORDS):
+        return "NEG"
+    return None
+
+
+def detect_severity(text):
+    if any(w in text for w in SEV_L):
+        return "L"
+    if any(w in text for w in SEV_M):
+        return "M"
+    return "S"
+
+
+def deal_value(deal, acq_price):
+    if deal["structure"] == "CASH":
+        return deal["cash"]
+    if deal["structure"] == "STOCK":
+        return deal["ratio"] * acq_price
+    return deal["cash"] + deal["ratio"] * acq_price
+
+
+def infer_standalone_value(deal):
+    k0 = deal_value(deal, deal["acq_p0"])
+    p0 = deal["p0"]
+    return (deal["target_p0"] - p0 * k0) / (1.0 - p0)
+
+
+def best_bid_ask(client, ticker):
+    book = client.get_book(ticker)
+    bids = book.get("bids", [])
+    asks = book.get("asks", [])
+    if not bids or not asks:
+        return None, None
+    return bids[0]["price"], asks[0]["price"]
+
+
+def main():
+    if API_KEY == "YOUR_API_KEY":
+        raise RuntimeError("Set RIT_API_KEY before running.")
+
+    client = RITClient(API_KEY, base_url=BASE_URL)
+    wait_until_active(client)
+
+    state = {d: {"p": info["p0"], "V": infer_standalone_value(info)} for d, info in DEALS.items()}
+    last_news_id = 0
+
+    print(f"Connected to {BASE_URL}. Running merger arb bot...")
+
+    while True:
+        case = client.get_case()
+        if case.get("status") != "ACTIVE":
+            print("Case no longer ACTIVE. Exiting.")
+            break
+
+        news = client.get_news(since=last_news_id)
+        if news:
+            last_news_id = max(n["news_id"] for n in news)
+            for n in news:
+                text = ((n.get("headline") or "") + " " + (n.get("body") or "")).lower()
+                for d, info in DEALS.items():
+                    if info["target"].lower() in text or info["acquirer"].lower() in text:
+                        cat = detect_category(text)
+                        direction = detect_direction(text)
+                        severity = detect_severity(text)
+                        if cat and direction:
+                            delta = BASE_IMPACT[(direction, severity)] * CATEGORY_MULT[cat] * DEAL_MULT[d]
+                            state[d]["p"] = min(1.0, max(0.0, state[d]["p"] + delta))
+
+        sec = {s["ticker"]: s for s in client.get_securities()}
+
+        for d, info in DEALS.items():
+            target = info["target"]
+            acq = info["acquirer"]
+            if target not in sec or acq not in sec:
+                continue
+
+            t_bid, t_ask = best_bid_ask(client, target)
+            a_bid, a_ask = best_bid_ask(client, acq)
+            if t_bid is None or t_ask is None or a_bid is None or a_ask is None:
+                continue
+
+            t_mid = (t_bid + t_ask) / 2.0
+            a_mid = (a_bid + a_ask) / 2.0
+            k = deal_value(info, a_mid)
+            p = state[d]["p"]
+            v = state[d]["V"]
+            intrinsic = p * k + (1.0 - p) * v
+
+            if t_mid < intrinsic - PRICE_THRESHOLD:
+                client.place_order(target, "LIMIT", ORDER_QTY, "BUY", price=t_bid)
+                if info["structure"] in ("STOCK", "MIXED"):
+                    hedge_qty = int(round(info["ratio"] * ORDER_QTY))
+                    if hedge_qty > 0:
+                        client.place_order(acq, "MARKET", hedge_qty, "SELL")
+            elif t_mid > intrinsic + PRICE_THRESHOLD:
+                client.place_order(target, "LIMIT", ORDER_QTY, "SELL", price=t_ask)
+                if info["structure"] in ("STOCK", "MIXED"):
+                    hedge_qty = int(round(info["ratio"] * ORDER_QTY))
+                    if hedge_qty > 0:
+                        client.place_order(acq, "MARKET", hedge_qty, "BUY")
+
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    main()
