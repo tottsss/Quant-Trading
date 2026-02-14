@@ -46,6 +46,9 @@ FORCE_FLATTEN_TICKS_LEFT = int(os.environ.get("RIT_FORCE_FLATTEN_TICKS_LEFT", "4
 HEDGE_POS_CONFIRM_RETRIES = int(os.environ.get("RIT_HEDGE_POS_CONFIRM_RETRIES", "5"))
 HEDGE_POS_CONFIRM_SLEEP_SECS = float(os.environ.get("RIT_HEDGE_POS_CONFIRM_SLEEP_SECS", "0.12"))
 MIN_DELTA_TO_HEDGE = float(os.environ.get("RIT_MIN_DELTA_TO_HEDGE", "1"))
+TENDER_RESOLVE_RETRIES = int(os.environ.get("RIT_TENDER_RESOLVE_RETRIES", "8"))
+TENDER_RESOLVE_SLEEP_SECS = float(os.environ.get("RIT_TENDER_RESOLVE_SLEEP_SECS", "0.12"))
+FORCE_HEDGE_FROM_FILL_QTY = env_flag("RIT_FORCE_HEDGE_FROM_FILL_QTY", True)
 GROSS_USAGE_CAP = float(os.environ.get("RIT_GROSS_USAGE_CAP", "0.90"))
 NET_USAGE_CAP = float(os.environ.get("RIT_NET_USAGE_CAP", "0.90"))
 CLEAR_SCREEN = env_flag("RIT_CLEAR_SCREEN", False)
@@ -324,7 +327,7 @@ def tender_fill_confirmed(resp: dict) -> bool:
     if any(word in status for word in ("REJECT", "DECLIN", "TRADING_LIMIT", "ERROR", "CANCEL")):
         return False
     if not status:
-        return True
+        return False
     return any(word in status for word in ("ACCEPT", "WON", "FILL", "SUCCESS", "COMPLETE"))
 
 
@@ -376,6 +379,67 @@ def fetch_related_position_delta(
         time.sleep(HEDGE_POS_CONFIRM_SLEEP_SECS)
 
     return delta, last_positions
+
+
+def extract_filled_qty(resp: dict) -> float | None:
+    if not isinstance(resp, dict):
+        return None
+    for key in ("quantity_filled", "filled_qty", "filled_quantity", "quantity", "qty"):
+        v = resp.get(key)
+        if isinstance(v, (int, float)):
+            return max(0.0, float(v))
+    return None
+
+
+def find_tender_by_id(tenders: list[dict], tender_id: int) -> dict | None:
+    for t in tenders:
+        if t.get("tender_id") == tender_id:
+            return t
+    return None
+
+
+def wait_tender_not_open(client: RITClient, tender_id: int) -> tuple[bool, dict | None]:
+    last_seen: dict | None = None
+    for _ in range(max(1, TENDER_RESOLVE_RETRIES)):
+        try:
+            tenders = client.get_tenders()
+            t = find_tender_by_id(tenders, tender_id)
+            last_seen = t
+            if t is None:
+                return True, None
+            if not is_open_tender(t):
+                return True, t
+        except Exception:
+            pass
+        time.sleep(TENDER_RESOLVE_SLEEP_SECS)
+    return False, last_seen
+
+
+def decline_open_tenders_same_base(
+    client: RITClient,
+    tenders: list[dict],
+    base_ticker: str,
+    keep_tender_id: int,
+) -> set[int]:
+    declined: set[int] = set()
+    for t in tenders:
+        tid = t.get("tender_id")
+        if not isinstance(tid, int) or tid == keep_tender_id:
+            continue
+        tk = t.get("ticker")
+        if not isinstance(tk, str):
+            continue
+        if extract_base_ticker(tk) != base_ticker:
+            continue
+        if not is_open_tender(t):
+            continue
+        try:
+            client.decline_tender(tid)
+            declined.add(tid)
+            print(f"[DECLINE] id={tid} {tk} reason=clear_same_base_before_hedge")
+        except Exception as e:
+            print(f"[WARN] decline failed id={tid}: {e}")
+    return declined
 
 
 def flatten_all_positions(client: RITClient, securities: list[dict]):
@@ -590,21 +654,51 @@ def main():
                 continue
 
             if not tender_fill_confirmed(resp):
-                print(f"[INFO] accepted API call but not filled id={tid}; skip hedge")
+                print(f"[INFO] accept response not filled id={tid}; skip hedge")
                 processed_tender_ids.add(tid)
                 continue
+
+            resolved, t_after = wait_tender_not_open(client, tid)
+            if not resolved:
+                print(f"[INFO] tender id={tid} still open after accept; skip hedge")
+                processed_tender_ids.add(tid)
+                continue
+
+            try:
+                fresh_tenders = client.get_tenders()
+            except Exception:
+                fresh_tenders = []
+            base_ticker = extract_base_ticker(ticker)
+            dropped = decline_open_tenders_same_base(
+                client=client,
+                tenders=fresh_tenders,
+                base_ticker=base_ticker,
+                keep_tender_id=tid,
+            )
+            processed_tender_ids.update(dropped)
 
             delta, latest_positions = fetch_related_position_delta(client, rel, pre_related_pos)
             if latest_positions:
                 positions.update(latest_positions)
 
             if abs(delta) < MIN_DELTA_TO_HEDGE:
+                fallback_qty = None
+                if FORCE_HEDGE_FROM_FILL_QTY:
+                    fallback_qty = extract_filled_qty(resp)
+                    if fallback_qty is None and isinstance(t_after, dict):
+                        fallback_qty = extract_filled_qty(t_after)
+                if fallback_qty is None or fallback_qty < MIN_DELTA_TO_HEDGE:
+                    print(
+                        f"[INFO] id={tid} accepted but no detectable position delta "
+                        f"(delta={delta:.2f}); skip hedge"
+                    )
+                    processed_tender_ids.add(tid)
+                    continue
+                delta = fallback_qty if my_action == "BUY" else -fallback_qty
                 print(
-                    f"[INFO] id={tid} accepted but no detectable position delta "
-                    f"(delta={delta:.2f}); skip hedge"
+                    f"[INFO] id={tid} using fallback hedge qty from fill fields: "
+                    f"qty={fallback_qty:.2f} delta={delta:.2f}"
                 )
-                processed_tender_ids.add(tid)
-                continue
 
             actual_hedge_action = "SELL" if delta > 0 else "BUY"
             actual_hedge_qty = abs(delta)
