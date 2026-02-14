@@ -208,8 +208,25 @@ def place_aggressive_limit_orders(session, ticker, inventory, order_delay):
 def evaluate_tender(session, tender):
     """Evaluate tender using the same style method, adapted to current API/tickers."""
     ticker = tender.get("ticker")
-    tender_price = float(tender.get("price", 0.0))
+    raw_price = tender.get("price")
     action = str(tender.get("action", "")).upper()  # from source method
+    is_fixed = bool(tender.get("is_fixed_bid"))
+    tender_id = tender.get("tender_id")
+
+    if not ticker:
+        return
+
+    # Some tenders can come with null/empty price fields; do not crash.
+    if not isinstance(raw_price, (int, float)):
+        print(f"Skipping tender {tender_id}: missing/invalid price ({raw_price})")
+        # In this copied method we do not price non-fixed tenders, so decline safely.
+        try:
+            decline_tender(session, tender)
+        except Exception:
+            pass
+        return
+
+    tender_price = float(raw_price)
 
     attempts = 0
     max_attempts = 13
