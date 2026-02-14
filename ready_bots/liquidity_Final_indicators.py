@@ -9,14 +9,14 @@ class ApiException(Exception):
 
 
 BASE_URL = os.environ.get("RIT_BASE_URL", "http://localhost:9999/v1").rstrip("/")
-API_KEY = os.environ.get("RIT_API_KEY", "YOUR_API_KEY")
+API_KEY = os.environ.get("RIT_API_KEY", "BNWI101Y")
 HEADERS = {"X-API-key": API_KEY}
 SHUTDOWN = False
 
 # Core strategy params
-MIN_EDGE = float(os.environ.get("RIT_FINAL_MIN_EDGE", "0.12"))
+MIN_EDGE = float(os.environ.get("RIT_FINAL_MIN_EDGE", "0.10"))
 VOL_FACTOR = float(os.environ.get("RIT_FINAL_VOL_FACTOR", "1.15"))
-MAX_ATTEMPTS = int(os.environ.get("RIT_FINAL_MAX_ATTEMPTS", "8"))
+MAX_ATTEMPTS = int(os.environ.get("RIT_FINAL_MAX_ATTEMPTS", "12"))
 EVAL_DELAY = float(os.environ.get("RIT_FINAL_EVAL_DELAY", "0.8"))
 ORDER_DELAY = float(os.environ.get("RIT_FINAL_ORDER_DELAY", "0.12"))
 AFTER_ACCEPT_DELAY = float(os.environ.get("RIT_FINAL_AFTER_ACCEPT_DELAY", "0.5"))
