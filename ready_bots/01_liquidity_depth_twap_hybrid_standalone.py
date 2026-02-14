@@ -11,6 +11,7 @@ Run:
 """
 
 import os
+import re
 import time
 import requests
 
@@ -20,7 +21,9 @@ BASE_URL = os.environ.get("RIT_BASE_URL", "http://localhost:9999/v1")
 POLL_SECS = 0.5
 EDGE_BPS = 5
 MIN_EDGE = 0.03
-MAX_LEVELS = 5
+MAX_LEVELS = 50
+# Use a capped quantity to estimate hedge cost on very large tenders.
+HEDGE_ESTIMATE_QTY_CAP = 15000
 
 # TWAP hedge controls
 TWAP_SLICES = 5
@@ -59,8 +62,11 @@ class RITClient:
         r.raise_for_status()
         return r.json()
 
-    def get_book(self, ticker: str):
-        r = self._get("/securities/book", {"ticker": ticker})
+    def get_book(self, ticker: str, limit: int | None = None):
+        params = {"ticker": ticker}
+        if limit is not None:
+            params["limit"] = limit
+        r = self._get("/securities/book", params)
         r.raise_for_status()
         return r.json()
 
@@ -105,13 +111,18 @@ def infer_ticker(tender: dict, tickers: list[str]):
     if ticker:
         return ticker
     caption = tender.get("caption") or ""
+    m = re.search(r"shares of\s+([A-Z0-9\-]+)", caption, re.IGNORECASE)
+    if m:
+        parsed = m.group(1).upper()
+        if parsed in tickers:
+            return parsed
     for t in tickers:
         if t in caption:
             return t
     return None
 
 
-def estimate_fill_price(levels: list[dict], qty: float, max_levels: int) -> float | None:
+def estimate_fill_price(levels: list[dict], qty: float, max_levels: int):
     remaining = qty
     notional = 0.0
     used = 0.0
@@ -126,9 +137,11 @@ def estimate_fill_price(levels: list[dict], qty: float, max_levels: int) -> floa
         notional += take * float(price)
         remaining -= take
         used += take
-    if used <= 0 or remaining > 0:
-        return None
-    return notional / used
+    if used <= 0:
+        return None, used, remaining
+    if remaining > 0:
+        return None, used, remaining
+    return notional / used, used, remaining
 
 
 def schedule_twap(hedges: list[dict], ticker: str, action: str, qty: float):
@@ -177,32 +190,35 @@ def evaluate_tender(client: RITClient, tender: dict, tickers: list[str]):
     price = tender.get("price")
     ticker = infer_ticker(tender, tickers)
 
-    if not ticker or qty <= 0:
-        return None
+    if qty <= 0:
+        return None, "invalid qty"
+    if not ticker:
+        return None, "ticker not found in tender"
 
-    book = client.get_book(ticker)
+    book = client.get_book(ticker, limit=MAX_LEVELS)
     bid, ask = best_bid_ask(book)
     if bid is None or ask is None:
-        return None
+        return None, "empty book"
     mid = (bid + ask) / 2.0
     edge = max(MIN_EDGE, mid * EDGE_BPS / 10000.0)
+    estimate_qty = min(qty, HEDGE_ESTIMATE_QTY_CAP)
 
     if action == "BUY":
         hedge_action = "SELL"
-        hedge_price = estimate_fill_price(book.get("bids", []), qty, MAX_LEVELS)
+        hedge_price, used, rem = estimate_fill_price(book.get("bids", []), estimate_qty, MAX_LEVELS)
         if hedge_price is None:
-            return None
+            return None, f"insufficient bid depth for estimate_qty={estimate_qty:.0f} (filled={used:.0f}, rem={rem:.0f})"
         limit_price = round(hedge_price - edge, 2)
         fixed_accept = price is not None and price <= limit_price
     elif action == "SELL":
         hedge_action = "BUY"
-        hedge_price = estimate_fill_price(book.get("asks", []), qty, MAX_LEVELS)
+        hedge_price, used, rem = estimate_fill_price(book.get("asks", []), estimate_qty, MAX_LEVELS)
         if hedge_price is None:
-            return None
+            return None, f"insufficient ask depth for estimate_qty={estimate_qty:.0f} (filled={used:.0f}, rem={rem:.0f})"
         limit_price = round(hedge_price + edge, 2)
         fixed_accept = price is not None and price >= limit_price
     else:
-        return None
+        return None, f"unsupported action={action}"
 
     return {
         "ticker": ticker,
@@ -212,7 +228,8 @@ def evaluate_tender(client: RITClient, tender: dict, tickers: list[str]):
         "submit_price": limit_price,
         "hedge_action": hedge_action,
         "action": action,
-    }
+        "estimate_qty": estimate_qty,
+    }, "ok"
 
 
 def main():
@@ -247,8 +264,9 @@ def main():
             if tid in seen:
                 continue
 
-            decision = evaluate_tender(client, tender, tickers)
+            decision, reason = evaluate_tender(client, tender, tickers)
             if decision is None:
+                print(f"SKIP tender {tid}: {reason}")
                 continue
 
             # Backpressure: avoid accepting new risk if too many hedge jobs are queued.
@@ -261,13 +279,22 @@ def main():
                     if not decision["fixed_accept"]:
                         client.decline_tender(tid)
                         seen.add(tid)
-                        print(f"DECLINE fixed tender {tid}")
+                        print(
+                            f"DECLINE fixed tender {tid} ticker={decision['ticker']} "
+                            f"qty={decision['qty']:.0f} estimate_qty={decision['estimate_qty']:.0f}"
+                        )
                         continue
                     client.accept_tender(tid)
-                    print(f"ACCEPT fixed tender {tid}")
+                    print(
+                        f"ACCEPT fixed tender {tid} ticker={decision['ticker']} "
+                        f"qty={decision['qty']:.0f} estimate_qty={decision['estimate_qty']:.0f}"
+                    )
                 else:
                     client.accept_tender(tid, price=decision["submit_price"])
-                    print(f"BID auction tender {tid} price={decision['submit_price']}")
+                    print(
+                        f"BID auction tender {tid} ticker={decision['ticker']} "
+                        f"price={decision['submit_price']} estimate_qty={decision['estimate_qty']:.0f}"
+                    )
 
                 seen.add(tid)
                 schedule_twap(hedges, decision["ticker"], decision["hedge_action"], decision["qty"])
