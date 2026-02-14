@@ -30,7 +30,7 @@ def env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
-API_KEY = os.environ.get("RIT_API_KEY") or os.environ.get("API_KEY", "YOUR_API_KEY")
+API_KEY = os.environ.get("RIT_API_KEY") or os.environ.get("API_KEY", "BNWI101Y")
 BASE_URL = os.environ.get("RIT_BASE_URL", "http://localhost:9999/v1").rstrip("/")
 
 POLL_SECS = float(os.environ.get("RIT_POLL_SECS", "0.60"))
