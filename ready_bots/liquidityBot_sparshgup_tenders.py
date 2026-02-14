@@ -9,7 +9,7 @@ class ApiException(Exception):
 
 
 BASE_URL = os.environ.get("RIT_BASE_URL", "http://localhost:9999/v1").rstrip("/")
-API_KEY = os.environ.get("RIT_API_KEY", "YOUR_API_KEY")
+API_KEY = os.environ.get("RIT_API_KEY", "BNWI101Y")
 HEADERS = {"X-API-key": API_KEY}
 shutdown = False
 
