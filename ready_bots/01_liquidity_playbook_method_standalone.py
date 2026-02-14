@@ -204,11 +204,22 @@ def infer_ticker(tender: dict, valid_tickers: set[str]) -> str | None:
 
 
 def infer_my_action(tender: dict) -> str:
+    # 1) Signed quantity (most explicit when available)
+    q = tender.get("quantity")
+    if isinstance(q, (int, float)):
+        if float(q) < 0:
+            return "SELL"
+        if float(q) > 0:
+            return "BUY"
+
+    # 2) Caption parsing
     caption = str(tender.get("caption") or "").lower()
     if "would you like to sell" in caption:
         return "SELL"
     if "would you like to buy" in caption:
         return "BUY"
+
+    # 3) Fallback to action field (assumed institution side -> invert)
     a = str(tender.get("action") or "").upper()
     if a == "BUY":
         return "SELL"
@@ -409,6 +420,9 @@ def unresolved_tender_tickers(tenders: list[dict], processed: set[int], valid_ti
         tid = t.get("tender_id")
         if tid in processed:
             continue
+        st = str(t.get("status") or "").upper()
+        if st and st not in {"OFFERED", "OPEN", "ACTIVE"}:
+            continue
         tk = infer_ticker(t, valid_tickers)
         if tk:
             out.add(tk)
@@ -436,9 +450,6 @@ def evaluate_tender_playbook(
     if qty <= 0:
         return None, "invalid qty"
 
-    my_action = infer_my_action(tender)
-    hedge_action = "BUY" if my_action == "SELL" else "SELL"
-
     is_fixed = bool(tender.get("is_fixed_bid"))
     if not is_fixed and (FIXED_ONLY_MODE or not ENABLE_AUCTION_BIDS):
         return None, "auction disabled"
@@ -463,6 +474,19 @@ def evaluate_tender_playbook(
     tender_price = tender.get("price")
     if is_fixed and not isinstance(tender_price, (int, float)):
         return None, "fixed missing price"
+
+    # Infer side robustly; then sanity-check with tender price vs mid (private tender logic).
+    my_action = infer_my_action(tender)
+    if isinstance(tender_price, (int, float)):
+        tp = float(tender_price)
+        # If tender is materially above mid, institution likely buys from us -> we SELL.
+        # If materially below mid, institution likely sells to us -> we BUY.
+        edge_hint = max(0.01, mid * 0.001)
+        if tp > mid + edge_hint:
+            my_action = "SELL"
+        elif tp < mid - edge_hint:
+            my_action = "BUY"
+    hedge_action = "BUY" if my_action == "SELL" else "SELL"
 
     label_vol, label_liq = SEC_LABELS.get(ticker, ("Medium", "Medium"))
     expires = tender.get("expires")
@@ -717,6 +741,9 @@ def main():
         for tender in tenders:
             tid = tender.get("tender_id")
             if tid in processed_tenders:
+                continue
+            st = str(tender.get("status") or "").upper()
+            if st and st not in {"OFFERED", "OPEN", "ACTIVE"}:
                 continue
 
             if case_ticks_left is not None and case_ticks_left <= STOP_NEW_TENDERS_TICKS_LEFT:
