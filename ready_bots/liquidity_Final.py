@@ -9,20 +9,23 @@ class ApiException(Exception):
 
 
 BASE_URL = os.environ.get("RIT_BASE_URL", "http://localhost:9999/v1").rstrip("/")
-API_KEY = os.environ.get("RIT_API_KEY", "YOUR_API_KEY")
+API_KEY = os.environ.get("RIT_API_KEY", "BNWI101Y")
 HEADERS = {"X-API-key": API_KEY}
 SHUTDOWN = False
 
 # Strategy params
 MIN_EDGE = float(os.environ.get("RIT_FINAL_MIN_EDGE", "0.15"))
-VOL_FACTOR = float(os.environ.get("RIT_FINAL_VOL_FACTOR", "1.2"))
-MAX_ATTEMPTS = int(os.environ.get("RIT_FINAL_MAX_ATTEMPTS", "8"))
-EVAL_DELAY = float(os.environ.get("RIT_FINAL_EVAL_DELAY", "1.0"))
-ORDER_DELAY = float(os.environ.get("RIT_FINAL_ORDER_DELAY", "0.15"))
-AFTER_ACCEPT_DELAY = float(os.environ.get("RIT_FINAL_AFTER_ACCEPT_DELAY", "0.6"))
-MAX_ORDER_SIZE = 10000.0
-ENDGAME_TICKS = int(os.environ.get("RIT_FINAL_ENDGAME_TICKS", "8"))
-FIXED_ONLY = os.environ.get("RIT_FINAL_FIXED_ONLY", "1").strip() in {"1", "true", "yes", "on"}
+# Minimum edge for the tender to be accepted
+
+
+VOL_FACTOR = float(os.environ.get("RIT_FINAL_VOL_FACTOR", "1.1")) # Volume factor for the tender to be accepted, default is 1.2
+MAX_ATTEMPTS = int(os.environ.get("RIT_FINAL_MAX_ATTEMPTS", "8"))# Maximum number of attempts to evaluate the tender    
+EVAL_DELAY = float(os.environ.get("RIT_FINAL_EVAL_DELAY", "1.0"))# Delay between attempts to evaluate the tender
+ORDER_DELAY = float(os.environ.get("RIT_FINAL_ORDER_DELAY", "0.08"))# Delay between orders, default is 0.15
+AFTER_ACCEPT_DELAY = float(os.environ.get("RIT_FINAL_AFTER_ACCEPT_DELAY", "0.6"))# Delay after accepting the tender
+MAX_ORDER_SIZE = 10000.0# Maximum order size
+ENDGAME_TICKS = int(os.environ.get("RIT_FINAL_ENDGAME_TICKS", "8"))# Number of ticks to end the game
+FIXED_ONLY = os.environ.get("RIT_FINAL_FIXED_ONLY", "1").strip() in {"1", "true", "yes", "on"}# Whether to only accept fixed tenders
 
 
 def signal_handler(signum, frame):
