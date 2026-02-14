@@ -10,7 +10,7 @@ Run (PowerShell)
   pip install requests
   $env:RIT_API_KEY="YOUR_KEY"
   $env:RIT_BASE_URL="http://localhost:9999/v1"
-  python .\ready_bots\01_liquidity_wac_depth_router_standalone.py
+  python ./ready_bots/liquidity_lorenzourera_tenders.py
 """
 
 from __future__ import annotations
@@ -43,6 +43,9 @@ MAX_ORDER_QTY = float(os.environ.get("RIT_MAX_ORDER_QTY", "10000"))
 FIXED_ONLY_MODE = env_flag("RIT_FIXED_ONLY", True)
 STOP_NEW_TENDERS_TICKS_LEFT = int(os.environ.get("RIT_STOP_NEW_TENDERS_TICKS_LEFT", "8"))
 FORCE_FLATTEN_TICKS_LEFT = int(os.environ.get("RIT_FORCE_FLATTEN_TICKS_LEFT", "4"))
+HEDGE_POS_CONFIRM_RETRIES = int(os.environ.get("RIT_HEDGE_POS_CONFIRM_RETRIES", "5"))
+HEDGE_POS_CONFIRM_SLEEP_SECS = float(os.environ.get("RIT_HEDGE_POS_CONFIRM_SLEEP_SECS", "0.12"))
+MIN_DELTA_TO_HEDGE = float(os.environ.get("RIT_MIN_DELTA_TO_HEDGE", "1"))
 GROSS_USAGE_CAP = float(os.environ.get("RIT_GROSS_USAGE_CAP", "0.90"))
 NET_USAGE_CAP = float(os.environ.get("RIT_NET_USAGE_CAP", "0.90"))
 CLEAR_SCREEN = env_flag("RIT_CLEAR_SCREEN", False)
@@ -341,6 +344,40 @@ def hedge_route(client: RITClient, hedge_action: str, by_ticker_qty: dict[str, f
         place_market_chunks(client, tk, q, hedge_action)
 
 
+def sum_positions_for_tickers(positions: dict[str, float], tickers: list[str]) -> float:
+    total = 0.0
+    for tk in tickers:
+        total += float(positions.get(tk, 0.0))
+    return total
+
+
+def fetch_related_position_delta(
+    client: RITClient,
+    related: list[str],
+    pre_related_pos: float,
+) -> tuple[float, dict[str, float]]:
+    last_positions: dict[str, float] = {}
+    delta = 0.0
+
+    for _ in range(max(1, HEDGE_POS_CONFIRM_RETRIES)):
+        try:
+            secs_now = client.get_securities()
+            last_positions = {
+                s["ticker"]: float(s.get("position") or 0.0)
+                for s in secs_now
+                if s.get("ticker")
+            }
+            post_related_pos = sum_positions_for_tickers(last_positions, related)
+            delta = post_related_pos - pre_related_pos
+            if abs(delta) >= MIN_DELTA_TO_HEDGE:
+                return delta, last_positions
+        except Exception:
+            pass
+        time.sleep(HEDGE_POS_CONFIRM_SLEEP_SECS)
+
+    return delta, last_positions
+
+
 def flatten_all_positions(client: RITClient, securities: list[dict]):
     for sec in securities:
         ticker = sec.get("ticker")
@@ -479,6 +516,7 @@ def main():
             my_action = infer_my_action(t)
             hedge_action = "BUY" if my_action == "SELL" else "SELL"
             rel = related_tickers(ticker, valid_tickers)
+            pre_related_pos = sum_positions_for_tickers(positions, rel)
             bids, asks = merged_levels_for_related(client, rel)
             levels = asks if hedge_action == "BUY" else bids
 
@@ -556,9 +594,41 @@ def main():
                 processed_tender_ids.add(tid)
                 continue
 
-            print(f"[ACCEPT] id={tid} {ticker} -> hedging {hedge_action}")
+            delta, latest_positions = fetch_related_position_delta(client, rel, pre_related_pos)
+            if latest_positions:
+                positions.update(latest_positions)
+
+            if abs(delta) < MIN_DELTA_TO_HEDGE:
+                print(
+                    f"[INFO] id={tid} accepted but no detectable position delta "
+                    f"(delta={delta:.2f}); skip hedge"
+                )
+                processed_tender_ids.add(tid)
+                continue
+
+            actual_hedge_action = "SELL" if delta > 0 else "BUY"
+            actual_hedge_qty = abs(delta)
+            bids_now, asks_now = merged_levels_for_related(client, rel)
+            levels_now = asks_now if actual_hedge_action == "BUY" else bids_now
+            available_now, wac_now, route_now = route_wac(levels_now, actual_hedge_qty)
+
+            print(
+                f"[ACCEPT] id={tid} {ticker} delta={delta:.2f} "
+                f"hedge={actual_hedge_action} qty={actual_hedge_qty:.2f} "
+                f"wac={wac_now:.4f}"
+            )
+
             try:
-                hedge_route(client, hedge_action, route_exact)
+                if available_now > 0:
+                    hedge_route(client, actual_hedge_action, route_now)
+                remaining = max(0.0, actual_hedge_qty - available_now)
+                if remaining > 0:
+                    # Safety fallback to avoid leaving inventory risk unhedged.
+                    place_market_chunks(client, ticker, remaining, actual_hedge_action)
+                    print(
+                        f"[HEDGE-FALLBACK] {actual_hedge_action} {remaining:.0f} {ticker} "
+                        f"(routed={available_now:.0f}/{actual_hedge_qty:.0f})"
+                    )
             except Exception as e:
                 print(f"[WARN] hedge failed id={tid}: {e}")
 
