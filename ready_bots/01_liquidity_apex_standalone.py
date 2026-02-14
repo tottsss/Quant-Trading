@@ -12,6 +12,10 @@ Runtime requirements
 - Set env vars:
   - RIT_API_KEY
   - RIT_BASE_URL (default http://localhost:9999/v1)
+Optional env vars (risk/offense tuning)
+  - RIT_FIXED_ONLY=1            # default on: skip auction tenders
+  - RIT_ENABLE_AUCTION=0        # default off
+  - RIT_MIN_GROSS_PNL=300       # minimum estimated gross P&L per tender
 """
 
 from __future__ import annotations
@@ -27,6 +31,14 @@ import requests
 API_KEY = os.environ.get("RIT_API_KEY", "YOUR_API_KEY")
 BASE_URL = os.environ.get("RIT_BASE_URL", "http://localhost:9999/v1")
 
+
+def env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 POLL_SECS = 0.35
 BOOK_LEVELS = 100
 TAS_LIMIT = 80
@@ -39,17 +51,28 @@ MAX_VOL_EDGE_BPS = 14.0
 VOL_TO_BPS_MULT = 3000.0  # bps contribution from realized short-horizon log-return stdev
 MIN_EDGE_ABS = 0.03
 
+# Profit and mode controls
+FIXED_ONLY_MODE = env_flag("RIT_FIXED_ONLY", True)
+ENABLE_AUCTION_BIDS = env_flag("RIT_ENABLE_AUCTION", False)
+MIN_EXPECTED_GROSS_PNL = float(os.environ.get("RIT_MIN_GROSS_PNL", "300"))
+MIN_EXPECTED_PNL_PER_SHARE = float(os.environ.get("RIT_MIN_PNL_PER_SHARE", "0.012"))
+
 # Tender handling timing
 FIXED_DECLINE_TICKS_LEFT = 1
 AUCTION_BID_TICKS_LEFT = 6
 LOG_HOLD_EVERY_SECS = 3.0
+STOP_NEW_TENDERS_TICKS_LEFT = 8
+FORCE_FLATTEN_TICKS_LEFT = 4
 
 # Hedge controls
 TWAP_SLICES = 8
 TWAP_INTERVAL_SECS = 0.4
 MAX_ACTIVE_HEDGES = 30
 DEFAULT_MAX_ORDER_QTY = 10000.0
+HARD_MAX_ORDER_QTY = 10000.0
 MIN_AUCTION_PRICE = 0.01
+MAX_PENDING_HEDGE_QTY = 90000.0
+ORDER_MIN_SPACING_SECS = 0.07  # keep below API rate limit safely
 
 # Estimate only this much depth for very large tenders; add size edge for larger sizes.
 HEDGE_ESTIMATE_QTY_CAP = 25000.0
@@ -143,6 +166,7 @@ class TenderDecision:
     estimate_qty: float
     edge: float
     estimate_px: float
+    expected_gross_pnl: float
 
 
 @dataclass
@@ -157,12 +181,38 @@ class HedgeJob:
     fail_streak: int = 0
 
 
+@dataclass
+class OrderThrottle:
+    min_spacing: float
+    next_allowed_at: float = 0.0
+
+    def wait(self):
+        now = time.time()
+        if now < self.next_allowed_at:
+            time.sleep(self.next_allowed_at - now)
+            now = time.time()
+        self.next_allowed_at = now + self.min_spacing
+
+
 def wait_until_active(client: RITClient, poll_s: float = 0.5):
     while True:
         case = client.get_case()
         if case.get("status") == "ACTIVE":
             return case
         time.sleep(poll_s)
+
+
+def infer_case_ticks_left(case: dict) -> int | None:
+    tick = case.get("tick")
+    if not isinstance(tick, (int, float)):
+        return None
+    tick_i = int(tick)
+
+    for total_key in ("ticks_per_period", "period_ticks", "total_ticks", "max_ticks"):
+        total = case.get(total_key)
+        if isinstance(total, (int, float)) and total > 0:
+            return max(0, int(total) - tick_i)
+    return None
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
@@ -405,16 +455,33 @@ def evaluate_tender(
     tender_price = tender.get("price")
     is_fixed = bool(tender.get("is_fixed_bid"))
 
+    # By default we only run fixed tenders to avoid reserve/auction fines.
+    if not is_fixed and (FIXED_ONLY_MODE or not ENABLE_AUCTION_BIDS):
+        return None, "auction disabled in safe mode"
+
+    expected_gross_pnl = 0.0
     if my_action == "BUY":
         # We BUY from tender, then SELL in market at est_px.
         fair = est_px - edge
         fixed_accept = tender_price is not None and float(tender_price) <= fair
         submit_price = max(MIN_AUCTION_PRICE, round(fair, 2))
+        if tender_price is not None:
+            expected_gross_pnl = (est_px - float(tender_price)) * qty
     else:
         # We SELL to tender, then BUY in market at est_px.
         fair = est_px + edge
         fixed_accept = tender_price is not None and float(tender_price) >= fair
         submit_price = max(MIN_AUCTION_PRICE, round(fair, 2))
+        if tender_price is not None:
+            expected_gross_pnl = (float(tender_price) - est_px) * qty
+
+    if is_fixed:
+        pnl_per_share = expected_gross_pnl / max(1.0, qty)
+        if expected_gross_pnl < MIN_EXPECTED_GROSS_PNL or pnl_per_share < MIN_EXPECTED_PNL_PER_SHARE:
+            return None, (
+                f"edge too small est_pnl={expected_gross_pnl:.2f} "
+                f"pps={pnl_per_share:.4f} qty={qty:.0f}"
+            )
 
     return (
         TenderDecision(
@@ -428,17 +495,18 @@ def evaluate_tender(
             estimate_qty=estimate_qty,
             edge=edge,
             estimate_px=est_px,
+            expected_gross_pnl=expected_gross_pnl,
         ),
         "ok",
     )
 
 
 def infer_max_order_qty(sec: dict) -> float:
-    for key in ("max_trade_size", "max_order_size", "max_trade_qty", "limit"):
+    for key in ("max_trade_size", "max_order_size", "max_trade_qty", "max_order_qty"):
         v = sec.get(key)
         if isinstance(v, (int, float)) and v > 0:
-            return float(v)
-    return DEFAULT_MAX_ORDER_QTY
+            return min(float(v), HARD_MAX_ORDER_QTY)
+    return min(DEFAULT_MAX_ORDER_QTY, HARD_MAX_ORDER_QTY)
 
 
 def schedule_hedge(hedges: list[HedgeJob], ticker: str, action: str, qty: float, max_order_qty: float):
@@ -457,7 +525,7 @@ def schedule_hedge(hedges: list[HedgeJob], ticker: str, action: str, qty: float,
     )
 
 
-def process_hedges(client: RITClient, hedges: list[HedgeJob]) -> list[HedgeJob]:
+def process_hedges(client: RITClient, hedges: list[HedgeJob], throttle: OrderThrottle) -> list[HedgeJob]:
     now = time.time()
     still = []
     for h in hedges:
@@ -469,6 +537,7 @@ def process_hedges(client: RITClient, hedges: list[HedgeJob]) -> list[HedgeJob]:
 
         qty = min(h.slice_qty, h.remaining, h.max_order_qty)
         try:
+            throttle.wait()
             client.place_order(h.ticker, "MARKET", qty, h.action)
             print(f"HEDGE {h.action} {h.ticker} qty={qty:.0f} rem_before={h.remaining:.0f}")
             h.remaining -= qty
@@ -489,6 +558,27 @@ def process_hedges(client: RITClient, hedges: list[HedgeJob]) -> list[HedgeJob]:
     return still
 
 
+def flatten_positions_step(
+    client: RITClient,
+    positions: dict[str, float],
+    sec_by_ticker: dict[str, dict],
+    throttle: OrderThrottle,
+):
+    for ticker, pos in positions.items():
+        if abs(pos) < 1:
+            continue
+        action = "SELL" if pos > 0 else "BUY"
+        qty = min(abs(pos), infer_max_order_qty(sec_by_ticker.get(ticker, {})))
+        if qty <= 0:
+            continue
+        try:
+            throttle.wait()
+            client.place_order(ticker, "MARKET", qty, action)
+            print(f"FLATTEN {action} {ticker} qty={qty:.0f} from_pos={pos:.0f}")
+        except Exception as exc:
+            print(f"FLATTEN ERROR {ticker} action={action} qty={qty:.0f}: {exc}")
+
+
 def main():
     if API_KEY == "YOUR_API_KEY":
         raise RuntimeError("Set RIT_API_KEY environment variable before running.")
@@ -499,8 +589,12 @@ def main():
     processed_tenders = set()
     last_hold_log_at = {}
     hedges: list[HedgeJob] = []
+    throttle = OrderThrottle(min_spacing=ORDER_MIN_SPACING_SECS)
 
-    print(f"Connected to {BASE_URL}. Running Liquidity APEX bot...")
+    print(
+        f"Connected to {BASE_URL}. Running Liquidity APEX bot..."
+        f" fixed_only={FIXED_ONLY_MODE} auction={ENABLE_AUCTION_BIDS}"
+    )
 
     while True:
         case = client.get_case()
@@ -509,6 +603,7 @@ def main():
             break
 
         current_tick = int(case.get("tick", 0))
+        case_ticks_left = infer_case_ticks_left(case)
 
         # Refresh market/risk state each loop (simple and robust).
         securities = client.get_securities()
@@ -522,7 +617,13 @@ def main():
         except Exception:
             gross_limit, net_limit = FALLBACK_GROSS_LIMIT, FALLBACK_NET_LIMIT
 
-        hedges = process_hedges(client, hedges)
+        hedges = process_hedges(client, hedges, throttle)
+
+        if case_ticks_left is not None and case_ticks_left <= FORCE_FLATTEN_TICKS_LEFT:
+            print(f"ENDGAME flatten mode: case_ticks_left={case_ticks_left}")
+            flatten_positions_step(client, positions, sec_by_ticker, throttle)
+            time.sleep(POLL_SECS)
+            continue
 
         try:
             tenders = client.get_tenders()
@@ -534,6 +635,16 @@ def main():
         for tender in tenders:
             tid = tender.get("tender_id")
             if tid in processed_tenders:
+                continue
+
+            if case_ticks_left is not None and case_ticks_left <= STOP_NEW_TENDERS_TICKS_LEFT:
+                print(f"SKIP tender {tid}: endgame (case_ticks_left={case_ticks_left})")
+                processed_tenders.add(tid)
+                continue
+
+            pending_hedge_qty = sum(h.remaining for h in hedges)
+            if pending_hedge_qty > MAX_PENDING_HEDGE_QTY:
+                print(f"HOLD tender {tid}: pending hedge qty too high ({pending_hedge_qty:.0f})")
                 continue
 
             decision, reason = evaluate_tender(
@@ -594,7 +705,8 @@ def main():
                     processed_tenders.add(tid)
                     print(
                         f"ACCEPT fixed tender {tid} ticker={decision.ticker} qty={decision.qty:.0f} "
-                        f"my_action={decision.my_action} hedge={decision.hedge_action}"
+                        f"my_action={decision.my_action} hedge={decision.hedge_action} "
+                        f"est_pnl={decision.expected_gross_pnl:.2f}"
                     )
                 else:
                     if ticks_left is not None and ticks_left > AUCTION_BID_TICKS_LEFT:

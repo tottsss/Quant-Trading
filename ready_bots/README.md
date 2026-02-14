@@ -13,6 +13,8 @@ These files are standalone versions meant for quick testing on a Windows machine
    - PowerShell:
      - `$env:RIT_API_KEY="YOUR_KEY"`
      - `$env:RIT_BASE_URL="http://localhost:9999/v1"`
+     - `$env:RIT_FIXED_ONLY="1"` (recommended)
+     - `$env:RIT_MIN_GROSS_PNL="300"` (tighten/loosen selectivity)
 3. Run the script:
    - `python <bot_file>.py`
 
