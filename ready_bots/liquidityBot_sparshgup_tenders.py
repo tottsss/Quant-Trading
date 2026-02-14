@@ -43,6 +43,15 @@ def get_tenders(session):
     return resp.json()
 
 
+def get_tender_map(session):
+    out = {}
+    for t in get_tenders(session):
+        tid = t.get("tender_id")
+        if tid is not None:
+            out[tid] = t
+    return out
+
+
 def get_securities(session):
     resp = session.get(f"{BASE_URL}/securities")
     if not resp.ok:
@@ -136,9 +145,13 @@ def accept_tender(session, tender):
     action = tender.get("action")
     resp = session.post(f"{BASE_URL}/tenders/{tender_id}")
     if not resp.ok:
-        raise ApiException(f"Failed to accept tender {tender_id} for {ticker} at {price} ({action})")
+        print(
+            f"Accept failed (likely expired/unavailable) for tender {tender_id}: "
+            f"{ticker} {action} @ {price} status={resp.status_code}"
+        )
+        return False
     print(f"Accepted Tender {tender_id}: {ticker} {action} @ {price}")
-    return resp.json() if resp.content else {}
+    return True
 
 
 def decline_tender(session, tender):
@@ -148,8 +161,13 @@ def decline_tender(session, tender):
     action = tender.get("action")
     resp = session.delete(f"{BASE_URL}/tenders/{tender_id}")
     if not resp.ok:
-        raise ApiException(f"Failed to decline tender {tender_id} for {ticker} at {price} ({action})")
+        print(
+            f"Decline failed (likely expired/unavailable) for tender {tender_id}: "
+            f"{ticker} {action} @ {price} status={resp.status_code}"
+        )
+        return False
     print(f"Declined Tender {tender_id}: {ticker} {action} @ {price}")
+    return True
 
 
 def submit_limit_order(session, ticker, quantity, price, action):
@@ -229,15 +247,33 @@ def evaluate_tender(session, tender):
     tender_price = float(raw_price)
 
     attempts = 0
-    max_attempts = 13
+    max_attempts = 8
     threshold = 0.15
-    evaluation_delay = 2.0
+    evaluation_delay = 1.0
     after_accept_delay = 1.5
     order_delay = 0.2
     accepted = False
 
+    # Tender windows are short (often 20-30s). Bound attempts by remaining tender time.
+    expires = tender.get("expires")
+    try:
+        tick_now, _, _ = get_tick(session)
+        if isinstance(expires, (int, float)):
+            ticks_left = max(0, int(expires) - int(tick_now))
+            max_attempts = max(1, min(max_attempts, ticks_left - 1))
+    except Exception:
+        pass
+
     while attempts < max_attempts:
         time.sleep(evaluation_delay)
+        live = get_tender_map(session).get(tender_id)
+        if live is None:
+            print(f"Tender {tender_id} no longer available. Stop evaluation.")
+            return
+        live_status = str(live.get("status", "")).upper()
+        if live_status and live_status not in {"OFFERED", "OPEN", "ACTIVE"}:
+            print(f"Tender {tender_id} status={live_status}. Stop evaluation.")
+            return
 
         ob = get_order_book(session, ticker)
         bid_volume = ob["bid_volume"]
@@ -246,12 +282,10 @@ def evaluate_tender(session, tender):
         vwap_ask = ob["vwap_ask"]
 
         if action == "BUY" and tender_price < vwap_bid + threshold and bid_volume * 1.2 > ask_volume:
-            accept_tender(session, tender)
-            accepted = True
+            accepted = accept_tender(session, tender)
             break
         elif action == "SELL" and tender_price > vwap_ask - threshold and ask_volume * 1.2 > bid_volume:
-            accept_tender(session, tender)
-            accepted = True
+            accepted = accept_tender(session, tender)
             break
 
         attempts += 1
@@ -301,7 +335,12 @@ def main():
                 tid = tender.get("tender_id")
                 if tid in processed_tenders:
                     continue
-                evaluate_tender(session, tender)
+                try:
+                    evaluate_tender(session, tender)
+                except ApiException as exc:
+                    print(f"Tender error {tid}: {exc}")
+                except Exception as exc:
+                    print(f"Unexpected tender error {tid}: {exc}")
                 processed_tenders.add(tid)
 
             time.sleep(1.0)
