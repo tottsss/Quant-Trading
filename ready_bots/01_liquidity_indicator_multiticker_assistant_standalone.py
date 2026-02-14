@@ -13,6 +13,10 @@ Run (PowerShell):
 Optional:
   $env:RIT_AUTO_EXEC="1"            # auto orders from ranked signals
   $env:RIT_ALLOW_SPECULATIVE="1"    # allow auto orders in Liquidity case
+
+Tender decision support:
+- Prints ACCEPT/DECLINE recommendations for each open tender.
+- In this script, non-fixed tenders are declined by design (simple mode).
 """
 
 from __future__ import annotations
@@ -39,6 +43,9 @@ ORDER_QTY = max(1.0, min(10000.0, float(os.environ.get("RIT_ORDER_QTY", "1000"))
 ORDER_COOLDOWN_SECS = float(os.environ.get("RIT_ORDER_COOLDOWN_SECS", "3.0"))
 TOP_N = max(1, int(os.environ.get("RIT_TOP_N", "4")))
 MAX_SPREAD_BPS = float(os.environ.get("RIT_MAX_SPREAD_BPS", "35"))
+TENDER_EST_QTY_CAP = float(os.environ.get("RIT_TENDER_EST_QTY_CAP", "25000"))
+TENDER_MIN_GROSS_PNL = float(os.environ.get("RIT_TENDER_MIN_GROSS_PNL", "300"))
+TENDER_MIN_PNL_PER_SHARE = float(os.environ.get("RIT_TENDER_MIN_PNL_PER_SHARE", "0.012"))
 
 AUTO_EXEC = os.environ.get("RIT_AUTO_EXEC", "0").strip().lower() in {"1", "true", "yes", "on"}
 ALLOW_SPECULATIVE = os.environ.get("RIT_ALLOW_SPECULATIVE", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -70,6 +77,18 @@ class TickerSignal:
     spread_bps: float
     blocked: bool
     block_reason: str
+
+
+@dataclass
+class TenderDecision:
+    tender_id: int
+    ticker: str
+    decision: str
+    reason: str
+    my_action: str
+    qty: float
+    price: float | None
+    expected_pnl: float | None = None
 
 
 def ema(values: list[float], period: int) -> float | None:
@@ -207,6 +226,102 @@ def tender_ticker_set(tenders: list[dict]) -> set[str]:
     return out
 
 
+def infer_ticker_from_tender(tender: dict, valid_tickers: set[str]) -> str | None:
+    tk = tender.get("ticker")
+    if isinstance(tk, str) and tk in valid_tickers:
+        return tk
+    caption = str(tender.get("caption") or "")
+    for vt in valid_tickers:
+        if vt in caption:
+            return vt
+    return None
+
+
+def infer_my_action(tender: dict) -> str:
+    caption = str(tender.get("caption") or "").lower()
+    if "would you like to sell" in caption:
+        return "SELL"
+    if "would you like to buy" in caption:
+        return "BUY"
+
+    # API tender action is institution side; invert for our side.
+    a = str(tender.get("action") or "").upper()
+    if a == "BUY":
+        return "SELL"
+    if a == "SELL":
+        return "BUY"
+    return "BUY"
+
+
+def tender_expected_pnl(my_action: str, tender_price: float, hedge_px: float, qty: float, fee_per_share: float) -> float:
+    if my_action == "BUY":
+        gross = (hedge_px - tender_price) * qty
+    else:
+        gross = (tender_price - hedge_px) * qty
+    return gross - fee_per_share * qty
+
+
+def recommend_tender_decision(
+    tender: dict,
+    valid_tickers: set[str],
+    book_by_ticker: dict[str, dict],
+    fee_by_ticker: dict[str, float],
+) -> TenderDecision:
+    tid = int(tender.get("tender_id") or -1)
+    is_fixed = bool(tender.get("is_fixed_bid"))
+    if not is_fixed:
+        return TenderDecision(tid, str(tender.get("ticker") or "?"), "DECLINE", "non-fixed disabled (simple mode)", "N/A", 0.0, None)
+
+    ticker = infer_ticker_from_tender(tender, valid_tickers)
+    if not ticker:
+        return TenderDecision(tid, "?", "DECLINE", "ticker unresolved", "N/A", 0.0, None)
+
+    raw_qty = tender.get("quantity")
+    qty = abs(float(raw_qty)) if isinstance(raw_qty, (int, float)) else 0.0
+    px = tender.get("price")
+    if qty <= 0 or not isinstance(px, (int, float)):
+        return TenderDecision(tid, ticker, "DECLINE", "invalid qty/price", "N/A", qty, float(px) if isinstance(px, (int, float)) else None)
+
+    my_action = infer_my_action(tender)
+    hedge_action = "BUY" if my_action == "SELL" else "SELL"
+
+    book = book_by_ticker.get(ticker)
+    if not isinstance(book, dict):
+        return TenderDecision(tid, ticker, "DECLINE", "missing book", my_action, qty, float(px))
+
+    est_qty = min(qty, TENDER_EST_QTY_CAP)
+    hedge_px = depth_vwap_for_action(book, hedge_action, est_qty)
+    if hedge_px is None:
+        return TenderDecision(tid, ticker, "DECLINE", "insufficient depth for hedge", my_action, qty, float(px))
+
+    fee_ps = fee_by_ticker.get(ticker, 0.0)
+    exp_pnl = tender_expected_pnl(my_action, float(px), hedge_px, qty, fee_ps)
+    pps = exp_pnl / max(1.0, qty)
+
+    if exp_pnl >= TENDER_MIN_GROSS_PNL and pps >= TENDER_MIN_PNL_PER_SHARE:
+        return TenderDecision(
+            tid,
+            ticker,
+            "ACCEPT",
+            f"expected_pnl={exp_pnl:.2f} pps={pps:.4f}",
+            my_action,
+            qty,
+            float(px),
+            expected_pnl=exp_pnl,
+        )
+
+    return TenderDecision(
+        tid,
+        ticker,
+        "DECLINE",
+        f"edge too small expected_pnl={exp_pnl:.2f} pps={pps:.4f}",
+        my_action,
+        qty,
+        float(px),
+        expected_pnl=exp_pnl,
+    )
+
+
 def build_signal(prices: list[float], volumes: list[float], book: dict) -> tuple[str, int, float, str, float]:
     if len(prices) < max(EMA_SLOW + 2, RSI_PERIOD + 2) or len(volumes) < VOL_LOOKBACK:
         return "HOLD", 0, 0.0, "not_enough_data", 999.0
@@ -262,7 +377,13 @@ def main():
         in_liquidity = "liquidity" in case_name
 
         securities = client.get("/securities")
-        all_tickers = [s.get("ticker") for s in securities if s.get("ticker")]
+        sec_by_ticker = {s.get("ticker"): s for s in securities if s.get("ticker")}
+        fee_by_ticker = {
+            tk: float(sec.get("trading_fee") or sec.get("fee") or 0.0)
+            for tk, sec in sec_by_ticker.items()
+            if tk
+        }
+        all_tickers = list(sec_by_ticker.keys())
         tickers = resolve_tickers(all_tickers)
         if not tickers:
             print("No matching tickers resolved.")
@@ -284,10 +405,12 @@ def main():
             last_fine_print = fines_guess
 
         rows: list[TickerSignal] = []
+        book_by_ticker: dict[str, dict] = {}
         for tk in tickers:
             try:
                 tas = client.get("/securities/tas", {"ticker": tk, "limit": TAS_LIMIT})
                 book = client.get("/securities/book", {"ticker": tk, "limit": BOOK_LEVELS})
+                book_by_ticker[tk] = book
             except Exception as exc:
                 rows.append(TickerSignal(tk, "HOLD", 0, 0.0, f"data_error={exc}", 999.0, True, "data_error"))
                 continue
@@ -316,6 +439,22 @@ def main():
                 f"{r.ticker:6s} sig={r.signal:4s} score={r.score:+d} conf={r.confidence:.2f} "
                 f"spr={r.spread_bps:6.1f}bps | {r.reason}{block_txt}"
             )
+
+        if tenders:
+            print("OFFERS:")
+            tender_decisions = [
+                recommend_tender_decision(t, set(tickers), book_by_ticker, fee_by_ticker) for t in tenders
+            ]
+            tender_decisions.sort(key=lambda x: x.tender_id)
+            for td in tender_decisions:
+                px_txt = f"{td.price:.2f}" if isinstance(td.price, (int, float)) else "MKT"
+                print(
+                    f"  TENDER {td.tender_id} {td.ticker} qty={td.qty:.0f} px={px_txt} "
+                    f"-> {td.decision} ({td.reason})"
+                )
+            print("MANUAL ACTION: Click tender popup ACCEPT only when line says ACCEPT; otherwise DECLINE.")
+        else:
+            print("OFFERS: none")
 
         if AUTO_EXEC:
             tradable = [r for r in rows if (not r.blocked) and r.signal in ("BUY", "SELL")]
