@@ -1,140 +1,230 @@
-import requests
-import time
+"""
+Liquidity Risk VWAP & Limit Order Auto-Trader
+Methodology:
+- Calculates true VWAP of the order book up to the tender quantity.
+- Requires a strict profit margin per share to accept/bid.
+- Hedges inventory strictly using LIMIT orders at the best bid/ask to capture the spread.
+- Actively manages open orders (cancel/replace) to stay at the top of the book.
+- Cancels open orders and stops trading on a ticker if an unresolved tender appears (avoids fines).
+- Force-flattens via MARKET orders only in the final 30 seconds to avoid $10/share penalties.
+"""
+
 import os
+import time
+import requests
 
-# Configuration and Environment Setup
-API_KEY = os.getenv("RIT_API_KEY", "BNWI101Y")
-BASE_URL = os.getenv("RIT_BASE_URL", "http://localhost:9999/v1")
+# --- Configuration ---
+API_KEY = os.environ.get("RIT_API_KEY", "BNWI101Y") # Defaulting to your known key
+BASE_URL = os.environ.get("RIT_BASE_URL", "http://localhost:9999/v1").rstrip("/")
 SESSION = requests.Session()
-SESSION.headers.update({'X-API-Key': API_KEY})
+SESSION.headers.update({"X-API-key": API_KEY})
 
-MAX_ORDER_SIZE = 10000
-ENDGAME_SECONDS = 30  # Start flattening when less than 30s remain
-TENDER_PROFIT_MARGIN = 0.05  # Minimum expected profit per share (can be tuned)
+# Tuning Parameters
+PROFIT_MARGIN_PER_SHARE = 0.02  # $0.02 minimum profit per share required
+MAX_ORDER_QTY = 10000.0         # Standard RIT liquidity case constraint
+ENDGAME_TICKS = 30              # Seconds left to start force-flattening
 
-# Dynamic API Keys to map to the exact JSON payload specs
-API_KEY_KIND = chr(116) + chr(121) + chr(112) + chr(101)
-API_KEY_COND = chr(115) + chr(116) + chr(97) + chr(116) + chr(117) + chr(115)
+def get_api(endpoint, params=None):
+    resp = SESSION.get(BASE_URL + endpoint, params=params, timeout=3.0)
+    return resp.json() if resp.ok else None
 
-def get_case_info():
-    resp = SESSION.get(f"{BASE_URL}/case")
-    return resp.json() if resp.ok else {}
+def post_api(endpoint, payload=None):
+    resp = SESSION.post(BASE_URL + endpoint, json=payload, timeout=3.0)
+    return resp.json() if resp.ok else None
 
-def get_securities():
-    resp = SESSION.get(f"{BASE_URL}/securities")
-    return {s['ticker']: s for s in resp.json()} if resp.ok else {}
+def delete_api(endpoint):
+    resp = SESSION.delete(BASE_URL + endpoint, timeout=3.0)
+    return resp.json() if resp.ok else None
 
-def get_tenders():
-    resp = SESSION.get(f"{BASE_URL}/tenders")
-    return resp.json() if resp.ok else []
+def best_bid_ask(book: dict):
+    bids = book.get("bids", [])
+    asks = book.get("asks", [])
+    best_bid = bids[0]["price"] if bids else None
+    best_ask = asks[0]["price"] if asks else None
+    return best_bid, best_ask
 
-def monitor_fines():
-    resp = SESSION.get(f"{BASE_URL}/trader")
-    if resp.ok:
-        data = resp.json()
-        fines = sum(v for k, v in data.items() if "fine" in k.lower() and isinstance(v, (int, float)))
-        print(f"FINE WATCH: Current estimated fines: ${fines:,.2f}")
-
-def place_order(ticker, action, quantity, order_kind="MARKET", price=None):
-    payload = {
-        "ticker": ticker,
-        "action": action,
-        "quantity": quantity
-    }
-    payload[API_KEY_KIND] = order_kind
-    if price:
-        payload["price"] = price
+def calculate_vwap(book: dict, side: str, qty: float):
+    """Calculates the exact average price if we were to sweep 'qty' from the book."""
+    levels = book.get(side, [])
+    if not levels: return None
+    
+    # Bids are sorted desc (highest first), Asks are sorted asc (lowest first)
+    levels.sort(key=lambda x: x["price"], reverse=(side == "bids"))
+    
+    rem = qty
+    used = 0.0
+    notional = 0.0
+    
+    for level in levels:
+        if rem <= 0: break
+        take = min(rem, level["quantity"])
+        rem -= take
+        used += take
+        notional += take * level["price"]
         
-    resp = SESSION.post(f"{BASE_URL}/orders", json=payload)
-    return resp.ok
+    if rem > 0 or used <= 0:
+        return None # Not enough liquidity in the book
+    return notional / used
 
-def hedge_position(ticker, current_position):
-    if current_position == 0:
-        return
+def evaluate_and_bid_tenders(tenders, book_by_ticker, valid_tickers):
+    for t in tenders:
+        if t["status"] != "OFFERED":
+            continue
+            
+        tid = t["tender_id"]
+        ticker = t["ticker"]
+        qty = t["quantity"]
+        action = t["action"] # Action the CUSTOMER wants to do
+        is_fixed = t["is_fixed_bid"]
+        fixed_price = t.get("price", 0)
         
-    action = "SELL" if current_position > 0 else "BUY"
-    qty_to_hedge = abs(current_position)
-    
-    print(f"Hedging {qty_to_hedge} shares of {ticker}...")
-    while qty_to_hedge > 0:
-        chunk = min(MAX_ORDER_SIZE, qty_to_hedge)
-        success = place_order(ticker, action, chunk)
-        if success:
-            qty_to_hedge -= chunk
-            print(f"Hedged chunk of {chunk} {ticker}. Remaining: {qty_to_hedge}")
-            time.sleep(0.3)  # Rate limiting
-        else:
-            print(f"Failed to place hedge order for {ticker}. Retrying...")
-            time.sleep(1)
-
-def evaluate_and_trade():
-    case_info = get_case_info()
-    if not case_info: return
-    
-    time_remaining = case_info.get("ticks_per_period", 300) - case_info.get("tick", 0)
-    securities = get_securities()
-    tenders = get_tenders()
-    
-    # 1. Check for unresolved tenders to avoid front-running fines
-    unresolved_tickers = set()
-    for t in tenders:
-        condition = t.get(API_KEY_COND)
-        if condition != "ACCEPTED" and condition != "DECLINED":
-            unresolved_tickers.add(t['ticker'])
-
-    # 2. Endgame Flattening Sequence
-    if time_remaining <= ENDGAME_SECONDS:
-        print("ENDGAME INITIATED: Flattening all positions.")
-        for ticker, sec_data in securities.items():
-            pos = sec_data.get("position", 0)
-            if pos != 0 and ticker not in unresolved_tickers:
-                hedge_position(ticker, pos)
-        return
-
-    # 3. Process Tenders
-    for t in tenders:
-        condition = t.get(API_KEY_COND)
-        if condition == "OFFERED":
-            ticker = t['ticker']
-            tender_id = t['tender_id']
-            action = t['action']
-            price = t['price']
+        if ticker not in valid_tickers or ticker not in book_by_ticker:
+            continue
             
-            sec_data = securities.get(ticker, {})
-            last_price = sec_data.get("last", price)
+        book = book_by_ticker[ticker]
+        
+        # Determine our hedging side. If customer BUYS, we SELL to them, so we must BUY to hedge.
+        hedge_side_in_book = "asks" if action == "BUY" else "bids"
+        hedge_action = "BUY" if action == "BUY" else "SELL"
+        
+        # Calculate true cost of hedging
+        vwap_price = calculate_vwap(book, hedge_side_in_book, min(qty, MAX_ORDER_QTY * 2))
+        if vwap_price is None:
+            continue # Book too thin
             
-            # Straightforward profitability logic
-            is_profitable = False
-            if action == "BUY" and price > (last_price + TENDER_PROFIT_MARGIN):
-                is_profitable = True
-            elif action == "SELL" and price < (last_price - TENDER_PROFIT_MARGIN):
-                is_profitable = True
-                
-            if is_profitable:
-                print(f"Accepting profitable tender {tender_id} on {ticker}")
-                resp = SESSION.post(f"{BASE_URL}/tenders/{tender_id}")
-                if resp.ok:
-                    time.sleep(0.5) # Wait for fill
-                    updated_secs = get_securities()
-                    new_pos = updated_secs.get(ticker, {}).get("position", 0)
-                    hedge_position(ticker, new_pos)
+        # Calculate fair value based on required margin
+        if action == "BUY": # We are selling to them
+            my_bid_price = vwap_price + PROFIT_MARGIN_PER_SHARE
+            acceptable = (fixed_price >= my_bid_price) if is_fixed else True
+        else:               # We are buying from them
+            my_bid_price = vwap_price - PROFIT_MARGIN_PER_SHARE
+            acceptable = (fixed_price <= my_bid_price) if is_fixed else True
+
+        if is_fixed:
+            if acceptable:
+                print(f"ACCEPT Fixed Tender {tid} | Ticker: {ticker} | Expected Edge based on VWAP.")
+                post_api(f"/tenders/{tid}")
             else:
-                print(f"Declining unprofitable tender {tender_id}")
-                SESSION.delete(f"{BASE_URL}/tenders/{tender_id}")
+                delete_api(f"/tenders/{tid}")
+        else:
+            # It's an auction. Submit our calculated profitable bid.
+            print(f"BID Auction Tender {tid} | Ticker: {ticker} | Bid: ${my_bid_price:.2f}")
+            post_api(f"/tenders/{tid}", {"price": round(my_bid_price, 2)})
+
+def manage_limit_hedges(positions, open_orders, book_by_ticker, blocked_tickers):
+    """
+    Maintains LIMIT orders at the top of the book to unwind inventory.
+    Cancels orders if they are not at the top of the book or if the ticker is blocked.
+    """
+    for ticker, pos in positions.items():
+        if abs(pos) == 0:
+            continue
+            
+        ticker_orders = [o for o in open_orders if o["ticker"] == ticker]
+        
+        # If there's an active tender for this ticker, CANCEL ALL orders to avoid front-running fines.
+        if ticker in blocked_tickers:
+            for o in ticker_orders:
+                delete_api(f"/orders/{o['order_id']}")
+                print(f"CANCEL Hedge {o['order_id']} on {ticker}: Unresolved tender active.")
+            continue
+            
+        book = book_by_ticker.get(ticker)
+        if not book: continue
+        
+        best_bid, best_ask = best_bid_ask(book)
+        if best_bid is None or best_ask is None: continue
+        
+        # Determine what we need to do
+        action = "SELL" if pos > 0 else "BUY"
+        qty_to_hedge = min(abs(pos), MAX_ORDER_QTY)
+        target_price = best_ask if action == "SELL" else best_bid
+        
+        has_optimal_order = False
+        
+        for o in ticker_orders:
+            # If our order is for the right action and is exactly at the best price, keep it
+            if o["action"] == action and o["price"] == target_price:
+                has_optimal_order = True
+            else:
+                # Cancel if we are off the top of the book or wrong direction
+                delete_api(f"/orders/{o['order_id']}")
+                
+        # If we don't have an order at the best price, place one
+        if not has_optimal_order and qty_to_hedge > 0:
+            payload = {
+                "ticker": ticker,
+                "type": "LIMIT",
+                "action": action,
+                "quantity": qty_to_hedge,
+                "price": target_price
+            }
+            post_api("/orders", payload)
+            print(f"PLACED LIMIT HEDGE: {action} {qty_to_hedge} {ticker} @ {target_price}")
+
+def execute_endgame_flattening(positions):
+    """Strictly use MARKET orders to wipe all inventory to 0 in the final seconds."""
+    for ticker, pos in positions.items():
+        if abs(pos) > 0:
+            action = "SELL" if pos > 0 else "BUY"
+            qty = min(abs(pos), MAX_ORDER_QTY)
+            post_api("/orders", {
+                "ticker": ticker,
+                "type": "MARKET",
+                "action": action,
+                "quantity": float(qty)
+            })
+            print(f"ENDGAME MARKET FLATTEN: {action} {qty} {ticker}")
 
 def main():
-    print("Starting Liquidity Bot...")
+    print("Starting VWAP & Limit Order Auto-Trader...")
     while True:
         try:
-            evaluate_and_trade()
-            monitor_fines()
-            time.sleep(1)
-        except KeyboardInterrupt:
-            print("Bot stopped by user.")
-            break
+            case = get_api("/case")
+            if not case or case.get("status") != "ACTIVE":
+                time.sleep(1)
+                continue
+                
+            ticks_left = case.get("ticks_per_period", 300) - case.get("tick", 0)
+            
+            securities = get_api("/securities")
+            valid_tickers = [s["ticker"] for s in securities]
+            positions = {s["ticker"]: s["position"] for s in securities}
+            
+            tenders = get_api("/tenders") or []
+            open_orders = get_api("/orders", {"status": "OPEN"}) or []
+            
+            # Identify tickers with active tenders to avoid front-running
+            blocked_tickers = {t["ticker"] for t in tenders if t["status"] not in ("ACCEPTED", "DECLINED", "REJECTED")}
+
+            if ticks_left <= ENDGAME_TICKS:
+                # Cancel all open limit orders before dumping via market
+                for o in open_orders:
+                    delete_api(f"/orders/{o['order_id']}")
+                execute_endgame_flattening(positions)
+                time.sleep(0.3)
+                continue
+
+            # Pre-fetch order books for speed
+            book_by_ticker = {}
+            for tk in valid_tickers:
+                book = get_api("/securities/book", {"ticker": tk, "limit": 40})
+                if book: book_by_ticker[tk] = book
+
+            evaluate_and_bid_tenders(tenders, book_by_ticker, valid_tickers)
+            manage_limit_hedges(positions, open_orders, book_by_ticker, blocked_tickers)
+            
+            # Print Fine Watch every few cycles
+            if int(ticks_left) % 10 == 0:
+                trader_data = get_api("/trader") or {}
+                fines = sum(v for k, v in trader_data.items() if "fine" in str(k).lower() and isinstance(v, (int, float)))
+                print(f"--- FINE WATCH: ${fines:,.2f} ---")
+
+            time.sleep(0.1) # Fast iteration loop for market making
+            
         except Exception as e:
-            print(f"Error: {e}")
-            time.sleep(2)
+            print(f"Loop Error: {e}")
+            time.sleep(1)
 
 if __name__ == "__main__":
     main()
