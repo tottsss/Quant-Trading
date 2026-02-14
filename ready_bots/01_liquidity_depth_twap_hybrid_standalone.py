@@ -24,6 +24,8 @@ MIN_EDGE = 0.03
 MAX_LEVELS = 50
 # Use a capped quantity to estimate hedge cost on very large tenders.
 HEDGE_ESTIMATE_QTY_CAP = 15000
+MIN_AUCTION_PRICE = 0.01
+DEFAULT_MAX_ORDER_QTY = 10000
 
 # TWAP hedge controls
 TWAP_SLICES = 5
@@ -52,8 +54,9 @@ class RITClient:
         r.raise_for_status()
         return r.json()
 
-    def get_securities(self):
-        r = self._get("/securities")
+    def get_securities(self, ticker: str | None = None):
+        params = {"ticker": ticker} if ticker else None
+        r = self._get("/securities", params=params)
         r.raise_for_status()
         return r.json()
 
@@ -144,7 +147,7 @@ def estimate_fill_price(levels: list[dict], qty: float, max_levels: int):
     return notional / used, used, remaining
 
 
-def schedule_twap(hedges: list[dict], ticker: str, action: str, qty: float):
+def schedule_twap(hedges: list[dict], ticker: str, action: str, qty: float, max_order_qty: float):
     slices = max(1, TWAP_SLICES)
     slice_qty = max(1.0, qty / slices)
     hedges.append(
@@ -153,6 +156,7 @@ def schedule_twap(hedges: list[dict], ticker: str, action: str, qty: float):
             "action": action,
             "remaining": qty,
             "slice_qty": slice_qty,
+            "max_order_qty": max(1.0, max_order_qty),
             "next_time": time.time(),
             "interval": TWAP_INTERVAL_SECS,
         }
@@ -168,7 +172,7 @@ def process_hedges(client: RITClient, hedges: list[dict]):
         if now < h["next_time"]:
             still.append(h)
             continue
-        qty = min(h["slice_qty"], h["remaining"])
+        qty = min(h["slice_qty"], h["remaining"], h["max_order_qty"])
         try:
             client.place_order(h["ticker"], "MARKET", qty, h["action"])
             print(f"HEDGE {h['action']} {h['ticker']} qty={qty}")
@@ -232,13 +236,23 @@ def evaluate_tender(client: RITClient, tender: dict, tickers: list[str]):
     }, "ok"
 
 
+def infer_max_order_qty(security: dict):
+    for k in ("max_trade_size", "max_trade_qty", "max_order_size", "limit"):
+        v = security.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v)
+    return float(DEFAULT_MAX_ORDER_QTY)
+
+
 def main():
     if API_KEY == "YOUR_API_KEY":
         raise RuntimeError("Set RIT_API_KEY environment variable before running.")
 
     client = RITClient(API_KEY, base_url=BASE_URL)
     wait_until_active(client)
-    tickers = [s["ticker"] for s in client.get_securities()]
+    securities = client.get_securities()
+    tickers = [s["ticker"] for s in securities]
+    max_qty_by_ticker = {s["ticker"]: infer_max_order_qty(s) for s in securities}
     seen = set()
     hedges = []
 
@@ -290,6 +304,14 @@ def main():
                         f"qty={decision['qty']:.0f} estimate_qty={decision['estimate_qty']:.0f}"
                     )
                 else:
+                    if decision["submit_price"] < MIN_AUCTION_PRICE:
+                        client.decline_tender(tid)
+                        seen.add(tid)
+                        print(
+                            f"DECLINE auction tender {tid} ticker={decision['ticker']} "
+                            f"invalid submit_price={decision['submit_price']}"
+                        )
+                        continue
                     client.accept_tender(tid, price=decision["submit_price"])
                     print(
                         f"BID auction tender {tid} ticker={decision['ticker']} "
@@ -297,7 +319,14 @@ def main():
                     )
 
                 seen.add(tid)
-                schedule_twap(hedges, decision["ticker"], decision["hedge_action"], decision["qty"])
+                max_order_qty = max_qty_by_ticker.get(decision["ticker"], float(DEFAULT_MAX_ORDER_QTY))
+                schedule_twap(
+                    hedges,
+                    decision["ticker"],
+                    decision["hedge_action"],
+                    decision["qty"],
+                    max_order_qty=max_order_qty,
+                )
             except Exception as exc:
                 print(f"TENDER ACTION ERROR {tid}: {exc}")
 
