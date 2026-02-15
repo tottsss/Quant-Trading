@@ -42,6 +42,12 @@ VOL_RELAX_PER_ATTEMPT = float(_env("RIT_FINAL_RISKY_VOL_RELAX_PER_ATTEMPT", "RIT
 HEDGE_RATIO = float(_env("RIT_FINAL_RISKY_HEDGE_RATIO", "RIT_FINAL_HEDGE_RATIO", "0.45" if AGGRESSIVE_MODE else "0.80"))
 HEDGE_RATIO = max(0.0, min(1.0, HEDGE_RATIO))
 PORTFOLIO_PRINT_INTERVAL = float(_env("RIT_FINAL_RISKY_PORTFOLIO_PRINT_INTERVAL", "RIT_FINAL_PORTFOLIO_PRINT_INTERVAL", "5.0"))
+TAKE_PROFIT_ENABLED = _env_bool("RIT_FINAL_RISKY_TAKE_PROFIT_ENABLED", "RIT_FINAL_TAKE_PROFIT_ENABLED", "1")
+TAKE_PROFIT_PER_SHARE = float(_env("RIT_FINAL_RISKY_TAKE_PROFIT_PER_SHARE", "RIT_FINAL_TAKE_PROFIT_PER_SHARE", "0.30"))
+TAKE_PROFIT_COVER_RATIO = float(_env("RIT_FINAL_RISKY_TAKE_PROFIT_COVER_RATIO", "RIT_FINAL_TAKE_PROFIT_COVER_RATIO", "0.35"))
+TAKE_PROFIT_COVER_RATIO = max(0.01, min(1.0, TAKE_PROFIT_COVER_RATIO))
+TAKE_PROFIT_MIN_QTY = float(_env("RIT_FINAL_RISKY_TAKE_PROFIT_MIN_QTY", "RIT_FINAL_TAKE_PROFIT_MIN_QTY", "1000"))
+TAKE_PROFIT_COOLDOWN = float(_env("RIT_FINAL_RISKY_TAKE_PROFIT_COOLDOWN", "RIT_FINAL_TAKE_PROFIT_COOLDOWN", "2.0"))
 
 
 def signal_handler(signum, frame):
@@ -235,6 +241,62 @@ def log_portfolio(session, tick, tpp):
     print("[PORTFOLIO] " + " | ".join(lines))
 
 
+def _cost_basis(row):
+    for key in ("cost", "vwap"):
+        px = row.get(key)
+        if isinstance(px, (int, float)):
+            return float(px)
+    return None
+
+
+def maybe_take_profit_cover(session, last_tp_by_ticker):
+    if not TAKE_PROFIT_ENABLED or TAKE_PROFIT_PER_SHARE <= 0:
+        return
+
+    now = time.monotonic()
+    for s in get_securities(session):
+        ticker = s.get("ticker")
+        if not ticker:
+            continue
+        pos = float(s.get("position", 0.0))
+        if abs(pos) < 1:
+            continue
+        cost = _cost_basis(s)
+        if cost is None:
+            continue
+        if now - last_tp_by_ticker.get(ticker, 0.0) < TAKE_PROFIT_COOLDOWN:
+            continue
+
+        ob = get_order_book_agg(session, ticker)
+        if pos < 0:
+            if not ob["asks"]:
+                continue
+            exec_px = ob["asks"][0]["price"]
+            edge = cost - exec_px
+            action = "BUY"
+        else:
+            if not ob["bids"]:
+                continue
+            exec_px = ob["bids"][0]["price"]
+            edge = exec_px - cost
+            action = "SELL"
+
+        if edge < TAKE_PROFIT_PER_SHARE:
+            continue
+
+        cover_qty = max(TAKE_PROFIT_MIN_QTY, abs(pos) * TAKE_PROFIT_COVER_RATIO)
+        cover_qty = min(abs(pos), cover_qty)
+        if cover_qty < 1:
+            continue
+
+        submit_market_order(session, ticker, cover_qty, action)
+        last_tp_by_ticker[ticker] = now
+        print(
+            f"[TAKE_PROFIT] {ticker} {action} {cover_qty:.0f} "
+            f"edge={edge:.3f} cost={cost:.2f} exec={exec_px:.2f}"
+        )
+
+
 def unwind_inventory(session, ticker, inventory):
     if abs(inventory) < 1:
         return
@@ -396,6 +458,7 @@ def main():
 
     processed = set()
     next_portfolio_print = 0.0
+    last_tp_by_ticker = {}
     with requests.Session() as session:
         session.headers.update(HEADERS)
         while not SHUTDOWN:
@@ -407,6 +470,11 @@ def main():
             if tick >= tpp - ENDGAME_TICKS:
                 close_positions(session)
                 break
+
+            try:
+                maybe_take_profit_cover(session, last_tp_by_ticker)
+            except Exception as exc:
+                print(f"Take-profit error: {exc}")
 
             if PORTFOLIO_PRINT_INTERVAL > 0:
                 now = time.monotonic()
