@@ -248,14 +248,31 @@ def _cost_basis(row):
     return None
 
 
+def _is_unresolved_tender(tender):
+    status = str(tender.get("status", "")).upper()
+    if not status:
+        return True
+    return status in {"OFFERED", "OPEN", "ACTIVE", "PENDING"}
+
+
 def maybe_take_profit_cover(session, last_tp_by_ticker):
     if not TAKE_PROFIT_ENABLED or TAKE_PROFIT_PER_SHARE <= 0:
         return
+
+    unresolved_bases = set()
+    for t in get_tenders(session):
+        tk = t.get("ticker")
+        if not tk:
+            continue
+        if _is_unresolved_tender(t):
+            unresolved_bases.add(_base_symbol(tk))
 
     now = time.monotonic()
     for s in get_securities(session):
         ticker = s.get("ticker")
         if not ticker:
+            continue
+        if _base_symbol(ticker) in unresolved_bases:
             continue
         pos = float(s.get("position", 0.0))
         if abs(pos) < 1:
