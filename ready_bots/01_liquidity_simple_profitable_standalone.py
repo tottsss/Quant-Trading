@@ -5,6 +5,7 @@ What it does
 - Accepts only when depth-adjusted hedge economics are clearly positive.
 - Enforces gross/net usage buffers before accepting.
 - Avoids front-running by pausing hedge trading while unresolved tenders exist on that ticker family.
+- Uses safe-mode defaults in code (conservative acceptance, earlier endgame, tighter risk caps).
 - Stops opening new tender risk near end and force-flattens inventory.
 
 Run (PowerShell)
@@ -26,29 +27,44 @@ import requests
 API_KEY = os.environ.get("RIT_API_KEY", "YOUR_API_KEY")
 BASE_URL = os.environ.get("RIT_BASE_URL", "http://localhost:9999/v1").rstrip("/")
 
+
+def env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+SAFE_MODE = env_flag("RIT_SAFE_MODE", True)
+
 POLL_SECS = float(os.environ.get("RIT_POLL_SECS", "0.30"))
 BOOK_LEVELS = int(os.environ.get("RIT_BOOK_LEVELS", "70"))
-ORDER_MIN_SPACING_SECS = float(os.environ.get("RIT_ORDER_MIN_SPACING", "0.07"))
+ORDER_MIN_SPACING_SECS = float(os.environ.get("RIT_ORDER_MIN_SPACING", "0.08" if SAFE_MODE else "0.07"))
 
 DEFAULT_MAX_ORDER_QTY = 10000.0
 HARD_MAX_ORDER_QTY = 10000.0
-HEDGE_ESTIMATE_QTY_CAP = float(os.environ.get("RIT_HEDGE_EST_QTY_CAP", "30000"))
+HEDGE_ESTIMATE_QTY_CAP = float(os.environ.get("RIT_HEDGE_EST_QTY_CAP", "20000" if SAFE_MODE else "30000"))
+MAX_PENDING_HEDGE_QTY = float(os.environ.get("RIT_MAX_PENDING_HEDGE_QTY", "45000" if SAFE_MODE else "90000"))
+MAX_ACTIVE_HEDGES = int(os.environ.get("RIT_MAX_ACTIVE_HEDGES", "25" if SAFE_MODE else "40"))
 
-STOP_NEW_TENDERS_TICKS_LEFT = int(os.environ.get("RIT_STOP_NEW_TENDERS_TICKS_LEFT", "8"))
-FORCE_FLATTEN_TICKS_LEFT = int(os.environ.get("RIT_FORCE_FLATTEN_TICKS_LEFT", "4"))
+STOP_NEW_TENDERS_TICKS_LEFT = int(os.environ.get("RIT_STOP_NEW_TENDERS_TICKS_LEFT", "12" if SAFE_MODE else "8"))
+FORCE_FLATTEN_TICKS_LEFT = int(os.environ.get("RIT_FORCE_FLATTEN_TICKS_LEFT", "7" if SAFE_MODE else "4"))
 
-MIN_EXPECTED_GROSS_PNL = float(os.environ.get("RIT_MIN_GROSS_PNL", "320"))
-MIN_PPS_BASE = float(os.environ.get("RIT_MIN_PNL_PER_SHARE", "0.02"))
+MIN_EXPECTED_GROSS_PNL = float(os.environ.get("RIT_MIN_GROSS_PNL", "450" if SAFE_MODE else "320"))
+MIN_PPS_BASE = float(os.environ.get("RIT_MIN_PNL_PER_SHARE", "0.035" if SAFE_MODE else "0.02"))
 MIN_EDGE_ABS = float(os.environ.get("RIT_MIN_EDGE_ABS", "0.03"))
-SPREAD_EDGE_MULT = float(os.environ.get("RIT_SPREAD_EDGE_MULT", "0.25"))
-SIZE_EDGE_BPS_PER_10K = float(os.environ.get("RIT_SIZE_EDGE_BPS_PER_10K", "1.8"))
+SPREAD_EDGE_MULT = float(os.environ.get("RIT_SPREAD_EDGE_MULT", "0.30" if SAFE_MODE else "0.25"))
+SIZE_EDGE_BPS_PER_10K = float(os.environ.get("RIT_SIZE_EDGE_BPS_PER_10K", "2.2" if SAFE_MODE else "1.8"))
 
-GROSS_USAGE_CAP = float(os.environ.get("RIT_GROSS_USAGE_CAP", "0.88"))
-NET_USAGE_CAP = float(os.environ.get("RIT_NET_USAGE_CAP", "0.88"))
+GROSS_USAGE_CAP = float(os.environ.get("RIT_GROSS_USAGE_CAP", "0.82" if SAFE_MODE else "0.88"))
+NET_USAGE_CAP = float(os.environ.get("RIT_NET_USAGE_CAP", "0.82" if SAFE_MODE else "0.88"))
 FALLBACK_GROSS_LIMIT = 250000.0
 FALLBACK_NET_LIMIT = 150000.0
 
-FINE_WATCH_EVERY_SECS = float(os.environ.get("RIT_FINE_WATCH_EVERY_SECS", "5"))
+FINE_WATCH_EVERY_SECS = float(os.environ.get("RIT_FINE_WATCH_EVERY_SECS", "3" if SAFE_MODE else "5"))
+FINE_SPIKE_TRIGGER = float(os.environ.get("RIT_FINE_SPIKE_TRIGGER", "2500" if SAFE_MODE else "5000"))
+FINE_PAUSE_SECS = float(os.environ.get("RIT_FINE_PAUSE_SECS", "35" if SAFE_MODE else "20"))
+FINE_PAUSE_DECLINE = env_flag("RIT_FINE_PAUSE_DECLINE", True)
 
 
 @dataclass
@@ -269,8 +285,9 @@ def main():
     hedges: list[HedgeJob] = []
     last_fine_watch = 0.0
     last_fine_total = None
+    pause_new_accept_until = 0.0
 
-    print(f"Connected to {BASE_URL}. Running simple profitable liquidity bot.")
+    print(f"Connected to {BASE_URL}. Running simple profitable liquidity bot (safe_mode={SAFE_MODE}).")
 
     while True:
         try:
@@ -336,6 +353,14 @@ def main():
                 fine_total += sum_fine_fields(client.get("/trader"))
             except Exception:
                 pass
+            if last_fine_total is not None:
+                fine_delta = fine_total - last_fine_total
+                if fine_delta >= FINE_SPIKE_TRIGGER:
+                    pause_new_accept_until = max(pause_new_accept_until, now + FINE_PAUSE_SECS)
+                    print(
+                        f"SAFE PAUSE: fine spike +{fine_delta:.2f}, "
+                        f"pausing new accepts for {FINE_PAUSE_SECS:.0f}s"
+                    )
             if last_fine_total is None or abs(fine_total - last_fine_total) > 1e-6:
                 print(f"FINE WATCH total={fine_total:.2f}")
                 last_fine_total = fine_total
@@ -380,6 +405,33 @@ def main():
         for t in tenders:
             tid = t.get("tender_id")
             if tid in processed:
+                continue
+
+            pending_hedge_qty = sum(h.remaining for h in hedges if h.remaining > 0)
+            active_hedge_jobs = sum(1 for h in hedges if h.remaining > 0)
+            if pending_hedge_qty >= MAX_PENDING_HEDGE_QTY or active_hedge_jobs >= MAX_ACTIVE_HEDGES:
+                try:
+                    client.delete(f"/tenders/{tid}")
+                    print(
+                        f"DECLINE tender {tid}: hedge backlog "
+                        f"pending={pending_hedge_qty:.0f}/{MAX_PENDING_HEDGE_QTY:.0f} "
+                        f"jobs={active_hedge_jobs}/{MAX_ACTIVE_HEDGES}"
+                    )
+                except Exception as exc:
+                    print(f"DECLINE ERROR {tid}: {exc}")
+                processed.add(tid)
+                continue
+
+            if now < pause_new_accept_until:
+                if FINE_PAUSE_DECLINE:
+                    try:
+                        client.delete(f"/tenders/{tid}")
+                        print(f"DECLINE tender {tid}: safe pause active")
+                    except Exception as exc:
+                        print(f"DECLINE ERROR {tid}: {exc}")
+                    processed.add(tid)
+                else:
+                    print(f"HOLD tender {tid}: safe pause active")
                 continue
 
             tk = infer_ticker(t, valid_tickers)
