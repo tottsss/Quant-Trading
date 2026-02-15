@@ -26,30 +26,35 @@ def _env_bool(name, fallback, default):
 
 
 # Strategy params
-MIN_EDGE = float(_env("RIT_FINAL_RISKY_MIN_EDGE", "RIT_FINAL_MIN_EDGE", "0.07")) # Minimum edge for the tender to be accepted, default is 0.15
+MIN_EDGE = float(_env("RIT_FINAL_RISKY_MIN_EDGE", "RIT_FINAL_MIN_EDGE", "0.03"))
 # Minimum edge for the tender to be accepted
 
 
-VOL_FACTOR = float(_env("RIT_FINAL_RISKY_VOL_FACTOR", "RIT_FINAL_VOL_FACTOR", "0.95")) # Volume factor for the tender to be accepted, default is 1.2
-MAX_ATTEMPTS = int(_env("RIT_FINAL_RISKY_MAX_ATTEMPTS", "RIT_FINAL_MAX_ATTEMPTS", "16"))# Maximum number of attempts to evaluate the tender
-EVAL_DELAY = float(_env("RIT_FINAL_RISKY_EVAL_DELAY", "RIT_FINAL_EVAL_DELAY", "0.8"))# Delay between attempts to evaluate the tender
-ORDER_DELAY = float(_env("RIT_FINAL_RISKY_ORDER_DELAY", "RIT_FINAL_ORDER_DELAY", "0.10"))# Delay between orders, default is 0.15
-AFTER_ACCEPT_DELAY = float(_env("RIT_FINAL_RISKY_AFTER_ACCEPT_DELAY", "RIT_FINAL_AFTER_ACCEPT_DELAY", "0.35"))# Delay after accepting the tender, default is 0.6
+VOL_FACTOR = float(_env("RIT_FINAL_RISKY_VOL_FACTOR", "RIT_FINAL_VOL_FACTOR", "0.70"))
+MAX_ATTEMPTS = int(_env("RIT_FINAL_RISKY_MAX_ATTEMPTS", "RIT_FINAL_MAX_ATTEMPTS", "20"))
+EVAL_DELAY = float(_env("RIT_FINAL_RISKY_EVAL_DELAY", "RIT_FINAL_EVAL_DELAY", "0.5"))
+ORDER_DELAY = float(_env("RIT_FINAL_RISKY_ORDER_DELAY", "RIT_FINAL_ORDER_DELAY", "0.05"))
+AFTER_ACCEPT_DELAY = float(_env("RIT_FINAL_RISKY_AFTER_ACCEPT_DELAY", "RIT_FINAL_AFTER_ACCEPT_DELAY", "0.20"))
 MAX_ORDER_SIZE = 10000.0# Maximum order size
-ENDGAME_TICKS = int(_env("RIT_FINAL_RISKY_ENDGAME_TICKS", "RIT_FINAL_ENDGAME_TICKS", "5"))# Number of ticks to end the game
+ENDGAME_TICKS = int(_env("RIT_FINAL_RISKY_ENDGAME_TICKS", "RIT_FINAL_ENDGAME_TICKS", "2"))# Number of ticks to end the game
 FIXED_ONLY = _env_bool("RIT_FINAL_RISKY_FIXED_ONLY", "RIT_FINAL_FIXED_ONLY", "0")# Whether to only accept fixed tenders
 AGGRESSIVE_MODE = _env_bool("RIT_FINAL_RISKY_AGGRESSIVE", "RIT_FINAL_AGGRESSIVE", "1")
-EDGE_FLOOR_RATIO = float(_env("RIT_FINAL_RISKY_EDGE_FLOOR_RATIO", "RIT_FINAL_EDGE_FLOOR_RATIO", "0.30"))
-EDGE_DECAY_PER_ATTEMPT = float(_env("RIT_FINAL_RISKY_EDGE_DECAY_PER_ATTEMPT", "RIT_FINAL_EDGE_DECAY_PER_ATTEMPT", "0.015"))
-VOL_RELAX_PER_ATTEMPT = float(_env("RIT_FINAL_RISKY_VOL_RELAX_PER_ATTEMPT", "RIT_FINAL_VOL_RELAX_PER_ATTEMPT", "0.08"))
-HEDGE_RATIO = float(_env("RIT_FINAL_RISKY_HEDGE_RATIO", "RIT_FINAL_HEDGE_RATIO", "0.45" if AGGRESSIVE_MODE else "0.80"))
+EDGE_FLOOR_RATIO = float(_env("RIT_FINAL_RISKY_EDGE_FLOOR_RATIO", "RIT_FINAL_EDGE_FLOOR_RATIO", "0.15"))
+EDGE_DECAY_PER_ATTEMPT = float(_env("RIT_FINAL_RISKY_EDGE_DECAY_PER_ATTEMPT", "RIT_FINAL_EDGE_DECAY_PER_ATTEMPT", "0.020"))
+VOL_RELAX_PER_ATTEMPT = float(_env("RIT_FINAL_RISKY_VOL_RELAX_PER_ATTEMPT", "RIT_FINAL_VOL_RELAX_PER_ATTEMPT", "0.12"))
+HEDGE_RATIO = float(_env("RIT_FINAL_RISKY_HEDGE_RATIO", "RIT_FINAL_HEDGE_RATIO", "0.25" if AGGRESSIVE_MODE else "0.70"))
 HEDGE_RATIO = max(0.0, min(1.0, HEDGE_RATIO))
 PORTFOLIO_PRINT_INTERVAL = float(_env("RIT_FINAL_RISKY_PORTFOLIO_PRINT_INTERVAL", "RIT_FINAL_PORTFOLIO_PRINT_INTERVAL", "5.0"))
 TAKE_PROFIT_ENABLED = _env_bool("RIT_FINAL_RISKY_TAKE_PROFIT_ENABLED", "RIT_FINAL_TAKE_PROFIT_ENABLED", "1")
-TAKE_PROFIT_PER_SHARE = float(_env("RIT_FINAL_RISKY_TAKE_PROFIT_PER_SHARE", "RIT_FINAL_TAKE_PROFIT_PER_SHARE", "0.30"))
+TAKE_PROFIT_PER_SHARE = float(_env("RIT_FINAL_RISKY_TAKE_PROFIT_PER_SHARE", "RIT_FINAL_TAKE_PROFIT_PER_SHARE", "0.15"))
 TAKE_PROFIT_CHUNK_QTY = float(_env("RIT_FINAL_RISKY_TAKE_PROFIT_CHUNK_QTY", "RIT_FINAL_TAKE_PROFIT_CHUNK_QTY", "10000"))
 TAKE_PROFIT_CHUNK_QTY = max(1.0, TAKE_PROFIT_CHUNK_QTY)
 TAKE_PROFIT_COOLDOWN = float(_env("RIT_FINAL_RISKY_TAKE_PROFIT_COOLDOWN", "RIT_FINAL_TAKE_PROFIT_COOLDOWN", "2.0"))
+STOP_LOSS_ENABLED = _env_bool("RIT_FINAL_RISKY_STOP_LOSS_ENABLED", "RIT_FINAL_STOP_LOSS_ENABLED", "0")
+STOP_LOSS_PER_SHARE = float(_env("RIT_FINAL_RISKY_STOP_LOSS_PER_SHARE", "RIT_FINAL_STOP_LOSS_PER_SHARE", "0.30"))
+STOP_LOSS_CHUNK_QTY = float(_env("RIT_FINAL_RISKY_STOP_LOSS_CHUNK_QTY", "RIT_FINAL_STOP_LOSS_CHUNK_QTY", "10000"))
+STOP_LOSS_CHUNK_QTY = max(1.0, STOP_LOSS_CHUNK_QTY)
+STOP_LOSS_COOLDOWN = float(_env("RIT_FINAL_RISKY_STOP_LOSS_COOLDOWN", "RIT_FINAL_STOP_LOSS_COOLDOWN", "2.0"))
 SAVE_REPORT_ON_EXIT = _env_bool("RIT_FINAL_RISKY_SAVE_REPORT_ON_EXIT", "RIT_FINAL_SAVE_REPORT_ON_EXIT", "1")
 REPORT_PREFIX = _env("RIT_FINAL_RISKY_REPORT_PREFIX", "RIT_FINAL_REPORT_PREFIX", "final_risky_report")
 
@@ -183,6 +188,10 @@ def save_run_report(session, reason, run_error=None):
             "TAKE_PROFIT_PER_SHARE": TAKE_PROFIT_PER_SHARE,
             "TAKE_PROFIT_CHUNK_QTY": TAKE_PROFIT_CHUNK_QTY,
             "TAKE_PROFIT_COOLDOWN": TAKE_PROFIT_COOLDOWN,
+            "STOP_LOSS_ENABLED": STOP_LOSS_ENABLED,
+            "STOP_LOSS_PER_SHARE": STOP_LOSS_PER_SHARE,
+            "STOP_LOSS_CHUNK_QTY": STOP_LOSS_CHUNK_QTY,
+            "STOP_LOSS_COOLDOWN": STOP_LOSS_COOLDOWN,
         },
         "case": case_info,
         "trader": trader_info,
@@ -365,10 +374,7 @@ def _is_unresolved_tender(tender):
     return status in {"OFFERED", "OPEN", "ACTIVE", "PENDING"}
 
 
-def maybe_take_profit_cover(session, last_tp_by_ticker):
-    if not TAKE_PROFIT_ENABLED or TAKE_PROFIT_PER_SHARE <= 0:
-        return
-
+def _unresolved_tender_bases(session):
     unresolved_bases = set()
     for t in get_tenders(session):
         tk = t.get("ticker")
@@ -376,6 +382,14 @@ def maybe_take_profit_cover(session, last_tp_by_ticker):
             continue
         if _is_unresolved_tender(t):
             unresolved_bases.add(_base_symbol(tk))
+    return unresolved_bases
+
+
+def maybe_take_profit_cover(session, last_tp_by_ticker):
+    if not TAKE_PROFIT_ENABLED or TAKE_PROFIT_PER_SHARE <= 0:
+        return
+
+    unresolved_bases = _unresolved_tender_bases(session)
 
     now = time.monotonic()
     for s in get_securities(session):
@@ -419,6 +433,57 @@ def maybe_take_profit_cover(session, last_tp_by_ticker):
         print(
             f"[TAKE_PROFIT] {ticker} {action} {cover_qty:.0f} "
             f"edge={edge:.3f} cost={cost:.2f} exec={exec_px:.2f}"
+        )
+
+
+def maybe_stop_loss_cut(session, last_sl_by_ticker):
+    if not STOP_LOSS_ENABLED or STOP_LOSS_PER_SHARE <= 0:
+        return
+
+    unresolved_bases = _unresolved_tender_bases(session)
+
+    now = time.monotonic()
+    for s in get_securities(session):
+        ticker = s.get("ticker")
+        if not ticker:
+            continue
+        if _base_symbol(ticker) in unresolved_bases:
+            continue
+        pos = float(s.get("position", 0.0))
+        if abs(pos) < 1:
+            continue
+        cost = _cost_basis(s)
+        if cost is None:
+            continue
+        if now - last_sl_by_ticker.get(ticker, 0.0) < STOP_LOSS_COOLDOWN:
+            continue
+
+        ob = get_order_book_agg(session, ticker)
+        if pos < 0:
+            if not ob["asks"]:
+                continue
+            exec_px = ob["asks"][0]["price"]
+            loss = exec_px - cost
+            action = "BUY"
+        else:
+            if not ob["bids"]:
+                continue
+            exec_px = ob["bids"][0]["price"]
+            loss = cost - exec_px
+            action = "SELL"
+
+        if loss < STOP_LOSS_PER_SHARE:
+            continue
+
+        cut_qty = min(abs(pos), STOP_LOSS_CHUNK_QTY)
+        if cut_qty < 1:
+            continue
+
+        submit_market_order(session, ticker, cut_qty, action)
+        last_sl_by_ticker[ticker] = now
+        print(
+            f"[STOP_LOSS] {ticker} {action} {cut_qty:.0f} "
+            f"loss={loss:.3f} cost={cost:.2f} exec={exec_px:.2f}"
         )
 
 
@@ -584,6 +649,7 @@ def main():
     processed = set()
     next_portfolio_print = 0.0
     last_tp_by_ticker = {}
+    last_sl_by_ticker = {}
     exit_reason = "shutdown_or_manual_stop"
     run_error = None
     with requests.Session() as session:
@@ -599,6 +665,11 @@ def main():
                     close_positions(session)
                     exit_reason = "endgame_flatten"
                     break
+
+                try:
+                    maybe_stop_loss_cut(session, last_sl_by_ticker)
+                except Exception as exc:
+                    print(f"Stop-loss error: {exc}")
 
                 try:
                     maybe_take_profit_cover(session, last_tp_by_ticker)
