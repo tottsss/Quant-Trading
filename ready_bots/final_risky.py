@@ -41,6 +41,7 @@ EDGE_DECAY_PER_ATTEMPT = float(_env("RIT_FINAL_RISKY_EDGE_DECAY_PER_ATTEMPT", "R
 VOL_RELAX_PER_ATTEMPT = float(_env("RIT_FINAL_RISKY_VOL_RELAX_PER_ATTEMPT", "RIT_FINAL_VOL_RELAX_PER_ATTEMPT", "0.08"))
 HEDGE_RATIO = float(_env("RIT_FINAL_RISKY_HEDGE_RATIO", "RIT_FINAL_HEDGE_RATIO", "0.45" if AGGRESSIVE_MODE else "0.80"))
 HEDGE_RATIO = max(0.0, min(1.0, HEDGE_RATIO))
+PORTFOLIO_PRINT_INTERVAL = float(_env("RIT_FINAL_RISKY_PORTFOLIO_PRINT_INTERVAL", "RIT_FINAL_PORTFOLIO_PRINT_INTERVAL", "5.0"))
 
 
 def signal_handler(signum, frame):
@@ -192,12 +193,55 @@ def submit_market_order(session, ticker, quantity, action):
         time.sleep(0.08)
 
 
+def _mark_price(row):
+    for key in ("last", "close", "price"):
+        px = row.get(key)
+        if isinstance(px, (int, float)):
+            return float(px)
+    return None
+
+
+def log_portfolio(session, tick, tpp):
+    sec = get_securities(session)
+    lines = []
+    net_pos = 0.0
+    gross_pos = 0.0
+    gross_notional = 0.0
+
+    for s in sec:
+        ticker = s.get("ticker")
+        if not ticker:
+            continue
+        pos = float(s.get("position", 0.0))
+        if abs(pos) < 1:
+            continue
+        px = _mark_price(s)
+        net_pos += pos
+        gross_pos += abs(pos)
+        if px is not None:
+            gross_notional += abs(pos * px)
+            lines.append(f"{ticker}:{int(pos)}@{px:.2f}")
+        else:
+            lines.append(f"{ticker}:{int(pos)}")
+
+    if not lines:
+        print(f"[PORTFOLIO] tick={tick}/{tpp} flat")
+        return
+
+    print(
+        f"[PORTFOLIO] tick={tick}/{tpp} net={net_pos:.0f} "
+        f"gross={gross_pos:.0f} gross_notional={gross_notional:.2f}"
+    )
+    print("[PORTFOLIO] " + " | ".join(lines))
+
+
 def unwind_inventory(session, ticker, inventory):
     if abs(inventory) < 1:
         return
 
     ob = get_order_book_agg(session, ticker)
     remaining = abs(inventory)
+    pos_before = get_inventory_total(session, ticker)
 
     if inventory < 0:
         # We are short -> buy back using marketable buy limits.
@@ -207,8 +251,11 @@ def unwind_inventory(session, ticker, inventory):
             q = min(remaining, ask["quantity"], MAX_ORDER_SIZE)
             px = max(0.01, ask["price"] + 0.01)
             submit_limit_order(session, ask["ticker"], q, px, "BUY")
-            remaining -= q
             time.sleep(ORDER_DELAY)
+            pos_after = get_inventory_total(session, ticker)
+            filled = max(0.0, pos_after - pos_before)
+            pos_before = pos_after
+            remaining = max(0.0, remaining - filled)
         if remaining > 0:
             submit_market_order(session, ticker, remaining, "BUY")
     else:
@@ -219,8 +266,11 @@ def unwind_inventory(session, ticker, inventory):
             q = min(remaining, bid["quantity"], MAX_ORDER_SIZE)
             px = max(0.01, bid["price"] - 0.01)
             submit_limit_order(session, bid["ticker"], q, px, "SELL")
-            remaining -= q
             time.sleep(ORDER_DELAY)
+            pos_after = get_inventory_total(session, ticker)
+            filled = max(0.0, pos_before - pos_after)
+            pos_before = pos_after
+            remaining = max(0.0, remaining - filled)
         if remaining > 0:
             submit_market_order(session, ticker, remaining, "SELL")
 
@@ -345,6 +395,7 @@ def main():
         raise RuntimeError("Set RIT_API_KEY env var.")
 
     processed = set()
+    next_portfolio_print = 0.0
     with requests.Session() as session:
         session.headers.update(HEADERS)
         while not SHUTDOWN:
@@ -356,6 +407,15 @@ def main():
             if tick >= tpp - ENDGAME_TICKS:
                 close_positions(session)
                 break
+
+            if PORTFOLIO_PRINT_INTERVAL > 0:
+                now = time.monotonic()
+                if now >= next_portfolio_print:
+                    try:
+                        log_portfolio(session, tick, tpp)
+                    except Exception as exc:
+                        print(f"Portfolio log error: {exc}")
+                    next_portfolio_print = now + PORTFOLIO_PRINT_INTERVAL
 
             for tender in get_tenders(session):
                 tid = tender.get("tender_id")
