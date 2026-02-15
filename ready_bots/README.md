@@ -24,7 +24,9 @@ These files are standalone versions meant for quick testing on a Windows machine
   - Uses anti-fine safeguards: immediate decline of bad fixed tenders, no hedge trading on tickers with unresolved tenders, and endgame flatten.
 - `01_liquidity_full_autotrader_standalone.py` (full auto tender accept/decline + market-order hedging + anti-fine controls)
 - `01_liquidity_playbook_method_standalone.py` (notebook-method bot: Roll spread + Kyle lambda + adaptive kappa + 3-phase market hedge)
+- `01_liquidity_wac_depth_router_standalone.py` (WAC/depth router: aggregates BASE/BASE_M/BASE_A liquidity, accepts/declines tenders, then hedges by routed market chunks)
 - `01_liquidity_simple_profit_standalone.py` (simple safer alternative)
+- `01_liquidity_simple_profitable_standalone.py` (simple profit-focused fixed-tender bot with limit checks, anti-front-running hedge pause, and strict endgame flatten)
 - `01_liquidity_indicator_assistant_standalone.py` (EMA/RSI/Volume signal assistant + fine watch)
 - `01_liquidity_indicator_multiticker_assistant_standalone.py` (multi-ticker ranked signals with EMA/RSI/Volume + order-book + tender ACCEPT/DECLINE recommendations)
 - `01_liquidity_depth_twap_hybrid_standalone.py`
