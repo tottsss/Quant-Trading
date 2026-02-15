@@ -1,6 +1,9 @@
 import os
 import signal
 import time
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 import requests
 
 
@@ -47,6 +50,8 @@ TAKE_PROFIT_PER_SHARE = float(_env("RIT_FINAL_RISKY_TAKE_PROFIT_PER_SHARE", "RIT
 TAKE_PROFIT_CHUNK_QTY = float(_env("RIT_FINAL_RISKY_TAKE_PROFIT_CHUNK_QTY", "RIT_FINAL_TAKE_PROFIT_CHUNK_QTY", "10000"))
 TAKE_PROFIT_CHUNK_QTY = max(1.0, TAKE_PROFIT_CHUNK_QTY)
 TAKE_PROFIT_COOLDOWN = float(_env("RIT_FINAL_RISKY_TAKE_PROFIT_COOLDOWN", "RIT_FINAL_TAKE_PROFIT_COOLDOWN", "2.0"))
+SAVE_REPORT_ON_EXIT = _env_bool("RIT_FINAL_RISKY_SAVE_REPORT_ON_EXIT", "RIT_FINAL_SAVE_REPORT_ON_EXIT", "1")
+REPORT_PREFIX = _env("RIT_FINAL_RISKY_REPORT_PREFIX", "RIT_FINAL_REPORT_PREFIX", "final_risky_report")
 
 
 def signal_handler(signum, frame):
@@ -92,6 +97,111 @@ def get_securities(session):
     if not r.ok:
         raise ApiException("Failed to fetch securities")
     return r.json()
+
+
+def _safe_get_json(session, path, params=None):
+    try:
+        r = session.get(f"{BASE_URL}{path}", params=params)
+        if not r.ok:
+            return {
+                "_error": f"http_{r.status_code}",
+                "_path": path,
+                "_params": params or {},
+            }
+        return r.json()
+    except Exception as exc:
+        return {
+            "_error": str(exc),
+            "_path": path,
+            "_params": params or {},
+        }
+
+
+def _compute_position_summary(securities):
+    if not isinstance(securities, list):
+        return {}
+
+    net_position = 0.0
+    gross_position = 0.0
+    gross_notional = 0.0
+    by_ticker = {}
+    for s in securities:
+        ticker = s.get("ticker")
+        if not ticker:
+            continue
+        pos = float(s.get("position", 0.0))
+        if abs(pos) < 1:
+            continue
+        px = _mark_price(s)
+        by_ticker[ticker] = {"position": pos, "mark_price": px}
+        net_position += pos
+        gross_position += abs(pos)
+        if isinstance(px, (int, float)):
+            gross_notional += abs(pos * px)
+    return {
+        "net_position": net_position,
+        "gross_position": gross_position,
+        "gross_notional": gross_notional,
+        "open_positions": by_ticker,
+    }
+
+
+def save_run_report(session, reason, run_error=None):
+    ts = datetime.now(timezone.utc)
+    stamp = ts.strftime("%Y%m%d_%H%M%S")
+    out_path = Path(__file__).resolve().parent / f"{REPORT_PREFIX}_{stamp}.json"
+
+    case_info = _safe_get_json(session, "/case")
+    trader_info = _safe_get_json(session, "/trader")
+    limits_info = _safe_get_json(session, "/limits")
+    securities = _safe_get_json(session, "/securities")
+    tenders = _safe_get_json(session, "/tenders")
+    orders_all = _safe_get_json(session, "/orders")
+    orders_open = _safe_get_json(session, "/orders", params={"status": "OPEN"})
+    orders_transacted = _safe_get_json(session, "/orders", params={"status": "TRANSACTED"})
+    orders_cancelled = _safe_get_json(session, "/orders", params={"status": "CANCELLED"})
+
+    report = {
+        "saved_at_utc": ts.isoformat(),
+        "script": str(Path(__file__).resolve()),
+        "base_url": BASE_URL,
+        "exit_reason": reason,
+        "run_error": run_error,
+        "config": {
+            "MIN_EDGE": MIN_EDGE,
+            "VOL_FACTOR": VOL_FACTOR,
+            "MAX_ATTEMPTS": MAX_ATTEMPTS,
+            "EVAL_DELAY": EVAL_DELAY,
+            "ORDER_DELAY": ORDER_DELAY,
+            "AFTER_ACCEPT_DELAY": AFTER_ACCEPT_DELAY,
+            "MAX_ORDER_SIZE": MAX_ORDER_SIZE,
+            "ENDGAME_TICKS": ENDGAME_TICKS,
+            "FIXED_ONLY": FIXED_ONLY,
+            "AGGRESSIVE_MODE": AGGRESSIVE_MODE,
+            "HEDGE_RATIO": HEDGE_RATIO,
+            "TAKE_PROFIT_ENABLED": TAKE_PROFIT_ENABLED,
+            "TAKE_PROFIT_PER_SHARE": TAKE_PROFIT_PER_SHARE,
+            "TAKE_PROFIT_CHUNK_QTY": TAKE_PROFIT_CHUNK_QTY,
+            "TAKE_PROFIT_COOLDOWN": TAKE_PROFIT_COOLDOWN,
+        },
+        "case": case_info,
+        "trader": trader_info,
+        "limits": limits_info,
+        "securities": securities,
+        "position_summary": _compute_position_summary(securities),
+        "tenders_active": tenders,
+        "orders": {
+            "all": orders_all,
+            "open": orders_open,
+            "transacted": orders_transacted,
+            "cancelled": orders_cancelled,
+        },
+    }
+
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, sort_keys=True)
+    print(f"[REPORT] saved: {out_path}")
+    return out_path
 
 
 def _base_symbol(ticker):
@@ -474,43 +584,57 @@ def main():
     processed = set()
     next_portfolio_print = 0.0
     last_tp_by_ticker = {}
+    exit_reason = "shutdown_or_manual_stop"
+    run_error = None
     with requests.Session() as session:
         session.headers.update(HEADERS)
-        while not SHUTDOWN:
-            tick, tpp, status = get_tick(session)
-            if status != "ACTIVE":
-                time.sleep(1.0)
-                continue
-
-            if tick >= tpp - ENDGAME_TICKS:
-                close_positions(session)
-                break
-
-            try:
-                maybe_take_profit_cover(session, last_tp_by_ticker)
-            except Exception as exc:
-                print(f"Take-profit error: {exc}")
-
-            if PORTFOLIO_PRINT_INTERVAL > 0:
-                now = time.monotonic()
-                if now >= next_portfolio_print:
-                    try:
-                        log_portfolio(session, tick, tpp)
-                    except Exception as exc:
-                        print(f"Portfolio log error: {exc}")
-                    next_portfolio_print = now + PORTFOLIO_PRINT_INTERVAL
-
-            for tender in get_tenders(session):
-                tid = tender.get("tender_id")
-                if tid in processed:
+        try:
+            while not SHUTDOWN:
+                tick, tpp, status = get_tick(session)
+                if status != "ACTIVE":
+                    time.sleep(1.0)
                     continue
+
+                if tick >= tpp - ENDGAME_TICKS:
+                    close_positions(session)
+                    exit_reason = "endgame_flatten"
+                    break
+
                 try:
-                    evaluate_tender(session, tender)
+                    maybe_take_profit_cover(session, last_tp_by_ticker)
                 except Exception as exc:
-                    print(f"Tender error {tid}: {exc}")
-                    continue
-                processed.add(tid)
-            time.sleep(1.0)
+                    print(f"Take-profit error: {exc}")
+
+                if PORTFOLIO_PRINT_INTERVAL > 0:
+                    now = time.monotonic()
+                    if now >= next_portfolio_print:
+                        try:
+                            log_portfolio(session, tick, tpp)
+                        except Exception as exc:
+                            print(f"Portfolio log error: {exc}")
+                        next_portfolio_print = now + PORTFOLIO_PRINT_INTERVAL
+
+                for tender in get_tenders(session):
+                    tid = tender.get("tender_id")
+                    if tid in processed:
+                        continue
+                    try:
+                        evaluate_tender(session, tender)
+                    except Exception as exc:
+                        print(f"Tender error {tid}: {exc}")
+                        continue
+                    processed.add(tid)
+                time.sleep(1.0)
+        except Exception as exc:
+            run_error = str(exc)
+            exit_reason = "fatal_error"
+            print(f"Fatal error: {exc}")
+        finally:
+            if SAVE_REPORT_ON_EXIT:
+                try:
+                    save_run_report(session, exit_reason, run_error=run_error)
+                except Exception as exc:
+                    print(f"Report save error: {exc}")
 
 
 if __name__ == "__main__":
