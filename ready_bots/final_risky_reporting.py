@@ -85,8 +85,8 @@ class RuntimeTelemetry:
         self.record_event("error", where=str(where), error=str(exc), context=context)
         return payload
 
-    def record_tender_log(self, action, **fields):
-        payload = {"ts": utc_now_iso(), "action": str(action)}
+    def record_tender_log(self, event, **fields):
+        payload = {"ts": utc_now_iso(), "event": str(event)}
         payload.update(fields)
         self._capped_append(self.tender_log, payload, self.tender_log_cap)
         return payload

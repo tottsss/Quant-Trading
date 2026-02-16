@@ -226,8 +226,8 @@ def _record_error(where, exc, **context):
     REPORTER.record_error(where, exc, **context)
 
 
-def _record_tender_log(action, **fields):
-    REPORTER.record_tender_log(action, **fields)
+def _record_tender_log(event, **fields):
+    REPORTER.record_tender_log(event, **fields)
 
 
 def _record_hedge_log(event, **fields):
