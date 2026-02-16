@@ -203,6 +203,12 @@ REPORT_ORDER_LOG_CAP = max(
 REPORT_ERROR_LOG_CAP = max(
     50, int(_env("RIT_FINAL_RISKY_REPORT_ERROR_LOG_CAP", "RIT_FINAL_REPORT_ERROR_LOG_CAP", "2000"))
 )
+REPORT_ORDERS_FETCH_LIMIT = max(
+    100, int(_env("RIT_FINAL_RISKY_REPORT_ORDERS_FETCH_LIMIT", "RIT_FINAL_REPORT_ORDERS_FETCH_LIMIT", "5000"))
+)
+HEAT_RESET_TICK_DROP = max(
+    5, int(_env("RIT_FINAL_RISKY_HEAT_RESET_TICK_DROP", "RIT_FINAL_HEAT_RESET_TICK_DROP", "20"))
+)
 
 REPORTER = RuntimeTelemetry(
     event_cap=REPORT_EVENTS_CAP,
@@ -326,7 +332,13 @@ def _compute_position_summary(securities):
         if abs(pos) < 1:
             continue
         px = _mark_price(s)
-        by_ticker[ticker] = {"position": pos, "mark_price": px}
+        cost_basis = None
+        for key in ("cost", "vwap"):
+            val = s.get(key)
+            if isinstance(val, (int, float)) and float(val) > 0:
+                cost_basis = float(val)
+                break
+        by_ticker[ticker] = {"position": pos, "mark_price": px, "cost_basis": cost_basis}
         net_position += pos
         gross_position += abs(pos)
         if isinstance(px, (int, float)):
@@ -436,10 +448,11 @@ def save_run_report(session, reason, run_error=None):
     limits_info = _safe_get_json(session, "/limits")
     securities = _safe_get_json(session, "/securities")
     tenders = _safe_get_json(session, "/tenders")
-    orders_all = _safe_get_json(session, "/orders")
-    orders_open = _safe_get_json(session, "/orders", params={"status": "OPEN"})
-    orders_transacted = _safe_get_json(session, "/orders", params={"status": "TRANSACTED"})
-    orders_cancelled = _safe_get_json(session, "/orders", params={"status": "CANCELLED"})
+    base_order_params = {"limit": REPORT_ORDERS_FETCH_LIMIT}
+    orders_all = _safe_get_json(session, "/orders", params=dict(base_order_params))
+    orders_open = _safe_get_json(session, "/orders", params={**base_order_params, "status": "OPEN"})
+    orders_transacted = _safe_get_json(session, "/orders", params={**base_order_params, "status": "TRANSACTED"})
+    orders_cancelled = _safe_get_json(session, "/orders", params={**base_order_params, "status": "CANCELLED"})
     config = {
         "MIN_EDGE": MIN_EDGE,
         "VOL_FACTOR": VOL_FACTOR,
@@ -911,6 +924,20 @@ def _tender_quantity(tender):
     if isinstance(qty, (int, float)) and qty > 0:
         return float(qty)
     return 0.0
+
+
+def _tender_signature(tender):
+    if not isinstance(tender, dict):
+        return None
+    return (
+        tender.get("ticker"),
+        tender.get("action"),
+        tender.get("quantity"),
+        tender.get("price"),
+        tender.get("expires"),
+        tender.get("status"),
+        bool(tender.get("is_fixed_bid")),
+    )
 
 
 def _weighted_exec_price(levels, target_qty):
@@ -2182,17 +2209,21 @@ def _liquidity_aware_limit_sweep(session, ticker, action, target_qty, ticks_to_e
         depth4_qty = sum(max(0.0, float(lv.get("quantity", 0.0))) for lv in levels[:4])
 
         if ticks_to_end > (ENDGAME_TICKS // 2):
-            participation = 0.45
+            top_participation = 0.35
+            depth_participation = 0.18
+            min_clip = 250.0
         elif ticks_to_end > (FLATTEN_HARD_DEADLINE_TICKS + 1):
-            participation = 0.70
+            top_participation = 0.55
+            depth_participation = 0.30
+            min_clip = 500.0
         else:
-            participation = 1.00
+            top_participation = 0.90
+            depth_participation = 0.70
+            min_clip = 1000.0
 
-        planned = min(
-            remaining,
-            MAX_ORDER_SIZE,
-            max(500.0, top_qty * 0.8, depth4_qty * participation),
-        )
+        top_cap = max(min_clip, top_qty * top_participation)
+        depth_cap = max(min_clip, depth4_qty * depth_participation)
+        planned = min(remaining, MAX_ORDER_SIZE, max(min_clip, min(top_cap, depth_cap)))
         planned = math.floor(planned)
         if planned < 1:
             planned = min(int(MAX_ORDER_SIZE), int(math.floor(remaining)))
@@ -2306,8 +2337,13 @@ def flatten_positions_ticketed(session, tick, tpp):
             if ticks_to_end <= FLATTEN_HARD_DEADLINE_TICKS + 1:
                 mode = "hard_market"
                 ticket_qty = min(abs_pos, MAX_ORDER_SIZE)
+                pos_before_market = get_inventory_total(session, ticker)
                 submit_market_order(session, ticker, ticket_qty, unwind_action)
-                filled = float(ticket_qty)
+                pos_after_market = get_inventory_total(session, ticker)
+                if unwind_action == "BUY":
+                    filled = max(0.0, pos_after_market - pos_before_market)
+                else:
+                    filled = max(0.0, pos_before_market - pos_after_market)
             else:
                 filled = _liquidity_aware_limit_sweep(
                     session,
@@ -2322,8 +2358,25 @@ def flatten_positions_ticketed(session, tick, tpp):
                     remaining_after_limit = max(0.0, abs_pos - filled)
                     fallback_qty = min(remaining_after_limit, MAX_ORDER_SIZE)
                     if fallback_qty >= 1:
+                        pos_before_market = get_inventory_total(session, ticker)
                         submit_market_order(session, ticker, fallback_qty, unwind_action)
-                        filled += float(fallback_qty)
+                        pos_after_market = get_inventory_total(session, ticker)
+                        if unwind_action == "BUY":
+                            market_filled = max(0.0, pos_after_market - pos_before_market)
+                        else:
+                            market_filled = max(0.0, pos_before_market - pos_after_market)
+                        filled += market_filled
+                remaining_after_ticket = max(0.0, abs_pos - filled)
+                if remaining_after_ticket >= 1 and ticks_to_end <= ENDGAME_TICKS:
+                    mode = "limit_then_market"
+                    pos_before_market = get_inventory_total(session, ticker)
+                    submit_market_order(session, ticker, remaining_after_ticket, unwind_action)
+                    pos_after_market = get_inventory_total(session, ticker)
+                    if unwind_action == "BUY":
+                        market_filled = max(0.0, pos_after_market - pos_before_market)
+                    else:
+                        market_filled = max(0.0, pos_before_market - pos_after_market)
+                    filled += market_filled
 
             _record_hedge_log(
                 "endgame_ticket",
@@ -2363,10 +2416,12 @@ def main():
     if API_KEY == "YOUR_API_KEY":
         raise RuntimeError("Set RIT_API_KEY env var.")
 
-    processed = set()
+    processed = {}
     next_portfolio_print = 0.0
     last_tp_by_ticker = {}
     last_sl_by_ticker = {}
+    last_active_tick = None
+    heat_index = 1
     exit_reason = "shutdown_or_manual_stop"
     run_error = None
     _record_event("run_start", base_url=BASE_URL, report_prefix=REPORT_PREFIX)
@@ -2379,6 +2434,20 @@ def main():
                 if status != "ACTIVE":
                     time.sleep(1.0)
                     continue
+
+                if (
+                    isinstance(last_active_tick, int)
+                    and int(tick) + HEAT_RESET_TICK_DROP < int(last_active_tick)
+                ):
+                    heat_index += 1
+                    processed.clear()
+                    _record_event(
+                        "heat_reset_detected",
+                        heat_index=int(heat_index),
+                        prev_tick=int(last_active_tick),
+                        curr_tick=int(tick),
+                    )
+                last_active_tick = int(tick)
 
                 if tick >= tpp - ENDGAME_TICKS:
                     try:
@@ -2426,7 +2495,10 @@ def main():
 
                 for tender in get_tenders(session):
                     tid = tender.get("tender_id")
-                    if tid in processed:
+                    if tid is None:
+                        continue
+                    sig = _tender_signature(tender)
+                    if processed.get(tid) == sig:
                         continue
                     _bump_counter("tenders_seen", 1)
                     try:
@@ -2435,7 +2507,7 @@ def main():
                         print(f"Tender error {tid}: {exc}")
                         _record_error("evaluate_tender", exc, tender_id=tid, ticker=tender.get("ticker"))
                         continue
-                    processed.add(tid)
+                    processed[tid] = sig
                     _bump_counter("tenders_processed", 1)
                 time.sleep(1.0)
         except Exception as exc:
