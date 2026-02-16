@@ -66,6 +66,12 @@ MOM_EMA_SLOW = max(MOM_EMA_FAST + 1, int(_env("RIT_FINAL_RISKY_MOM_EMA_SLOW", "R
 MOM_RSI_PERIOD = max(3, int(_env("RIT_FINAL_RISKY_MOM_RSI_PERIOD", "RIT_FINAL_MOM_RSI_PERIOD", "14")))
 MOM_IMBALANCE_LEVELS = max(1, int(_env("RIT_FINAL_RISKY_MOM_IMBALANCE_LEVELS", "RIT_FINAL_MOM_IMBALANCE_LEVELS", "5")))
 MOM_IMBALANCE_THRESHOLD = float(_env("RIT_FINAL_RISKY_MOM_IMBALANCE_THRESHOLD", "RIT_FINAL_MOM_IMBALANCE_THRESHOLD", "0.15"))
+HEDGE_MOMENTUM_AWARE = _env_bool("RIT_FINAL_RISKY_HEDGE_MOMENTUM_AWARE", "RIT_FINAL_HEDGE_MOMENTUM_AWARE", "1")
+HEDGE_MIN_TICKET_QTY = float(_env("RIT_FINAL_RISKY_HEDGE_MIN_TICKET_QTY", "RIT_FINAL_HEDGE_MIN_TICKET_QTY", "1500"))
+HEDGE_FAVORABLE_MULT = float(_env("RIT_FINAL_RISKY_HEDGE_FAVORABLE_MULT", "RIT_FINAL_HEDGE_FAVORABLE_MULT", "0.75"))
+HEDGE_ADVERSE_MULT = float(_env("RIT_FINAL_RISKY_HEDGE_ADVERSE_MULT", "RIT_FINAL_HEDGE_ADVERSE_MULT", "1.35"))
+HEDGE_REGIME_REFRESH_SECS = float(_env("RIT_FINAL_RISKY_HEDGE_REGIME_REFRESH_SECS", "RIT_FINAL_HEDGE_REGIME_REFRESH_SECS", "0.35"))
+HEDGE_MAX_TICKETS = max(1, int(_env("RIT_FINAL_RISKY_HEDGE_MAX_TICKETS", "RIT_FINAL_HEDGE_MAX_TICKETS", "30")))
 FLATTEN_FAVORABLE_MULT = float(_env("RIT_FINAL_RISKY_FLATTEN_FAVORABLE_MULT", "RIT_FINAL_FLATTEN_FAVORABLE_MULT", "0.70"))
 FLATTEN_ADVERSE_MULT = float(_env("RIT_FINAL_RISKY_FLATTEN_ADVERSE_MULT", "RIT_FINAL_FLATTEN_ADVERSE_MULT", "1.40"))
 FLATTEN_MIN_TICKET_QTY = float(_env("RIT_FINAL_RISKY_FLATTEN_MIN_TICKET_QTY", "RIT_FINAL_FLATTEN_MIN_TICKET_QTY", "2000"))
@@ -221,6 +227,12 @@ def save_run_report(session, reason, run_error=None):
             "MOM_RSI_PERIOD": MOM_RSI_PERIOD,
             "MOM_IMBALANCE_LEVELS": MOM_IMBALANCE_LEVELS,
             "MOM_IMBALANCE_THRESHOLD": MOM_IMBALANCE_THRESHOLD,
+            "HEDGE_MOMENTUM_AWARE": HEDGE_MOMENTUM_AWARE,
+            "HEDGE_MIN_TICKET_QTY": HEDGE_MIN_TICKET_QTY,
+            "HEDGE_FAVORABLE_MULT": HEDGE_FAVORABLE_MULT,
+            "HEDGE_ADVERSE_MULT": HEDGE_ADVERSE_MULT,
+            "HEDGE_REGIME_REFRESH_SECS": HEDGE_REGIME_REFRESH_SECS,
+            "HEDGE_MAX_TICKETS": HEDGE_MAX_TICKETS,
             "FLATTEN_FAVORABLE_MULT": FLATTEN_FAVORABLE_MULT,
             "FLATTEN_ADVERSE_MULT": FLATTEN_ADVERSE_MULT,
             "FLATTEN_MIN_TICKET_QTY": FLATTEN_MIN_TICKET_QTY,
@@ -755,40 +767,79 @@ def unwind_inventory(session, ticker, inventory):
     if abs(inventory) < 1:
         return
 
-    ob = get_order_book_agg(session, ticker)
     remaining = abs(inventory)
+    unwind_action = "BUY" if inventory < 0 else "SELL"
+    side_key = "asks" if unwind_action == "BUY" else "bids"
     pos_before = get_inventory_total(session, ticker)
+    tickets = 0
+    regime = {"state": "NEUTRAL", "imbalance": 0.0, "ema_fast": None, "ema_slow": None, "rsi": None}
+    last_regime_refresh = 0.0
 
-    if inventory < 0:
-        # We are short -> buy back using marketable buy limits.
-        for ask in ob["asks"]:
-            if remaining <= 0:
-                break
-            q = min(remaining, ask["quantity"], MAX_ORDER_SIZE)
-            px = max(0.01, ask["price"] + 0.01)
-            submit_limit_order(session, ask["ticker"], q, px, "BUY")
-            time.sleep(ORDER_DELAY)
-            pos_after = get_inventory_total(session, ticker)
+    while remaining > 0 and tickets < HEDGE_MAX_TICKETS:
+        ob = get_order_book_agg(session, ticker)
+        levels = ob.get(side_key, [])
+        if not levels:
+            break
+
+        now = time.monotonic()
+        if HEDGE_MOMENTUM_AWARE and (
+            tickets == 0 or (now - last_regime_refresh) >= HEDGE_REGIME_REFRESH_SECS
+        ):
+            regime = _flatten_regime(session, ticker, unwind_action, ob)
+            last_regime_refresh = now
+
+        state = regime["state"] if HEDGE_MOMENTUM_AWARE else "NEUTRAL"
+        base_ticket = min(remaining, MAX_ORDER_SIZE, max(HEDGE_MIN_TICKET_QTY, remaining * 0.5))
+        ticket_qty = _state_scaled_ticket(
+            remaining,
+            base_ticket,
+            HEDGE_FAVORABLE_MULT,
+            HEDGE_ADVERSE_MULT,
+            state,
+        )
+
+        top = levels[0]
+        q = min(remaining, ticket_qty, float(top.get("quantity", 0.0)), MAX_ORDER_SIZE)
+        if q < 1:
+            q = min(remaining, ticket_qty, MAX_ORDER_SIZE)
+        if q < 1:
+            break
+
+        if unwind_action == "BUY":
+            px = max(0.01, float(top["price"]) + 0.01)
+        else:
+            px = max(0.01, float(top["price"]) - 0.01)
+
+        submit_limit_order(session, top["ticker"], q, px, unwind_action)
+        time.sleep(ORDER_DELAY)
+
+        pos_after = get_inventory_total(session, ticker)
+        if unwind_action == "BUY":
             filled = max(0.0, pos_after - pos_before)
-            pos_before = pos_after
-            remaining = max(0.0, remaining - filled)
-        if remaining > 0:
-            submit_market_order(session, ticker, remaining, "BUY")
-    else:
-        # We are long -> sell using marketable sell limits.
-        for bid in ob["bids"]:
-            if remaining <= 0:
-                break
-            q = min(remaining, bid["quantity"], MAX_ORDER_SIZE)
-            px = max(0.01, bid["price"] - 0.01)
-            submit_limit_order(session, bid["ticker"], q, px, "SELL")
-            time.sleep(ORDER_DELAY)
-            pos_after = get_inventory_total(session, ticker)
+        else:
             filled = max(0.0, pos_before - pos_after)
+        pos_before = pos_after
+
+        # If a marketable limit does not fill quickly, use market ticket fallback.
+        if filled <= 0.5:
+            market_q = min(remaining, q, MAX_ORDER_SIZE)
+            submit_market_order(session, ticker, market_q, unwind_action)
+            pos_after = get_inventory_total(session, ticker)
+            if unwind_action == "BUY":
+                filled = max(0.0, pos_after - pos_before)
+            else:
+                filled = max(0.0, pos_before - pos_after)
             pos_before = pos_after
-            remaining = max(0.0, remaining - filled)
-        if remaining > 0:
-            submit_market_order(session, ticker, remaining, "SELL")
+
+        remaining = max(0.0, remaining - filled)
+        tickets += 1
+        print(
+            f"[HEDGE] ticker={ticker} action={unwind_action} state={state} "
+            f"ticket={q:.0f} filled={filled:.0f} rem={remaining:.0f}"
+        )
+
+    if remaining > 0:
+        submit_market_order(session, ticker, remaining, unwind_action)
 
 
 def _action_edge_ok(my_action, tender_price, ob, tender_qty, attempt_idx):
@@ -939,18 +990,20 @@ def close_positions(session):
             submit_market_order(session, ticker, abs(pos), action)
 
 
+def _state_scaled_ticket(abs_qty, min_ticket_qty, favorable_mult, adverse_mult, state):
+    ticket = max(1.0, min(float(abs_qty), float(min_ticket_qty)))
+    if state == "FAVORABLE":
+        ticket *= favorable_mult
+    elif state == "ADVERSE":
+        ticket *= adverse_mult
+    return max(1.0, min(float(abs_qty), float(MAX_ORDER_SIZE), ticket))
+
+
 def _ticket_qty_for_state(abs_pos, ticks_to_end, state):
     base = abs_pos / max(1.0, float(ticks_to_end))
     base = max(1.0, base)
     ticket = max(base, min(FLATTEN_MIN_TICKET_QTY, abs_pos))
-
-    if state == "FAVORABLE":
-        ticket *= FLATTEN_FAVORABLE_MULT
-    elif state == "ADVERSE":
-        ticket *= FLATTEN_ADVERSE_MULT
-
-    ticket = max(1.0, ticket)
-    ticket = min(abs_pos, MAX_ORDER_SIZE, ticket)
+    ticket = _state_scaled_ticket(abs_pos, ticket, FLATTEN_FAVORABLE_MULT, FLATTEN_ADVERSE_MULT, state)
     return ticket
 
 
