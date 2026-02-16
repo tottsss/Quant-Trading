@@ -50,6 +50,11 @@ MAX_POS_PER_OPTION = _envi("RIT_VOL2026_MAX_POS_PER_OPTION", "200")
 REALIZED_WINDOW = _envi("RIT_VOL2026_REALIZED_WINDOW", "120")
 TICKS_PER_YEAR = _envf("RIT_VOL2026_TICKS_PER_YEAR", "15120")
 FALLBACK_SIGMA = _envf("RIT_VOL2026_FALLBACK_SIGMA", "0.20")
+SIGMA_FLOOR = max(0.0001, _envf("RIT_VOL2026_SIGMA_FLOOR", "0.05"))
+SIGMA_CAP = max(SIGMA_FLOOR, _envf("RIT_VOL2026_SIGMA_CAP", "2.00"))
+VOL_MIN_VALID = max(0.0, _envf("RIT_VOL2026_VOL_MIN_VALID", "0.01"))
+VOL_MAX_VALID = max(VOL_MIN_VALID, _envf("RIT_VOL2026_VOL_MAX_VALID", "2.50"))
+ENTRY_BLOCK_WHEN_DELTA_STRESSED = _env_bool("RIT_VOL2026_ENTRY_BLOCK_WHEN_DELTA_STRESSED", "1")
 
 STRADDLE_QTY = _envi("RIT_VOL2026_STRADDLE_QTY", "5")
 STRADDLE_EDGE_THRESHOLD = _envf("RIT_VOL2026_STRADDLE_EDGE_THRESHOLD", "0.03")
@@ -183,6 +188,11 @@ def save_run_report(client: "RITClient", reason: str, run_error: str | None = No
         "REALIZED_WINDOW": REALIZED_WINDOW,
         "TICKS_PER_YEAR": TICKS_PER_YEAR,
         "FALLBACK_SIGMA": FALLBACK_SIGMA,
+        "SIGMA_FLOOR": SIGMA_FLOOR,
+        "SIGMA_CAP": SIGMA_CAP,
+        "VOL_MIN_VALID": VOL_MIN_VALID,
+        "VOL_MAX_VALID": VOL_MAX_VALID,
+        "ENTRY_BLOCK_WHEN_DELTA_STRESSED": ENTRY_BLOCK_WHEN_DELTA_STRESSED,
         "STRADDLE_QTY": STRADDLE_QTY,
         "STRADDLE_EDGE_THRESHOLD": STRADDLE_EDGE_THRESHOLD,
         "STRADDLE_COOLDOWN_SECS": STRADDLE_COOLDOWN_SECS,
@@ -358,9 +368,18 @@ def _extract_vol_from_text(text: str) -> float | None:
     m = re.search(r"between\s+(\d+(?:\.\d+)?)%\s+and\s+(\d+(?:\.\d+)?)%", text, re.IGNORECASE)
     if m:
         return (float(m.group(1)) + float(m.group(2))) / 200.0
-    m = re.search(r"volatility[^\d]*(\d+(?:\.\d+)?)%", text, re.IGNORECASE)
-    if m:
-        return float(m.group(1)) / 100.0
+    text_lower = text.lower()
+    # Match a % that is explicitly tied to volatility context while avoiding
+    # nearby "risk free rate X%" and similar non-vol percentages.
+    for pct_match in re.finditer(r"(\d+(?:\.\d+)?)\s*%", text):
+        pct = float(pct_match.group(1))
+        left_ctx = text_lower[max(0, pct_match.start() - 48) : pct_match.start()]
+        near_ctx = text_lower[max(0, pct_match.start() - 20) : min(len(text_lower), pct_match.end() + 20)]
+        if "volatility" not in left_ctx and "iv" not in left_ctx:
+            continue
+        if "risk free" in near_ctx or "delta limit" in near_ctx or "penalty" in near_ctx:
+            continue
+        return pct / 100.0
     m = re.search(r"\biv\b[^\d]*(\d+(?:\.\d+)?)%", text, re.IGNORECASE)
     if m:
         return float(m.group(1)) / 100.0
@@ -369,6 +388,17 @@ def _extract_vol_from_text(text: str) -> float | None:
 
 def _current_week_from_tick(current_tick: int | float) -> int:
     return max(1, (int(current_tick) // VOL_WEEK_TICKS) + 1)
+
+
+def _extract_news_week(news_item: dict) -> int | None:
+    for key in ("ticker", "symbol", "headline"):
+        value = news_item.get(key)
+        if not isinstance(value, str):
+            continue
+        m = re.search(r"\bweek\s*[:#-]?\s*([1-9]\d*)\b", value, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+    return None
 
 
 def parse_vol_from_news(news_items, current_tick: int | float):
@@ -383,8 +413,12 @@ def parse_vol_from_news(news_items, current_tick: int | float):
         vol = _extract_vol_from_text(text)
         if vol is None:
             continue
+        if vol <= VOL_MIN_VALID or vol > VOL_MAX_VALID:
+            continue
+        news_week = _extract_news_week(n)
+        base_week = news_week if news_week is not None else current_week
         is_next_week = "next week" in text.lower()
-        target_week = current_week + 1 if is_next_week else current_week
+        target_week = base_week + 1 if is_next_week else base_week
         forecasts[target_week] = float(vol)
     return forecasts
 
@@ -407,9 +441,23 @@ def parse_penalty_rate(news_items, current_rate: float) -> float:
         if m:
             rate = float(m.group(1))
             continue
+        m = re.search(r"penalty(?:\s+percentage|\s+percent)?[^\d]*(\d+(?:\.\d+)?)\s*%", text, re.IGNORECASE)
+        if m:
+            rate = float(m.group(1))
+            continue
         m = re.search(r"penalty[^\d$]*(?:\$)?(\d+(?:\.\d+)?)\s*(?:per\s*second|/sec|sec)", text, re.IGNORECASE)
         if m:
             rate = float(m.group(1))
+    return rate
+
+
+def parse_risk_free_rate(news_items, current_rate: float) -> float:
+    rate = current_rate
+    for n in news_items:
+        text = (n.get("headline") or "") + " " + (n.get("body") or "")
+        m = re.search(r"risk\s*free\s*rate[^\d-]*(\d+(?:\.\d+)?)\s*%", text, re.IGNORECASE)
+        if m:
+            rate = float(m.group(1)) / 100.0
     return rate
 
 
@@ -424,7 +472,7 @@ def choose_atm_strike(S: float) -> int:
     return min(range(45, 55), key=lambda k: abs(S - k))
 
 
-def compute_portfolio_delta(S: float, positions: dict, sigma: float) -> float:
+def compute_portfolio_delta(S: float, positions: dict, sigma: float, r: float = RISK_FREE) -> float:
     delta = positions.get("RTM", 0)
     for t in OPTION_TICKERS:
         pos = positions.get(t, 0)
@@ -433,7 +481,7 @@ def compute_portfolio_delta(S: float, positions: dict, sigma: float) -> float:
         call, K = option_specs(t)
         if call is None:
             continue
-        delta += bs_delta(S, K, ASSUMED_T_YEARS, RISK_FREE, sigma, call=call) * pos * 100.0
+        delta += bs_delta(S, K, ASSUMED_T_YEARS, r, sigma, call=call) * pos * 100.0
     return delta
 
 
@@ -475,11 +523,11 @@ def can_open_option_trade(positions: dict[str, int], ticker: str, direction: str
     return True
 
 
-def option_delta_change(S: float, sigma: float, ticker: str, action: str, qty: int) -> float:
+def option_delta_change(S: float, sigma: float, ticker: str, action: str, qty: int, r: float = RISK_FREE) -> float:
     call, strike = option_specs(ticker)
     if call is None:
         return 0.0
-    d = bs_delta(S, strike, ASSUMED_T_YEARS, RISK_FREE, sigma, call=call)
+    d = bs_delta(S, strike, ASSUMED_T_YEARS, r, sigma, call=call)
     sign = 1.0 if action == "BUY" else -1.0
     return sign * d * qty * OPTION_CONTRACT_MULTIPLIER
 
@@ -703,16 +751,20 @@ def main():
             last_rtm_mid = S
 
             realized_vol = compute_realized_vol(rtm_returns)
-            sigma = active_news_vol if active_news_vol is not None else (realized_vol if realized_vol is not None else FALLBACK_SIGMA)
+            sigma_raw = active_news_vol if active_news_vol is not None else (realized_vol if realized_vol is not None else FALLBACK_SIGMA)
+            sigma = min(SIGMA_CAP, max(SIGMA_FLOOR, float(sigma_raw)))
 
             positions = {s["ticker"]: int(s.get("position", 0)) for s in client.get_securities()}
             delta = compute_portfolio_delta(S, positions, sigma)
             near_end = is_endgame(case)
             open_limit = max(100.0, SAFE_OPEN_DELTA_FRAC * abs(delta_limit))
             target_delta = max(50.0, TARGET_DELTA_FRAC * abs(delta_limit))
+            soft_limit = max(100.0, SAFE_OPEN_DELTA_FRAC * abs(delta_limit))
+            hard_limit = max(100.0, HEDGE_TRIGGER * abs(delta_limit))
+            entry_blocked_by_delta = ENTRY_BLOCK_WHEN_DELTA_STRESSED and abs(delta) > soft_limit
 
             now = time.time()
-            if not near_end:
+            if not near_end and not entry_blocked_by_delta:
                 for ticker in OPTION_TICKERS:
                     bid, ask = best_bid_ask(client, ticker)
                     if bid is None or ask is None:
@@ -762,10 +814,23 @@ def main():
                         price=float(price),
                         sigma=float(sigma),
                     )
+            elif entry_blocked_by_delta:
+                _record_event(
+                    "entry_blocked_delta_stressed",
+                    delta=float(delta),
+                    soft_limit=float(soft_limit),
+                    hard_limit=float(hard_limit),
+                    sigma=float(sigma),
+                )
 
             straddle_ref_vol = active_news_vol if active_news_vol is not None else realized_vol
             straddle_ref_source = "news" if active_news_vol is not None else "realized"
-            if not near_end and straddle_ref_vol is not None and now - last_straddle_ts >= STRADDLE_COOLDOWN_SECS:
+            if (
+                not near_end
+                and not entry_blocked_by_delta
+                and straddle_ref_vol is not None
+                and now - last_straddle_ts >= STRADDLE_COOLDOWN_SECS
+            ):
                 atm = choose_atm_strike(S)
                 call_ticker = f"RTM1C{atm}"
                 put_ticker = f"RTM1P{atm}"
@@ -845,8 +910,6 @@ def main():
                                 )
 
             if abs(delta_limit) > 0:
-                soft_limit = max(100.0, SAFE_OPEN_DELTA_FRAC * abs(delta_limit))
-                hard_limit = max(100.0, HEDGE_TRIGGER * abs(delta_limit))
                 if abs(delta) > soft_limit:
                     action = "SELL" if delta > 0 else "BUY"
                     passive_price = rtm_ask if action == "SELL" else rtm_bid
@@ -880,7 +943,11 @@ def main():
                                     status="cancelled",
                                 )
                             except Exception as exc:
-                                _record_error("cancel_order", exc, order_id=order_id, ticker="RTM")
+                                msg = str(exc)
+                                if "404" in msg:
+                                    _record_event("cancel_order_race", order_id=int(order_id), ticker="RTM")
+                                else:
+                                    _record_error("cancel_order", exc, order_id=order_id, ticker="RTM")
                         else:
                             pending_hedge_qty += int(unfilled_qty)
 
@@ -959,7 +1026,11 @@ def main():
                                 status="cancelled",
                             )
                         except Exception as exc:
-                            _record_error("cancel_order_clear", exc, order_id=order_id, ticker="RTM")
+                            msg = str(exc)
+                            if "404" in msg:
+                                _record_event("cancel_order_clear_race", order_id=int(order_id), ticker="RTM")
+                            else:
+                                _record_error("cancel_order_clear", exc, order_id=order_id, ticker="RTM")
 
             if now - last_status_print >= PRINT_INTERVAL_SECS:
                 rv = f"{realized_vol:.3f}" if realized_vol is not None else "n/a"
