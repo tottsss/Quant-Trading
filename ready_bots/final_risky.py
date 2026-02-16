@@ -383,7 +383,8 @@ def _pretrade_limit_gate(session, ticker, my_action, qty):
     summary = _compute_position_summary(securities)
     positions = _positions_by_ticker(securities)
 
-    delta_qty = qty if my_action == "BUY" else -qty
+    tender_qty = float(qty)
+    delta_qty = tender_qty if my_action == "BUY" else -tender_qty
     gross_now = float(summary.get("gross_position", 0.0))
     net_now = float(summary.get("net_position", 0.0))
     old_pos = float(positions.get(ticker, 0.0))
@@ -395,17 +396,15 @@ def _pretrade_limit_gate(session, ticker, my_action, qty):
     gross_violation = gross_after > gross_limit
     net_violation = abs(net_after) > net_limit
 
-    # If already violating, allow only trades that strictly reduce that violated exposure.
-    gross_reducing = gross_after < gross_now
-    net_reducing = abs(net_after) < abs(net_now)
-
-    blocked = False
-    if gross_violation and not (gross_now > gross_limit and gross_reducing):
-        blocked = True
-    if net_violation and not (abs(net_now) > net_limit and net_reducing):
-        blocked = True
+    # Strict pre-trade gate: do not accept tender if projected position breaches limits.
+    blocked = gross_violation or net_violation
 
     return (not blocked), {
+        "ticker": ticker,
+        "side": my_action,
+        "new_tender_quantity": tender_qty,
+        "current_net_position": net_now,
+        "current_gross_position": gross_now,
         "gross_now": gross_now,
         "gross_after": gross_after,
         "gross_limit": gross_limit,
@@ -414,8 +413,6 @@ def _pretrade_limit_gate(session, ticker, my_action, qty):
         "net_limit": net_limit,
         "gross_violation": gross_violation,
         "net_violation": net_violation,
-        "gross_reducing": gross_reducing,
-        "net_reducing": net_reducing,
     }
 
 
@@ -694,7 +691,10 @@ def get_inventory_total(session, ticker):
 
 
 def accept_tender(session, tender, submit_price=None):
-    tid = tender["tender_id"]
+    tid = tender.get("tender_id")
+    if tid is None:
+        _record_tender_log("accept_failed_missing_tender_id", tender=tender)
+        return False
     params = {}
     if submit_price is not None:
         params["price"] = float(submit_price)
@@ -729,7 +729,10 @@ def accept_tender(session, tender, submit_price=None):
 
 
 def decline_tender(session, tender):
-    tid = tender["tender_id"]
+    tid = tender.get("tender_id")
+    if tid is None:
+        _record_tender_log("decline_failed_missing_tender_id", tender=tender)
+        return False
     r = session.delete(f"{BASE_URL}/tenders/{tid}")
     if not r.ok:
         print(f"Decline failed tender {tid}: status={r.status_code}")
@@ -882,7 +885,7 @@ def log_portfolio(session, tick, tpp):
 def _cost_basis(row):
     for key in ("cost", "vwap"):
         px = row.get(key)
-        if isinstance(px, (int, float)):
+        if isinstance(px, (int, float)) and float(px) > 0:
             return float(px)
     return None
 
@@ -1283,6 +1286,51 @@ def _unresolved_tender_ids_for_base(session, ticker, exclude_tids=None):
             continue
         out.append(tid)
     return out
+
+
+def _decline_unresolved_tenders_for_bases(session, bases, exclude_tids=None):
+    base_set = {_base_symbol(x) for x in (bases or set()) if x}
+    if not base_set:
+        return 0, set()
+    exclude = {str(x) for x in (exclude_tids or set())}
+    declined = 0
+
+    try:
+        tenders_now = get_tenders(session)
+    except Exception as exc:
+        _record_error("_decline_unresolved_tenders_for_bases", exc, bases=list(base_set), stage="load_before")
+        return 0, set(base_set)
+
+    for t in tenders_now:
+        if not isinstance(t, dict):
+            continue
+        tk = t.get("ticker")
+        if not tk or _base_symbol(tk) not in base_set:
+            continue
+        if not _is_unresolved_tender(t):
+            continue
+        tid = t.get("tender_id")
+        if tid is not None and str(tid) in exclude:
+            continue
+        if decline_tender(session, t):
+            declined += 1
+
+    still_open = set()
+    try:
+        tenders_after = get_tenders(session)
+    except Exception as exc:
+        _record_error("_decline_unresolved_tenders_for_bases", exc, bases=list(base_set), stage="load_after")
+        return declined, set(base_set)
+
+    for t in tenders_after:
+        if not isinstance(t, dict):
+            continue
+        tk = t.get("ticker")
+        if not tk or _base_symbol(tk) not in base_set:
+            continue
+        if _is_unresolved_tender(t):
+            still_open.add(_base_symbol(tk))
+    return declined, still_open
 
 
 def maybe_take_profit_cover(session, last_tp_by_ticker):
@@ -2012,16 +2060,64 @@ def evaluate_tender(session, tender):
         decline_tender(session, tender)
 
 
-def close_positions(session):
-    print("Closing all positions before trading ends.")
-    _record_event("close_positions_start")
+def _live_positions(session):
+    out = []
     for s in get_securities(session):
         ticker = s.get("ticker")
+        if not ticker:
+            continue
         pos = float(s.get("position", 0.0))
-        if ticker and abs(pos) >= 1:
+        if abs(pos) < 1:
+            continue
+        out.append({"ticker": ticker, "position": pos})
+    return out
+
+
+def close_positions(session, force_if_blocked=True):
+    print("Closing all positions before trading ends.")
+    _record_event("close_positions_start", force_if_blocked=bool(force_if_blocked))
+
+    for pass_idx in range(1, 4):
+        live = _live_positions(session)
+        if not live:
+            _record_event("close_positions_flat", pass_idx=pass_idx)
+            return True
+
+        bases = {_base_symbol(p["ticker"]) for p in live}
+        declined, blocked_bases = _decline_unresolved_tenders_for_bases(session, bases)
+        if declined > 0:
+            _record_event(
+                "close_positions_declined_unresolved",
+                pass_idx=pass_idx,
+                declined=int(declined),
+            )
+
+        for row in live:
+            ticker = row["ticker"]
+            pos = float(row["position"])
+            base = _base_symbol(ticker)
+            if base in blocked_bases and not force_if_blocked:
+                _record_event(
+                    "close_position_skipped_blocked",
+                    ticker=ticker,
+                    pass_idx=pass_idx,
+                    quantity=float(abs(pos)),
+                )
+                continue
             action = "SELL" if pos > 0 else "BUY"
-            _record_event("close_position_order", ticker=ticker, action=action, quantity=float(abs(pos)))
+            _record_event(
+                "close_position_order",
+                ticker=ticker,
+                action=action,
+                quantity=float(abs(pos)),
+                pass_idx=pass_idx,
+                blocked_base=(base in blocked_bases),
+            )
             submit_market_order(session, ticker, abs(pos), action)
+
+        time.sleep(max(0.01, ORDER_DELAY))
+
+    return len(_live_positions(session)) == 0
 
 
 def _state_scaled_ticket(abs_qty, min_ticket_qty, favorable_mult, adverse_mult, state, confidence=1.0):
@@ -2051,57 +2147,216 @@ def _ticket_qty_for_state(abs_pos, ticks_to_end, state, confidence=1.0):
     return ticket
 
 
+def _liquidity_aware_limit_sweep(session, ticker, action, target_qty, ticks_to_end, excluded_tender_ids=None):
+    remaining = float(abs(target_qty))
+    if remaining < 1 or action not in {"BUY", "SELL"}:
+        return 0.0
+
+    side_key = "asks" if action == "BUY" else "bids"
+    total_filled = 0.0
+    slices = 0
+
+    while remaining >= 1 and slices < HEDGE_MAX_FALLBACK_SLICES:
+        blocked_ids = _unresolved_tender_ids_for_base(session, ticker, exclude_tids=excluded_tender_ids)
+        if blocked_ids:
+            _record_hedge_log(
+                "endgame_blocked",
+                ticker=ticker,
+                action=action,
+                remaining=float(remaining),
+                unresolved_tenders=list(blocked_ids),
+            )
+            print(f"[ENDGAME BLOCK] ticker={ticker} unresolved_tenders={blocked_ids} rem={remaining:.0f}")
+            break
+
+        ob = get_order_book_agg(session, ticker)
+        levels = ob.get(side_key, [])
+        if not levels:
+            break
+
+        top = levels[0]
+        top_px = float(top.get("price", 0.0))
+        if top_px <= 0:
+            break
+        top_qty = max(0.0, float(top.get("quantity", 0.0)))
+        depth4_qty = sum(max(0.0, float(lv.get("quantity", 0.0))) for lv in levels[:4])
+
+        if ticks_to_end > (ENDGAME_TICKS // 2):
+            participation = 0.45
+        elif ticks_to_end > (FLATTEN_HARD_DEADLINE_TICKS + 1):
+            participation = 0.70
+        else:
+            participation = 1.00
+
+        planned = min(
+            remaining,
+            MAX_ORDER_SIZE,
+            max(500.0, top_qty * 0.8, depth4_qty * participation),
+        )
+        planned = math.floor(planned)
+        if planned < 1:
+            planned = min(int(MAX_ORDER_SIZE), int(math.floor(remaining)))
+        if planned < 1:
+            break
+
+        base_offset = min(HEDGE_MARKETABLE_OFFSET_MAX, max(AUCTION_TICK, HEDGE_MARKETABLE_OFFSET))
+        urgency_mult = 1.0
+        if ticks_to_end <= FLATTEN_HARD_DEADLINE_TICKS + 1:
+            urgency_mult = 1.6
+        elif ticks_to_end <= (ENDGAME_TICKS // 2):
+            urgency_mult = 1.25
+        offset = min(HEDGE_MARKETABLE_OFFSET_MAX, base_offset * urgency_mult)
+
+        if action == "BUY":
+            px = _round_to_tick(top_px + offset, AUCTION_TICK, mode="up")
+        else:
+            px = _round_to_tick(max(0.01, top_px - offset), AUCTION_TICK, mode="down")
+
+        pos_before = get_inventory_total(session, ticker)
+        submit_limit_order(session, ticker, planned, px, action)
+        time.sleep(max(0.01, ORDER_DELAY))
+        pos_after = get_inventory_total(session, ticker)
+
+        if action == "BUY":
+            filled = max(0.0, pos_after - pos_before)
+        else:
+            filled = max(0.0, pos_before - pos_after)
+
+        if filled <= 0.5 and ticks_to_end <= FLATTEN_HARD_DEADLINE_TICKS + 1:
+            market_qty = min(remaining, float(planned), float(MAX_ORDER_SIZE))
+            if market_qty >= 1:
+                submit_market_order(session, ticker, market_qty, action)
+                pos_after_mkt = get_inventory_total(session, ticker)
+                if action == "BUY":
+                    filled += max(0.0, pos_after_mkt - pos_after)
+                else:
+                    filled += max(0.0, pos_after - pos_after_mkt)
+
+        if filled <= 0.5:
+            break
+
+        total_filled += filled
+        remaining = max(0.0, remaining - filled)
+        slices += 1
+
+    return total_filled
+
+
 def flatten_positions_ticketed(session, tick, tpp):
     ticks_to_end = max(0, int(tpp) - int(tick))
-    any_pos = False
     regime_cache = {}
-    for s in get_securities(session):
-        ticker = s.get("ticker")
-        pos = float(s.get("position", 0.0))
-        if not ticker or abs(pos) < 1:
-            continue
+    passes = 4 if ticks_to_end > (FLATTEN_HARD_DEADLINE_TICKS + 1) else 2
 
-        any_pos = True
-        unwind_action = "SELL" if pos > 0 else "BUY"
-        abs_pos = abs(pos)
-        ob = get_order_book_agg(session, ticker)
-        regime = _flatten_regime(session, ticker, unwind_action, ob, cache=regime_cache)
+    for pass_idx in range(1, passes + 1):
+        live = _live_positions(session)
+        if not live:
+            return True
 
-        ticket_qty = _ticket_qty_for_state(
-            abs_pos,
-            ticks_to_end,
-            regime["state"],
-            confidence=float(regime.get("confidence", 0.0)),
-        )
-        if ticks_to_end <= FLATTEN_HARD_DEADLINE_TICKS + 1:
-            ticket_qty = min(abs_pos, MAX_ORDER_SIZE)
+        bases = {_base_symbol(p["ticker"]) for p in live}
+        declined, blocked_bases = _decline_unresolved_tenders_for_bases(session, bases)
+        if declined > 0:
+            _record_event(
+                "endgame_declined_unresolved",
+                tick=int(tick),
+                ticks_to_end=int(ticks_to_end),
+                pass_idx=pass_idx,
+                declined=int(declined),
+            )
 
-        submit_market_order(session, ticker, ticket_qty, unwind_action)
-        _record_hedge_log(
-            "endgame_ticket",
-            ticker=ticker,
-            action=unwind_action,
-            ticket=float(ticket_qty),
-            abs_position=float(abs_pos),
-            state=regime["state"],
-            confidence=float(regime.get("confidence", 0.0)),
-            ticks_to_end=int(ticks_to_end),
-        )
-        ema_fast = regime["ema_fast"]
-        ema_slow = regime["ema_slow"]
-        rsi = regime["rsi"]
-        ema_fast_s = f"{ema_fast:.3f}" if isinstance(ema_fast, (int, float)) else "N/A"
-        ema_slow_s = f"{ema_slow:.3f}" if isinstance(ema_slow, (int, float)) else "N/A"
-        rsi_s = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else "N/A"
-        print(
-            f"[ENDGAME] ticker={ticker} action={unwind_action} "
-            f"ticket={ticket_qty:.0f}/{abs_pos:.0f} state={regime['state']} "
-            f"ema_f={ema_fast_s} ema_s={ema_slow_s} rsi={rsi_s} "
-            f"imb={regime['imbalance']:.2f} conf={regime.get('confidence', 0.0):.2f} "
-            f"trend={regime.get('trend_bias', 'N/A')} ticks_to_end={ticks_to_end}"
-        )
+        for row in live:
+            ticker = row["ticker"]
+            pos = float(row["position"])
+            abs_pos = abs(pos)
+            if abs_pos < 1:
+                continue
 
-    return not any_pos
+            base = _base_symbol(ticker)
+            if base in blocked_bases and ticks_to_end > FLATTEN_HARD_DEADLINE_TICKS:
+                _record_hedge_log(
+                    "endgame_blocked_skip",
+                    ticker=ticker,
+                    action=("SELL" if pos > 0 else "BUY"),
+                    abs_position=float(abs_pos),
+                    ticks_to_end=int(ticks_to_end),
+                    pass_idx=pass_idx,
+                )
+                print(
+                    f"[ENDGAME BLOCK] ticker={ticker} unresolved_tender_open "
+                    f"pos={abs_pos:.0f} pass={pass_idx}/{passes}"
+                )
+                continue
+
+            unwind_action = "SELL" if pos > 0 else "BUY"
+            ob = get_order_book_agg(session, ticker)
+            regime = _flatten_regime(session, ticker, unwind_action, ob, cache=regime_cache)
+
+            safe_ticks = max(1, ticks_to_end - FLATTEN_HARD_DEADLINE_TICKS)
+            pace_ticket = abs_pos / float(safe_ticks)
+            ticket_qty = _ticket_qty_for_state(
+                abs_pos,
+                safe_ticks,
+                regime["state"],
+                confidence=float(regime.get("confidence", 0.0)),
+            )
+            ticket_qty = max(ticket_qty, pace_ticket)
+            ticket_qty = min(abs_pos, MAX_ORDER_SIZE, ticket_qty)
+
+            mode = "limit_sweep"
+            filled = 0.0
+            if ticks_to_end <= FLATTEN_HARD_DEADLINE_TICKS + 1:
+                mode = "hard_market"
+                ticket_qty = min(abs_pos, MAX_ORDER_SIZE)
+                submit_market_order(session, ticker, ticket_qty, unwind_action)
+                filled = float(ticket_qty)
+            else:
+                filled = _liquidity_aware_limit_sweep(
+                    session,
+                    ticker,
+                    unwind_action,
+                    ticket_qty,
+                    ticks_to_end,
+                )
+                min_expected = max(1.0, float(ticket_qty) * 0.25)
+                if filled < min_expected:
+                    mode = "limit_then_market"
+                    remaining_after_limit = max(0.0, abs_pos - filled)
+                    fallback_qty = min(remaining_after_limit, MAX_ORDER_SIZE)
+                    if fallback_qty >= 1:
+                        submit_market_order(session, ticker, fallback_qty, unwind_action)
+                        filled += float(fallback_qty)
+
+            _record_hedge_log(
+                "endgame_ticket",
+                ticker=ticker,
+                action=unwind_action,
+                ticket=float(ticket_qty),
+                filled=float(filled),
+                abs_position=float(abs_pos),
+                state=regime["state"],
+                confidence=float(regime.get("confidence", 0.0)),
+                ticks_to_end=int(ticks_to_end),
+                pass_idx=pass_idx,
+                mode=mode,
+                blocked_base=(base in blocked_bases),
+            )
+            ema_fast = regime["ema_fast"]
+            ema_slow = regime["ema_slow"]
+            rsi = regime["rsi"]
+            ema_fast_s = f"{ema_fast:.3f}" if isinstance(ema_fast, (int, float)) else "N/A"
+            ema_slow_s = f"{ema_slow:.3f}" if isinstance(ema_slow, (int, float)) else "N/A"
+            rsi_s = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else "N/A"
+            print(
+                f"[ENDGAME] ticker={ticker} action={unwind_action} "
+                f"mode={mode} pass={pass_idx}/{passes} ticket={ticket_qty:.0f}/{abs_pos:.0f} "
+                f"filled={filled:.0f} state={regime['state']} "
+                f"ema_f={ema_fast_s} ema_s={ema_slow_s} rsi={rsi_s} "
+                f"imb={regime['imbalance']:.2f} conf={regime.get('confidence', 0.0):.2f} "
+                f"trend={regime.get('trend_bias', 'N/A')} ticks_to_end={ticks_to_end}"
+            )
+
+        time.sleep(max(0.01, ORDER_DELAY))
+
+    return len(_live_positions(session)) == 0
 
 
 def main():
