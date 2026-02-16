@@ -991,6 +991,9 @@ class MergerArbBot:
 
     def trade_loop(self) -> None:
         loop_errors = 0
+        # Per-loop aliases for fast tuning and readability.
+        MIN_PROFIT_MARGIN = DESIRED_PROFIT_MARGIN
+        EXIT_BUFFER = TAKE_PROFIT_BUFFER
         while self.running:
             try:
                 case = self.client.get_case()
@@ -1028,19 +1031,19 @@ class MergerArbBot:
                         continue
 
                     st = states_copy[deal_id]
-                    if now - st.last_trade_ts < TRADE_COOLDOWN_SECS:
-                        continue
+                    can_enter = (now - st.last_trade_ts) >= TRADE_COOLDOWN_SECS
 
                     t_bid, t_ask, _ = books[target]
                     a_bid, a_ask, a_mid = books[acquirer]
                     k = deal_value(deal, a_mid)
                     p_star = st.probability * k + (1.0 - st.probability) * st.standalone_value
                     ratio = float(deal["ratio"]) if deal["structure"] in {"stock", "mixed"} else 0.0
+                    commission_cost = COMMISSION_PER_SHARE * (1.0 + ratio)
                     target_pos = int(positions.get(target, 0))
                     acq_pos = int(positions.get(acquirer, 0))
 
                     # Exit logic: flatten when price converges back to model.
-                    if target_pos > 0 and t_bid >= p_star - TAKE_PROFIT_BUFFER:
+                    if target_pos > 0 and t_bid >= p_star - commission_cost - EXIT_BUFFER:
                         close_qty = close_qty_for_position(abs(target_pos))
                         hedge_close_qty = compute_hedge_close_qty("SELL", ratio, close_qty, acq_pos)
                         target_ok, hedge_ok = self._submit_pair(
@@ -1068,7 +1071,7 @@ class MergerArbBot:
                                 self.deal_states[deal_id].last_trade_ts = now
                         continue
 
-                    if target_pos < 0 and t_ask <= p_star + TAKE_PROFIT_BUFFER:
+                    if target_pos < 0 and t_ask <= p_star + commission_cost + EXIT_BUFFER:
                         close_qty = close_qty_for_position(abs(target_pos))
                         hedge_close_qty = compute_hedge_close_qty("BUY", ratio, close_qty, acq_pos)
                         target_ok, hedge_ok = self._submit_pair(
@@ -1116,6 +1119,9 @@ class MergerArbBot:
                                 self.deal_states[deal_id].last_trade_ts = now
                         continue
 
+                    if not can_enter:
+                        continue
+
                     # Entry / add-reduce logic with dynamic friction-aware threshold.
                     action = None
                     edge = 0.0
@@ -1129,7 +1135,7 @@ class MergerArbBot:
                         continue
 
                     friction = compute_transaction_friction(ratio, t_bid, t_ask, a_bid, a_ask)
-                    base_threshold = max(MISPRICING_THRESHOLD, friction + DESIRED_PROFIT_MARGIN)
+                    base_threshold = max(MISPRICING_THRESHOLD, friction + MIN_PROFIT_MARGIN)
                     dyn_threshold = inventory_adjusted_threshold(
                         base_threshold=base_threshold,
                         target_pos=target_pos,
