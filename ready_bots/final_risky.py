@@ -34,6 +34,27 @@ MIN_EDGE = float(_env("RIT_FINAL_RISKY_MIN_EDGE", "RIT_FINAL_MIN_EDGE", "0.03"))
 VOL_FACTOR = float(_env("RIT_FINAL_RISKY_VOL_FACTOR", "RIT_FINAL_VOL_FACTOR", "0.70"))
 MAX_ATTEMPTS = int(_env("RIT_FINAL_RISKY_MAX_ATTEMPTS", "RIT_FINAL_MAX_ATTEMPTS", "20"))
 EVAL_DELAY = float(_env("RIT_FINAL_RISKY_EVAL_DELAY", "RIT_FINAL_EVAL_DELAY", "0.5"))
+TENDER_MONITOR_INTERVAL = max(
+    0.005, float(_env("RIT_FINAL_RISKY_TENDER_MONITOR_INTERVAL", "RIT_FINAL_TENDER_MONITOR_INTERVAL", "0.020"))
+)
+TENDER_MONITOR_FAST_INTERVAL = max(
+    0.003,
+    float(_env("RIT_FINAL_RISKY_TENDER_MONITOR_FAST_INTERVAL", "RIT_FINAL_TENDER_MONITOR_FAST_INTERVAL", "0.008")),
+)
+TENDER_MONITOR_EDGE_INTERVAL = max(
+    0.003,
+    float(_env("RIT_FINAL_RISKY_TENDER_MONITOR_EDGE_INTERVAL", "RIT_FINAL_TENDER_MONITOR_EDGE_INTERVAL", "0.006")),
+)
+TENDER_MONITOR_LOG_EVERY = max(
+    1, int(_env("RIT_FINAL_RISKY_TENDER_MONITOR_LOG_EVERY", "RIT_FINAL_TENDER_MONITOR_LOG_EVERY", "10"))
+)
+TENDER_MONITOR_MAX_POLLS = max(
+    20, int(_env("RIT_FINAL_RISKY_TENDER_MONITOR_MAX_POLLS", "RIT_FINAL_TENDER_MONITOR_MAX_POLLS", "1200"))
+)
+TENDER_TICK_REFRESH_SECS = max(
+    0.05,
+    float(_env("RIT_FINAL_RISKY_TENDER_TICK_REFRESH_SECS", "RIT_FINAL_TENDER_TICK_REFRESH_SECS", "0.25")),
+)
 ORDER_DELAY = float(_env("RIT_FINAL_RISKY_ORDER_DELAY", "RIT_FINAL_ORDER_DELAY", "0.05"))
 AFTER_ACCEPT_DELAY = float(_env("RIT_FINAL_RISKY_AFTER_ACCEPT_DELAY", "RIT_FINAL_AFTER_ACCEPT_DELAY", "0.20"))
 MAX_ORDER_SIZE = 10000.0# Maximum order size
@@ -47,11 +68,59 @@ EDGE_DECAY_PER_ATTEMPT = float(_env("RIT_FINAL_RISKY_EDGE_DECAY_PER_ATTEMPT", "R
 VOL_RELAX_PER_ATTEMPT = float(_env("RIT_FINAL_RISKY_VOL_RELAX_PER_ATTEMPT", "RIT_FINAL_VOL_RELAX_PER_ATTEMPT", "0.12"))
 HEDGE_RATIO = float(_env("RIT_FINAL_RISKY_HEDGE_RATIO", "RIT_FINAL_HEDGE_RATIO", "0.25" if AGGRESSIVE_MODE else "0.70"))
 HEDGE_RATIO = max(0.0, min(1.0, HEDGE_RATIO))
+DYN_HEDGE_RATIO_ENABLED = _env_bool("RIT_FINAL_RISKY_DYN_HEDGE_RATIO_ENABLED", "RIT_FINAL_DYN_HEDGE_RATIO_ENABLED", "1")
+DYN_HEDGE_RATIO_MIN = max(
+    0.0, min(1.0, float(_env("RIT_FINAL_RISKY_DYN_HEDGE_RATIO_MIN", "RIT_FINAL_DYN_HEDGE_RATIO_MIN", "0.25")))
+)
+DYN_HEDGE_RATIO_MAX = max(
+    DYN_HEDGE_RATIO_MIN,
+    min(1.0, float(_env("RIT_FINAL_RISKY_DYN_HEDGE_RATIO_MAX", "RIT_FINAL_DYN_HEDGE_RATIO_MAX", "1.00"))),
+)
+DYN_HEDGE_VOL_WEIGHT = max(
+    0.0, float(_env("RIT_FINAL_RISKY_DYN_HEDGE_VOL_WEIGHT", "RIT_FINAL_DYN_HEDGE_VOL_WEIGHT", "0.55"))
+)
+DYN_HEDGE_SPREAD_WEIGHT = max(
+    0.0, float(_env("RIT_FINAL_RISKY_DYN_HEDGE_SPREAD_WEIGHT", "RIT_FINAL_DYN_HEDGE_SPREAD_WEIGHT", "0.35"))
+)
+DYN_HEDGE_ADVERSE_BONUS = max(
+    0.0, float(_env("RIT_FINAL_RISKY_DYN_HEDGE_ADVERSE_BONUS", "RIT_FINAL_DYN_HEDGE_ADVERSE_BONUS", "0.20"))
+)
+DYN_HEDGE_FAVORABLE_DISCOUNT = max(
+    0.0, float(_env("RIT_FINAL_RISKY_DYN_HEDGE_FAVORABLE_DISCOUNT", "RIT_FINAL_DYN_HEDGE_FAVORABLE_DISCOUNT", "0.08"))
+)
+DYN_HEDGE_VOL_REF = max(
+    0.0001, float(_env("RIT_FINAL_RISKY_DYN_HEDGE_VOL_REF", "RIT_FINAL_DYN_HEDGE_VOL_REF", "0.0030"))
+)
+DYN_HEDGE_SPREAD_BPS_REF = max(
+    0.5, float(_env("RIT_FINAL_RISKY_DYN_HEDGE_SPREAD_BPS_REF", "RIT_FINAL_DYN_HEDGE_SPREAD_BPS_REF", "8.0"))
+)
 PORTFOLIO_PRINT_INTERVAL = float(_env("RIT_FINAL_RISKY_PORTFOLIO_PRINT_INTERVAL", "RIT_FINAL_PORTFOLIO_PRINT_INTERVAL", "5.0"))
 TAKE_PROFIT_ENABLED = _env_bool("RIT_FINAL_RISKY_TAKE_PROFIT_ENABLED", "RIT_FINAL_TAKE_PROFIT_ENABLED", "1")
 TAKE_PROFIT_PER_SHARE = float(_env("RIT_FINAL_RISKY_TAKE_PROFIT_PER_SHARE", "RIT_FINAL_TAKE_PROFIT_PER_SHARE", "0.15"))
 TAKE_PROFIT_CHUNK_QTY = float(_env("RIT_FINAL_RISKY_TAKE_PROFIT_CHUNK_QTY", "RIT_FINAL_TAKE_PROFIT_CHUNK_QTY", "10000"))
 TAKE_PROFIT_CHUNK_QTY = max(1.0, TAKE_PROFIT_CHUNK_QTY)
+TAKE_PROFIT_MIN_CHUNK_QTY = max(
+    1.0, float(_env("RIT_FINAL_RISKY_TAKE_PROFIT_MIN_CHUNK_QTY", "RIT_FINAL_TAKE_PROFIT_MIN_CHUNK_QTY", "500"))
+)
+TAKE_PROFIT_SPREAD_BPS_REF = max(
+    0.5, float(_env("RIT_FINAL_RISKY_TAKE_PROFIT_SPREAD_BPS_REF", "RIT_FINAL_TAKE_PROFIT_SPREAD_BPS_REF", "8.0"))
+)
+TAKE_PROFIT_SPREAD_POWER = max(
+    0.2, float(_env("RIT_FINAL_RISKY_TAKE_PROFIT_SPREAD_POWER", "RIT_FINAL_TAKE_PROFIT_SPREAD_POWER", "1.0"))
+)
+TAKE_PROFIT_TOP_LEVEL_PARTICIPATION = max(
+    0.05,
+    min(
+        1.0,
+        float(
+            _env(
+                "RIT_FINAL_RISKY_TAKE_PROFIT_TOP_LEVEL_PARTICIPATION",
+                "RIT_FINAL_TAKE_PROFIT_TOP_LEVEL_PARTICIPATION",
+                "0.60",
+            )
+        ),
+    ),
+)
 TAKE_PROFIT_COOLDOWN = float(_env("RIT_FINAL_RISKY_TAKE_PROFIT_COOLDOWN", "RIT_FINAL_TAKE_PROFIT_COOLDOWN", "2.0"))
 STOP_LOSS_ENABLED = _env_bool("RIT_FINAL_RISKY_STOP_LOSS_ENABLED", "RIT_FINAL_STOP_LOSS_ENABLED", "0")
 STOP_LOSS_PER_SHARE = float(_env("RIT_FINAL_RISKY_STOP_LOSS_PER_SHARE", "RIT_FINAL_STOP_LOSS_PER_SHARE", "0.30"))
@@ -321,6 +390,12 @@ def save_run_report(session, reason, run_error=None):
             "VOL_FACTOR": VOL_FACTOR,
             "MAX_ATTEMPTS": MAX_ATTEMPTS,
             "EVAL_DELAY": EVAL_DELAY,
+            "TENDER_MONITOR_INTERVAL": TENDER_MONITOR_INTERVAL,
+            "TENDER_MONITOR_FAST_INTERVAL": TENDER_MONITOR_FAST_INTERVAL,
+            "TENDER_MONITOR_EDGE_INTERVAL": TENDER_MONITOR_EDGE_INTERVAL,
+            "TENDER_MONITOR_LOG_EVERY": TENDER_MONITOR_LOG_EVERY,
+            "TENDER_MONITOR_MAX_POLLS": TENDER_MONITOR_MAX_POLLS,
+            "TENDER_TICK_REFRESH_SECS": TENDER_TICK_REFRESH_SECS,
             "ORDER_DELAY": ORDER_DELAY,
             "AFTER_ACCEPT_DELAY": AFTER_ACCEPT_DELAY,
             "MAX_ORDER_SIZE": MAX_ORDER_SIZE,
@@ -330,9 +405,22 @@ def save_run_report(session, reason, run_error=None):
             "FIXED_ONLY": FIXED_ONLY,
             "AGGRESSIVE_MODE": AGGRESSIVE_MODE,
             "HEDGE_RATIO": HEDGE_RATIO,
+            "DYN_HEDGE_RATIO_ENABLED": DYN_HEDGE_RATIO_ENABLED,
+            "DYN_HEDGE_RATIO_MIN": DYN_HEDGE_RATIO_MIN,
+            "DYN_HEDGE_RATIO_MAX": DYN_HEDGE_RATIO_MAX,
+            "DYN_HEDGE_VOL_WEIGHT": DYN_HEDGE_VOL_WEIGHT,
+            "DYN_HEDGE_SPREAD_WEIGHT": DYN_HEDGE_SPREAD_WEIGHT,
+            "DYN_HEDGE_ADVERSE_BONUS": DYN_HEDGE_ADVERSE_BONUS,
+            "DYN_HEDGE_FAVORABLE_DISCOUNT": DYN_HEDGE_FAVORABLE_DISCOUNT,
+            "DYN_HEDGE_VOL_REF": DYN_HEDGE_VOL_REF,
+            "DYN_HEDGE_SPREAD_BPS_REF": DYN_HEDGE_SPREAD_BPS_REF,
             "TAKE_PROFIT_ENABLED": TAKE_PROFIT_ENABLED,
             "TAKE_PROFIT_PER_SHARE": TAKE_PROFIT_PER_SHARE,
             "TAKE_PROFIT_CHUNK_QTY": TAKE_PROFIT_CHUNK_QTY,
+            "TAKE_PROFIT_MIN_CHUNK_QTY": TAKE_PROFIT_MIN_CHUNK_QTY,
+            "TAKE_PROFIT_SPREAD_BPS_REF": TAKE_PROFIT_SPREAD_BPS_REF,
+            "TAKE_PROFIT_SPREAD_POWER": TAKE_PROFIT_SPREAD_POWER,
+            "TAKE_PROFIT_TOP_LEVEL_PARTICIPATION": TAKE_PROFIT_TOP_LEVEL_PARTICIPATION,
             "TAKE_PROFIT_COOLDOWN": TAKE_PROFIT_COOLDOWN,
             "STOP_LOSS_ENABLED": STOP_LOSS_ENABLED,
             "STOP_LOSS_PER_SHARE": STOP_LOSS_PER_SHARE,
@@ -761,6 +849,76 @@ def _realized_volatility(prices, lookback):
     return _stdev(rets)
 
 
+def _spread_bps(ob):
+    spread = ob.get("spread")
+    if not isinstance(spread, (int, float)) or spread <= 0:
+        return 0.0
+    mid = ob.get("mid")
+    if isinstance(mid, (int, float)) and mid > 0:
+        denom = float(mid)
+    else:
+        best_bid = ob.get("best_bid")
+        best_ask = ob.get("best_ask")
+        if isinstance(best_bid, (int, float)) and isinstance(best_ask, (int, float)) and (best_bid + best_ask) > 0:
+            denom = (float(best_bid) + float(best_ask)) / 2.0
+        else:
+            denom = 1.0
+    return max(0.0, (float(spread) / max(0.01, denom)) * 10000.0)
+
+
+def _spread_scaled_chunk(base_qty, spread_bps, spread_ref_bps, min_qty=1.0, power=1.0):
+    base = max(1.0, float(base_qty))
+    ref = max(0.5, float(spread_ref_bps))
+    spread = max(0.0, float(spread_bps))
+    p = max(0.2, float(power))
+    if spread <= ref:
+        scale = 1.0
+    else:
+        scale = (ref / spread) ** p
+    chunk = base * max(0.01, min(1.0, scale))
+    return max(float(min_qty), min(base, chunk))
+
+
+def _dynamic_hedge_ratio(base_ratio, ob, regime=None):
+    base = max(0.0, min(1.0, float(base_ratio)))
+    spread_bps = _spread_bps(ob)
+    spread_score = _clip01(spread_bps / max(0.5, DYN_HEDGE_SPREAD_BPS_REF))
+
+    realized_vol = None
+    state = "NEUTRAL"
+    conf = 0.0
+    if isinstance(regime, dict):
+        rv = regime.get("realized_vol")
+        if isinstance(rv, (int, float)) and rv >= 0:
+            realized_vol = float(rv)
+        state = str(regime.get("state", "NEUTRAL")).upper()
+        conf = _clip01(regime.get("confidence", 0.0))
+
+    vol_score = _clip01((realized_vol or 0.0) / max(0.0001, DYN_HEDGE_VOL_REF))
+
+    ratio = base
+    if DYN_HEDGE_RATIO_ENABLED:
+        ratio += (DYN_HEDGE_VOL_WEIGHT * vol_score) + (DYN_HEDGE_SPREAD_WEIGHT * spread_score)
+        if state == "ADVERSE":
+            ratio += DYN_HEDGE_ADVERSE_BONUS * max(0.3, conf)
+        elif state == "FAVORABLE":
+            ratio -= DYN_HEDGE_FAVORABLE_DISCOUNT * conf
+        ratio = max(DYN_HEDGE_RATIO_MIN, min(DYN_HEDGE_RATIO_MAX, ratio))
+    else:
+        ratio = max(DYN_HEDGE_RATIO_MIN, min(DYN_HEDGE_RATIO_MAX, ratio))
+
+    return ratio, {
+        "base_ratio": base,
+        "final_ratio": ratio,
+        "spread_bps": spread_bps,
+        "spread_score": spread_score,
+        "realized_vol": realized_vol,
+        "vol_score": vol_score,
+        "state": state,
+        "confidence": conf,
+    }
+
+
 def _flatten_regime(session, ticker, unwind_action, ob, cache=None):
     now = time.monotonic()
     cache_key = f"{ticker}|{unwind_action}"
@@ -904,15 +1062,25 @@ def maybe_take_profit_cover(session, last_tp_by_ticker):
             continue
 
         ob = get_order_book_agg(session, ticker)
+        spread_bps = _spread_bps(ob)
+        spread_chunk_cap = _spread_scaled_chunk(
+            TAKE_PROFIT_CHUNK_QTY,
+            spread_bps,
+            TAKE_PROFIT_SPREAD_BPS_REF,
+            min_qty=TAKE_PROFIT_MIN_CHUNK_QTY,
+            power=TAKE_PROFIT_SPREAD_POWER,
+        )
         if pos < 0:
             if not ob["asks"]:
                 continue
+            top_level_qty = float(ob["asks"][0].get("quantity", 0.0))
             exec_px = ob["asks"][0]["price"]
             edge = cost - exec_px
             action = "BUY"
         else:
             if not ob["bids"]:
                 continue
+            top_level_qty = float(ob["bids"][0].get("quantity", 0.0))
             exec_px = ob["bids"][0]["price"]
             edge = exec_px - cost
             action = "SELL"
@@ -920,7 +1088,11 @@ def maybe_take_profit_cover(session, last_tp_by_ticker):
         if edge < TAKE_PROFIT_PER_SHARE:
             continue
 
-        cover_qty = min(abs(pos), TAKE_PROFIT_CHUNK_QTY)
+        if top_level_qty <= 0:
+            continue
+        top_level_cap = max(1.0, top_level_qty * TAKE_PROFIT_TOP_LEVEL_PARTICIPATION)
+        cover_qty = min(abs(pos), TAKE_PROFIT_CHUNK_QTY, spread_chunk_cap, top_level_cap)
+        cover_qty = math.floor(cover_qty)
         if cover_qty < 1:
             continue
 
@@ -928,7 +1100,8 @@ def maybe_take_profit_cover(session, last_tp_by_ticker):
         last_tp_by_ticker[ticker] = now
         print(
             f"[TAKE_PROFIT] {ticker} {action} {cover_qty:.0f} "
-            f"edge={edge:.3f} cost={cost:.2f} exec={exec_px:.2f}"
+            f"edge={edge:.3f} cost={cost:.2f} exec={exec_px:.2f} "
+            f"spread_bps={spread_bps:.2f} chunk_cap={spread_chunk_cap:.0f} top_cap={top_level_cap:.0f}"
         )
 
 
@@ -1232,23 +1405,39 @@ def evaluate_tender(session, tender):
         return
 
     attempts = MAX_ATTEMPTS
+    latest_tick = None
 
     # Bound attempts by remaining tender window.
     expires = tender.get("expires")
     try:
         tick_now, _, _ = get_tick(session)
+        latest_tick = tick_now
         if isinstance(expires, (int, float)):
             ticks_left = max(0, int(expires) - int(tick_now))
             attempts = max(1, min(attempts, ticks_left - 1))
     except Exception:
         pass
 
+    monitor_interval = max(0.005, TENDER_MONITOR_INTERVAL)
+    monitor_budget_secs = max(monitor_interval, float(attempts) * max(EVAL_DELAY, monitor_interval))
+    max_polls = max(1, min(TENDER_MONITOR_MAX_POLLS, int(monitor_budget_secs / monitor_interval) + 2))
+    monitor_deadline = time.monotonic() + monitor_budget_secs
+
     accepted = False
     regime_cache = {}
     last_fixed_price = tender.get("price")
-    for i in range(attempts):
-        if i > 0:
-            time.sleep(EVAL_DELAY)
+    poll_idx = 0
+    last_tick_refresh = 0.0
+
+    while poll_idx < max_polls and time.monotonic() <= monitor_deadline:
+        now = time.monotonic()
+        if latest_tick is None or (now - last_tick_refresh) >= TENDER_TICK_REFRESH_SECS:
+            try:
+                latest_tick, _, _ = get_tick(session)
+                last_tick_refresh = now
+            except Exception:
+                pass
+
         live = get_tender_map(session).get(tid)
         if live is None:
             print(f"Tender {tid} unavailable.")
@@ -1287,13 +1476,15 @@ def evaluate_tender(session, tender):
         if is_fixed_live:
             if not isinstance(last_fixed_price, (int, float)):
                 print(f"HOLD tender {tid}: fixed price missing")
+                poll_idx += 1
+                time.sleep(monitor_interval)
                 continue
             edge_ok, edge, eff_edge, imbalance, edge_top, edge_exec, fill_ratio = _action_edge_ok(
                 live_action,
                 float(last_fixed_price),
                 ob,
                 tender_qty,
-                i,
+                poll_idx,
                 regime=regime,
             )
             should_submit = edge_ok
@@ -1303,7 +1494,7 @@ def evaluate_tender(session, tender):
                 live_action,
                 ob,
                 tender_qty,
-                i,
+                poll_idx,
                 regime=regime,
             )
             if submit_price is not None and hedge_exec_px is not None:
@@ -1325,7 +1516,9 @@ def evaluate_tender(session, tender):
             pre = get_inventory_total(session, ticker)
             accepted = accept_tender(session, live, submit_price=submit_price)
             if not accepted:
-                print(f"Tender {tid} submit failed on attempt {i + 1}/{attempts}; retrying while still open.")
+                print(f"Tender {tid} submit failed on poll {poll_idx + 1}/{max_polls}; retrying while still open.")
+                poll_idx += 1
+                time.sleep(min(monitor_interval, TENDER_MONITOR_FAST_INTERVAL))
                 continue
 
             time.sleep(AFTER_ACCEPT_DELAY)
@@ -1334,29 +1527,59 @@ def evaluate_tender(session, tender):
             # Position-delta hedging (core anti-fine fix):
             # only unwind the quantity actually added by tender fill.
             if abs(delta) > 0:
-                hedge_delta = delta * HEDGE_RATIO
+                hedge_unwind_action = "BUY" if delta < 0 else "SELL"
+                ob_post = get_order_book_agg(session, ticker)
+                regime_post = _flatten_regime(session, ticker, hedge_unwind_action, ob_post, cache=regime_cache)
+                hedge_ratio_now, hedge_meta = _dynamic_hedge_ratio(HEDGE_RATIO, ob_post, regime=regime_post)
+                hedge_delta = delta * hedge_ratio_now
+                print(
+                    f"[HEDGE_RATIO] {ticker} base={HEDGE_RATIO:.2f} dyn={hedge_ratio_now:.2f} "
+                    f"spread_bps={hedge_meta['spread_bps']:.2f} vol={hedge_meta['realized_vol']} "
+                    f"state={hedge_meta['state']} conf={hedge_meta['confidence']:.2f}"
+                )
                 unwind_inventory(session, ticker, hedge_delta)
                 retained = delta - hedge_delta
                 if abs(retained) >= 1:
                     print(
                         f"Holding risk on {ticker}: retained={retained:.0f} "
-                        f"(hedge_ratio={HEDGE_RATIO:.2f})"
+                        f"(hedge_ratio={hedge_ratio_now:.2f})"
                     )
             else:
                 print(f"Tender {tid} accepted but no fill delta (likely lost auction or reserve miss).")
             break
-        print(
-            f"Evaluating tender {tid} ({i + 1}/{attempts}) "
-            f"mode={mode} px={(f'{last_fixed_price:.2f}' if isinstance(last_fixed_price, (int, float)) else 'N/A')} "
-            f"submit={(f'{submit_price:.2f}' if isinstance(submit_price, (int, float)) else 'N/A')} "
-            f"qty={tender_qty:.0f} side={live_action} "
-            f"edge={edge if edge is not None else 'N/A'} req={eff_edge:.3f} "
-            f"top={edge_top if edge_top is not None else 'N/A'} "
-            f"exec={edge_exec if edge_exec is not None else 'N/A'} "
-            f"fill={fill_ratio:.2f} imb={imbalance:.2f} regime={regime['state']} "
-            f"conf={regime.get('confidence', 0.0):.2f} "
-            f"trend={regime.get('trend_bias', 'N/A')}"
+
+        ticks_left_live = None
+        if isinstance(expires, (int, float)) and isinstance(latest_tick, (int, float)):
+            ticks_left_live = int(expires) - int(latest_tick)
+
+        should_log = (
+            poll_idx == 0
+            or (poll_idx % TENDER_MONITOR_LOG_EVERY == 0)
+            or (edge is not None and edge >= (0.92 * eff_edge))
+            or (ticks_left_live is not None and ticks_left_live <= 2)
         )
+        if should_log:
+            print(
+                f"Evaluating tender {tid} ({poll_idx + 1}/{max_polls}) "
+                f"mode={mode} px={(f'{last_fixed_price:.2f}' if isinstance(last_fixed_price, (int, float)) else 'N/A')} "
+                f"submit={(f'{submit_price:.2f}' if isinstance(submit_price, (int, float)) else 'N/A')} "
+                f"qty={tender_qty:.0f} side={live_action} "
+                f"edge={edge if edge is not None else 'N/A'} req={eff_edge:.3f} "
+                f"top={edge_top if edge_top is not None else 'N/A'} "
+                f"exec={edge_exec if edge_exec is not None else 'N/A'} "
+                f"fill={fill_ratio:.2f} imb={imbalance:.2f} regime={regime['state']} "
+                f"conf={regime.get('confidence', 0.0):.2f} "
+                f"trend={regime.get('trend_bias', 'N/A')} "
+                f"ticks_left={(ticks_left_live if ticks_left_live is not None else 'N/A')}"
+            )
+
+        poll_delay = monitor_interval
+        if edge is not None and edge >= (0.80 * eff_edge):
+            poll_delay = min(poll_delay, TENDER_MONITOR_EDGE_INTERVAL)
+        if ticks_left_live is not None and ticks_left_live <= 2:
+            poll_delay = min(poll_delay, TENDER_MONITOR_FAST_INTERVAL)
+        time.sleep(max(0.001, poll_delay))
+        poll_idx += 1
 
     if not accepted:
         decline_tender(session, tender)
