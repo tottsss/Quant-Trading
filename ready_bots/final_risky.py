@@ -130,6 +130,15 @@ STOP_LOSS_COOLDOWN = float(_env("RIT_FINAL_RISKY_STOP_LOSS_COOLDOWN", "RIT_FINAL
 BOOK_OUTLIER_BPS = float(_env("RIT_FINAL_RISKY_BOOK_OUTLIER_BPS", "RIT_FINAL_BOOK_OUTLIER_BPS", "60"))
 BOOK_OUTLIER_SPREAD_MULT = float(_env("RIT_FINAL_RISKY_BOOK_OUTLIER_SPREAD_MULT", "RIT_FINAL_BOOK_OUTLIER_SPREAD_MULT", "8.0"))
 BOOK_MAX_LEVEL_QTY = float(_env("RIT_FINAL_RISKY_BOOK_MAX_LEVEL_QTY", "RIT_FINAL_BOOK_MAX_LEVEL_QTY", "25000"))
+BOOK_DECISION_MAX_LEVELS = max(
+    1, int(_env("RIT_FINAL_RISKY_BOOK_DECISION_MAX_LEVELS", "RIT_FINAL_BOOK_DECISION_MAX_LEVELS", "12"))
+)
+BOOK_DECISION_MAX_BPS = max(
+    0.0, float(_env("RIT_FINAL_RISKY_BOOK_DECISION_MAX_BPS", "RIT_FINAL_BOOK_DECISION_MAX_BPS", "40"))
+)
+BOOK_DECISION_MIN_LEVELS = max(
+    1, int(_env("RIT_FINAL_RISKY_BOOK_DECISION_MIN_LEVELS", "RIT_FINAL_BOOK_DECISION_MIN_LEVELS", "3"))
+)
 BOOK_MIN_FILL_RATIO = max(
     0.0,
     min(1.0, float(_env("RIT_FINAL_RISKY_BOOK_MIN_FILL_RATIO", "RIT_FINAL_BOOK_MIN_FILL_RATIO", "0.95"))),
@@ -429,6 +438,9 @@ def save_run_report(session, reason, run_error=None):
             "BOOK_OUTLIER_BPS": BOOK_OUTLIER_BPS,
             "BOOK_OUTLIER_SPREAD_MULT": BOOK_OUTLIER_SPREAD_MULT,
             "BOOK_MAX_LEVEL_QTY": BOOK_MAX_LEVEL_QTY,
+            "BOOK_DECISION_MAX_LEVELS": BOOK_DECISION_MAX_LEVELS,
+            "BOOK_DECISION_MAX_BPS": BOOK_DECISION_MAX_BPS,
+            "BOOK_DECISION_MIN_LEVELS": BOOK_DECISION_MIN_LEVELS,
             "BOOK_MIN_FILL_RATIO": BOOK_MIN_FILL_RATIO,
             "LIMIT_FALLBACK_GROSS": LIMIT_FALLBACK_GROSS,
             "LIMIT_FALLBACK_NET": LIMIT_FALLBACK_NET,
@@ -766,6 +778,57 @@ def _weighted_exec_price(levels, target_qty):
         return None, 0.0, 0.0
     fill_ratio = min(1.0, filled / requested)
     return notional / filled, filled, fill_ratio
+
+
+def _decision_book_levels(ob, side, target_qty):
+    """
+    Use a filtered decision slice of the book (not full depth) for tender economics.
+    Side is hedge side: "bids" for SELL hedge, "asks" for BUY hedge.
+    """
+    if side not in {"bids", "asks"}:
+        return []
+    full = ob.get(f"{side}_all") or ob.get(side, [])
+    if not full:
+        return []
+
+    max_levels = max(1, BOOK_DECISION_MAX_LEVELS)
+    min_levels = max(1, min(BOOK_DECISION_MIN_LEVELS, max_levels))
+    qty_target = max(1.0, float(target_qty))
+
+    best_px = float(full[0].get("price", 0.0)) if full else 0.0
+    bps_window = max(0.0, BOOK_DECISION_MAX_BPS)
+    band = max(0.01, best_px * (bps_window / 10000.0))
+    if side == "bids":
+        px_limit = best_px - band
+    else:
+        px_limit = best_px + band
+
+    out = []
+    cum_qty = 0.0
+    for lv in full:
+        px = lv.get("price")
+        qty = lv.get("quantity")
+        if not isinstance(px, (int, float)) or not isinstance(qty, (int, float)) or qty <= 0:
+            continue
+        px_f = float(px)
+        if bps_window > 0:
+            if side == "bids" and px_f < px_limit:
+                if len(out) >= min_levels:
+                    break
+            if side == "asks" and px_f > px_limit:
+                if len(out) >= min_levels:
+                    break
+
+        out.append({"ticker": lv.get("ticker"), "price": px_f, "quantity": float(qty)})
+        cum_qty += float(qty)
+        if len(out) >= max_levels:
+            break
+        if cum_qty >= qty_target and len(out) >= min_levels:
+            break
+
+    if not out:
+        return full[:max_levels]
+    return out
 
 
 def _get_tas_prices(session, ticker, limit):
@@ -1324,7 +1387,8 @@ def _action_edge_ok(my_action, tender_price, ob, tender_qty, attempt_idx, regime
             edge_top = float(ob["best_bid"]) - tender_price
 
         edge_exec = None
-        exec_px, _, fill_ratio = _weighted_exec_price(ob.get("bids_all") or ob.get("bids", []), decision_qty)
+        decision_levels = _decision_book_levels(ob, "bids", decision_qty)
+        exec_px, _, fill_ratio = _weighted_exec_price(decision_levels, decision_qty)
         if exec_px is not None and fill_ratio >= BOOK_MIN_FILL_RATIO:
             edge_exec = exec_px - tender_price
 
@@ -1343,7 +1407,8 @@ def _action_edge_ok(my_action, tender_price, ob, tender_qty, attempt_idx, regime
             edge_top = tender_price - float(ob["best_ask"])
 
         edge_exec = None
-        exec_px, _, fill_ratio = _weighted_exec_price(ob.get("asks_all") or ob.get("asks", []), decision_qty)
+        decision_levels = _decision_book_levels(ob, "asks", decision_qty)
+        exec_px, _, fill_ratio = _weighted_exec_price(decision_levels, decision_qty)
         if exec_px is not None and fill_ratio >= BOOK_MIN_FILL_RATIO:
             edge_exec = tender_price - exec_px
 
@@ -1371,14 +1436,16 @@ def _build_non_fixed_submit_price(my_action, ob, tender_qty, attempt_idx, regime
     decision_qty = max(1.0, float(tender_qty))
 
     if my_action == "BUY":
-        exec_px, _, fill_ratio = _weighted_exec_price(ob.get("bids_all") or ob.get("bids", []), decision_qty)
+        decision_levels = _decision_book_levels(ob, "bids", decision_qty)
+        exec_px, _, fill_ratio = _weighted_exec_price(decision_levels, decision_qty)
         if exec_px is None or fill_ratio < BOOK_MIN_FILL_RATIO:
             return False, None, exec_px, eff_edge, imbalance, fill_ratio
         submit_px = _round_to_tick(exec_px - eff_edge, AUCTION_TICK, mode="down")
         return True, submit_px, exec_px, eff_edge, imbalance, fill_ratio
 
     if my_action == "SELL":
-        exec_px, _, fill_ratio = _weighted_exec_price(ob.get("asks_all") or ob.get("asks", []), decision_qty)
+        decision_levels = _decision_book_levels(ob, "asks", decision_qty)
+        exec_px, _, fill_ratio = _weighted_exec_price(decision_levels, decision_qty)
         if exec_px is None or fill_ratio < BOOK_MIN_FILL_RATIO:
             return False, None, exec_px, eff_edge, imbalance, fill_ratio
         submit_px = _round_to_tick(exec_px + eff_edge, AUCTION_TICK, mode="up")
