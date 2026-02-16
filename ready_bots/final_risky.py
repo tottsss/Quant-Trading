@@ -659,22 +659,29 @@ def decline_tender(session, tender):
 
 
 def submit_limit_order(session, ticker, quantity, price, action):
-    order = {"ticker": ticker, "type": "LIMIT", "quantity": quantity, "action": action, "price": price}
+    qty_i = int(math.floor(abs(float(quantity))))
+    if qty_i < 1:
+        raise ApiException(f"LIMIT order invalid qty {quantity} for {ticker} {action}")
+    qty_i = min(qty_i, int(MAX_ORDER_SIZE))
+    order = {"ticker": ticker, "type": "LIMIT", "quantity": qty_i, "action": action, "price": price}
     r = session.post(f"{BASE_URL}/orders", params=order)
     if not r.ok:
-        raise ApiException(f"LIMIT order failed {ticker} {action} {quantity} @ {price}")
-    print(f"Placed {action} LIMIT order: {int(quantity)} @ {price:.2f} on {ticker}")
+        raise ApiException(f"LIMIT order failed {ticker} {action} {qty_i} @ {price}")
+    print(f"Placed {action} LIMIT order: {qty_i} @ {price:.2f} on {ticker}")
 
 
 def submit_market_order(session, ticker, quantity, action):
-    qty = abs(float(quantity))
+    qty = int(math.floor(abs(float(quantity))))
+    if qty < 1:
+        return
+    max_chunk = max(1, int(MAX_ORDER_SIZE))
     while qty > 0:
-        chunk = min(MAX_ORDER_SIZE, qty)
+        chunk = min(max_chunk, qty)
         order = {"ticker": ticker, "type": "MARKET", "quantity": chunk, "action": action}
         r = session.post(f"{BASE_URL}/orders", params=order)
         if not r.ok:
             raise ApiException(f"MARKET order failed {ticker} {action} {chunk}")
-        print(f"Placed {action} MARKET order: {int(chunk)} on {ticker}")
+        print(f"Placed {action} MARKET order: {chunk} on {ticker}")
         qty -= chunk
         time.sleep(0.08)
 
@@ -1102,6 +1109,31 @@ def _unresolved_tender_bases(session):
     return unresolved_bases
 
 
+def _unresolved_tender_ids_for_base(session, ticker, exclude_tids=None):
+    base = _base_symbol(ticker)
+    exclude = {str(x) for x in (exclude_tids or set())}
+    out = []
+    try:
+        tenders = get_tenders(session)
+    except Exception as exc:
+        print(f"[WARN] unresolved tender check failed for {ticker}: {exc}")
+        return out
+
+    for t in tenders:
+        tk = t.get("ticker")
+        if not tk or _base_symbol(tk) != base:
+            continue
+        if not _is_unresolved_tender(t):
+            continue
+        tid = t.get("tender_id")
+        if tid is None:
+            continue
+        if str(tid) in exclude:
+            continue
+        out.append(tid)
+    return out
+
+
 def maybe_take_profit_cover(session, last_tp_by_ticker):
     if not TAKE_PROFIT_ENABLED or TAKE_PROFIT_PER_SHARE <= 0:
         return
@@ -1219,7 +1251,7 @@ def maybe_stop_loss_cut(session, last_sl_by_ticker):
         )
 
 
-def unwind_inventory(session, ticker, inventory):
+def unwind_inventory(session, ticker, inventory, excluded_tender_ids=None):
     if abs(inventory) < 1:
         return
 
@@ -1234,6 +1266,14 @@ def unwind_inventory(session, ticker, inventory):
     fallback_slices = 0
 
     while remaining > 0 and tickets < HEDGE_MAX_TICKETS:
+        blocked_ids = _unresolved_tender_ids_for_base(session, ticker, exclude_tids=excluded_tender_ids)
+        if blocked_ids:
+            print(
+                f"[HEDGE BLOCK] ticker={ticker} unresolved_tenders={blocked_ids} "
+                f"rem={remaining:.0f}; stopping hedge."
+            )
+            break
+
         ob = get_order_book_agg(session, ticker)
         levels = ob.get(side_key, [])
         if not levels:
@@ -1284,7 +1324,7 @@ def unwind_inventory(session, ticker, inventory):
 
         # If marketable limit under-fills, use smaller marketable-limit slices instead of a large market order.
         if filled <= 0.5:
-            fallback_remaining = min(remaining, q)
+            fallback_remaining = max(0.0, min(remaining, q) - filled)
             while fallback_remaining > 0 and fallback_slices < HEDGE_MAX_FALLBACK_SLICES:
                 ob_fb = get_order_book_agg(session, ticker)
                 levels_fb = ob_fb.get(side_key, [])
@@ -1345,11 +1385,29 @@ def unwind_inventory(session, ticker, inventory):
         )
 
     if remaining > 0:
+        blocked_ids = _unresolved_tender_ids_for_base(session, ticker, exclude_tids=excluded_tender_ids)
+        if blocked_ids:
+            print(
+                f"[HEDGE BLOCK] ticker={ticker} unresolved_tenders={blocked_ids} "
+                f"rem={remaining:.0f}; skipping final fallback."
+            )
+            return
         if HEDGE_ALLOW_MARKET_FALLBACK:
             while remaining > 0:
                 market_q = min(remaining, HEDGE_FALLBACK_CHUNK_QTY, MAX_ORDER_SIZE)
+                if market_q < 1:
+                    break
                 submit_market_order(session, ticker, market_q, unwind_action)
-                remaining -= market_q
+                pos_after = get_inventory_total(session, ticker)
+                if unwind_action == "BUY":
+                    mkt_filled = max(0.0, pos_after - pos_before)
+                else:
+                    mkt_filled = max(0.0, pos_before - pos_after)
+                pos_before = pos_after
+                if mkt_filled <= 0.5:
+                    print(f"[HEDGE WARN] market fallback no fill on {ticker}; rem={remaining:.0f}")
+                    break
+                remaining = max(0.0, remaining - mkt_filled)
         else:
             print(f"[HEDGE WARN] remaining {remaining:.0f} on {ticker}; no market fallback allowed.")
 
@@ -1604,7 +1662,7 @@ def evaluate_tender(session, tender):
                     f"spread_bps={hedge_meta['spread_bps']:.2f} vol={hedge_meta['realized_vol']} "
                     f"state={hedge_meta['state']} conf={hedge_meta['confidence']:.2f}"
                 )
-                unwind_inventory(session, ticker, hedge_delta)
+                unwind_inventory(session, ticker, hedge_delta, excluded_tender_ids={tid})
                 retained = delta - hedge_delta
                 if abs(retained) >= 1:
                     print(
