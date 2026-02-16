@@ -7,6 +7,7 @@ Run:
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import re
 import threading
@@ -25,6 +26,82 @@ API_KEY = os.environ.get("RIT_API_KEY", "YOUR_API_KEY")
 
 def env_bool(name: str, default: str) -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _find_repo_root(start: Path) -> Path:
+    for p in [start] + list(start.parents):
+        if (p / ".git").exists():
+            return p
+    return start.parent
+
+
+def _looks_like_hf_model_dir(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    # Minimal indicator for a local Hugging Face checkpoint/tokenizer directory.
+    return (path / "config.json").exists()
+
+
+def _dedupe_paths(paths: Iterable[Path]) -> List[Path]:
+    out: List[Path] = []
+    seen = set()
+    for p in paths:
+        key = str(p.resolve()) if p.exists() else str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+_THIS_FILE = Path(__file__).resolve()
+REPO_ROOT = _find_repo_root(_THIS_FILE)
+DEFAULT_FINBERT_ONNX_MODEL = REPO_ROOT / "ready_bots" / "finbert_hft" / "model_opt_int8.onnx"
+DEFAULT_FINBERT_TOKENIZER_DIR = REPO_ROOT / "ready_bots" / "finbert_hft" / "local_finbert"
+
+
+def _detect_finbert_assets(onnx_hint: str, tokenizer_hint: str) -> Tuple[Optional[Path], Optional[Path], str]:
+    onnx_candidates = _dedupe_paths(
+        [
+            Path(onnx_hint).expanduser(),
+            DEFAULT_FINBERT_ONNX_MODEL,
+            REPO_ROOT / "ready_bots" / "finbert_hft" / "output" / "model_opt_int8.onnx",
+            REPO_ROOT / "ready_bots" / "finbert_hft" / "onnx" / "model_opt_int8.onnx",
+        ]
+    )
+    onnx_path = next((p for p in onnx_candidates if p.exists() and p.is_file()), None)
+    if onnx_path is None:
+        return None, None, (
+            "No ONNX model found. Checked: "
+            + ", ".join(str(p) for p in onnx_candidates)
+        )
+
+    tokenizer_candidates: List[Path] = [Path(tokenizer_hint).expanduser()]
+    manifest = onnx_path.parent / "export_manifest.json"
+    if manifest.exists():
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            model_dir = payload.get("model_dir")
+            if model_dir:
+                tokenizer_candidates.append(Path(model_dir).expanduser())
+        except Exception:
+            pass
+    tokenizer_candidates.extend(
+        [
+            DEFAULT_FINBERT_TOKENIZER_DIR,
+            REPO_ROOT / "ready_bots" / "finbert_hft" / "model",
+            REPO_ROOT / "ready_bots" / "finbert_hft",
+        ]
+    )
+    tokenizer_candidates = _dedupe_paths(tokenizer_candidates)
+    tokenizer_path = next((p for p in tokenizer_candidates if _looks_like_hf_model_dir(p)), None)
+    if tokenizer_path is None:
+        return onnx_path, None, (
+            f"ONNX model found at {onnx_path}, but tokenizer/model directory was not found. Checked: "
+            + ", ".join(str(p) for p in tokenizer_candidates)
+        )
+
+    return onnx_path, tokenizer_path, "ok"
 
 
 WRITE_RUN_JSON = env_bool("RIT_MA_WRITE_RUN_JSON", "1")
@@ -65,6 +142,17 @@ MIN_REDUCE_THRESHOLD = float(os.environ.get("RIT_MA_MIN_REDUCE_THRESHOLD", "0.03
 # Execution controls
 SIMULTANEOUS_LEGS = env_bool("RIT_MA_SIMULTANEOUS_LEGS", "1")
 ENABLE_MANUAL_OVERRIDE = env_bool("RIT_MA_ENABLE_MANUAL_OVERRIDE", "1")
+USE_FINBERT = env_bool("RIT_MA_USE_FINBERT", "1")
+FINBERT_ONNX_MODEL = os.environ.get("RIT_MA_FINBERT_ONNX_MODEL", str(DEFAULT_FINBERT_ONNX_MODEL)).strip()
+FINBERT_TOKENIZER_DIR = os.environ.get("RIT_MA_FINBERT_TOKENIZER_DIR", str(DEFAULT_FINBERT_TOKENIZER_DIR)).strip()
+FINBERT_MAX_LENGTH = int(os.environ.get("RIT_MA_FINBERT_MAX_LENGTH", "128"))
+FINBERT_POS_THRESHOLD = float(os.environ.get("RIT_MA_FINBERT_POS_THRESHOLD", "0.56"))
+FINBERT_NEG_THRESHOLD = float(os.environ.get("RIT_MA_FINBERT_NEG_THRESHOLD", "0.56"))
+FINBERT_GAP_THRESHOLD = float(os.environ.get("RIT_MA_FINBERT_GAP_THRESHOLD", "0.08"))
+FINBERT_OVERRIDE_GAP = float(os.environ.get("RIT_MA_FINBERT_OVERRIDE_GAP", "0.22"))
+FINBERT_SEV_MEDIUM = float(os.environ.get("RIT_MA_FINBERT_SEV_MEDIUM", "0.65"))
+FINBERT_SEV_LARGE = float(os.environ.get("RIT_MA_FINBERT_SEV_LARGE", "0.80"))
+FINBERT_CATEGORY_FALLBACK = os.environ.get("RIT_MA_FINBERT_CATEGORY_FALLBACK", "FIN").strip().upper()
 
 # Risk limits from case package
 GROSS_LIMIT = 100_000
@@ -312,6 +400,7 @@ class RunRecorder:
         applied: List[dict],
         skipped: bool,
         skip_reason: Optional[str] = None,
+        classifier_meta: Optional[dict] = None,
     ) -> None:
         with self.lock:
             self.news.append(
@@ -326,6 +415,7 @@ class RunRecorder:
                         "direction": direction,
                         "severity": severity,
                     },
+                    "classifier_meta": classifier_meta or {},
                     "applied_updates": applied,
                     "skipped": skipped,
                     "skip_reason": skip_reason,
@@ -367,6 +457,39 @@ def log(msg: str, level: str = "INFO", extra: Optional[dict] = None) -> None:
     print(f"{now_ts()} | {msg}", flush=True)
     if RUN_RECORDER is not None:
         RUN_RECORDER.add_event(level=level, message=msg, extra=extra)
+
+
+def _resolve_finbert_module_path() -> Optional[Path]:
+    here = Path(__file__).resolve()
+    candidates: List[Path] = [
+        here.parent / "finbert_hft" / "fast_inference.py",
+    ]
+    if len(here.parents) >= 2:
+        candidates.append(here.parents[1] / "ready_bots" / "finbert_hft" / "fast_inference.py")
+    if len(here.parents) >= 3:
+        candidates.append(here.parents[2] / "ready_bots" / "finbert_hft" / "fast_inference.py")
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def _load_finbert_trader_class():
+    mod_path = _resolve_finbert_module_path()
+    if mod_path is None:
+        return None, "Could not find finbert_hft/fast_inference.py"
+    try:
+        spec = importlib.util.spec_from_file_location("finbert_hft_fast_inference", str(mod_path))
+        if spec is None or spec.loader is None:
+            return None, f"Failed to create import spec for {mod_path}"
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        trader_cls = getattr(module, "FinBERTTrader", None)
+        if trader_cls is None:
+            return None, "FinBERTTrader class not found in fast_inference.py"
+        return trader_cls, None
+    except Exception as exc:
+        return None, f"FinBERT module import failed: {exc}"
 
 
 class RITClient:
@@ -772,6 +895,10 @@ class MergerArbBot:
         self.order_meta_lock = threading.Lock()
         self.open_order_meta: Dict[int, Tuple[float, str, str]] = {}
         self.last_stale_check_ts = 0.0
+        self.finbert = None
+        self.finbert_enabled = False
+        self.finbert_model_path: Optional[str] = None
+        self.finbert_tokenizer_path: Optional[str] = None
 
         for deal_id, deal in DEALS.items():
             self.deal_ticker_to_id[deal["target"].upper()] = deal_id
@@ -837,6 +964,71 @@ class MergerArbBot:
     def _safe_positions(self) -> Dict[str, int]:
         sec = self.client.get_securities()
         return {s["ticker"].upper(): int(s.get("position", 0)) for s in sec}
+
+    def _initialize_finbert(self) -> None:
+        if not USE_FINBERT:
+            return
+        model_path, tokenizer_path, note = _detect_finbert_assets(FINBERT_ONNX_MODEL, FINBERT_TOKENIZER_DIR)
+        if model_path is None or tokenizer_path is None:
+            log(f"FINBERT disabled: {note}", level="WARN")
+            return
+        trader_cls, err = _load_finbert_trader_class()
+        if trader_cls is None:
+            log(f"FINBERT unavailable: {err}", level="WARN")
+            return
+        try:
+            self.finbert = trader_cls(
+                onnx_model_path=str(model_path),
+                tokenizer_dir=str(tokenizer_path),
+                max_length=FINBERT_MAX_LENGTH,
+            )
+            self.finbert_enabled = True
+            self.finbert_model_path = str(model_path)
+            self.finbert_tokenizer_path = str(tokenizer_path)
+            log(
+                f"FINBERT enabled model={model_path} tokenizer={tokenizer_path} "
+                f"pos_thr={FINBERT_POS_THRESHOLD:.2f} neg_thr={FINBERT_NEG_THRESHOLD:.2f}",
+            )
+        except Exception as exc:
+            self.finbert = None
+            self.finbert_enabled = False
+            self.finbert_model_path = None
+            self.finbert_tokenizer_path = None
+            log(f"FINBERT init failed: {exc}", level="WARN")
+
+    def _finbert_infer_direction(self, text: str) -> Tuple[Optional[str], str, Optional[dict]]:
+        if self.finbert is None:
+            return None, "S", None
+        try:
+            probs = self.finbert.predict(text)
+        except Exception as exc:
+            log(f"FINBERT inference error: {exc}", level="WARN")
+            return None, "S", {"error": str(exc)}
+
+        p_pos = float(probs.get("positive_probability", 0.0))
+        p_neg = float(probs.get("negative_probability", 0.0))
+        gap = abs(p_pos - p_neg)
+
+        direction = None
+        if p_pos >= FINBERT_POS_THRESHOLD and (p_pos - p_neg) >= FINBERT_GAP_THRESHOLD:
+            direction = "POS"
+        elif p_neg >= FINBERT_NEG_THRESHOLD and (p_neg - p_pos) >= FINBERT_GAP_THRESHOLD:
+            direction = "NEG"
+
+        confidence = max(p_pos, p_neg)
+        if confidence >= FINBERT_SEV_LARGE:
+            severity = "L"
+        elif confidence >= FINBERT_SEV_MEDIUM:
+            severity = "M"
+        else:
+            severity = "S"
+
+        return direction, severity, {
+            "positive_probability": round(p_pos, 6),
+            "negative_probability": round(p_neg, 6),
+            "gap": round(gap, 6),
+            "confidence": round(confidence, 6),
+        }
 
     def _marketable_limit_price(self, action: str, bid: float, ask: float) -> float:
         if action == "BUY":
@@ -1068,8 +1260,45 @@ class MergerArbBot:
                         continue
 
                     cat = classify_category(text_lower)
-                    direction = classify_direction(text_lower)
-                    severity = classify_severity(text_lower)
+                    keyword_direction = classify_direction(text_lower)
+                    keyword_severity = classify_severity(text_lower)
+                    direction = keyword_direction
+                    severity = keyword_severity
+
+                    finbert_direction = None
+                    finbert_severity = "S"
+                    finbert_meta = None
+                    if self.finbert_enabled:
+                        finbert_direction, finbert_severity, finbert_meta = self._finbert_infer_direction(text)
+                        if direction is None and finbert_direction is not None:
+                            direction = finbert_direction
+                        elif (
+                            direction is not None
+                            and finbert_direction is not None
+                            and finbert_direction != direction
+                            and finbert_meta is not None
+                            and float(finbert_meta.get("gap", 0.0)) >= FINBERT_OVERRIDE_GAP
+                        ):
+                            # Allow high-confidence model prediction to override ambiguous keyword polarity.
+                            direction = finbert_direction
+                        if finbert_severity == "L" or (finbert_severity == "M" and severity == "S"):
+                            severity = finbert_severity
+                        if cat is None and direction is not None and FINBERT_CATEGORY_FALLBACK in CATEGORY_MULT:
+                            cat = FINBERT_CATEGORY_FALLBACK
+
+                    classifier_meta = {
+                        "keyword": {
+                            "direction": keyword_direction,
+                            "severity": keyword_severity,
+                        },
+                        "finbert": {
+                            "enabled": self.finbert_enabled,
+                            "direction": finbert_direction,
+                            "severity": finbert_severity,
+                            "meta": finbert_meta,
+                        },
+                    }
+
                     if cat is None or direction is None:
                         log(
                             f"NEWS_SKIP id={news_id} refs={','.join(refs)} "
@@ -1085,6 +1314,7 @@ class MergerArbBot:
                                 applied=[],
                                 skipped=True,
                                 skip_reason="CLASSIFICATION_INCOMPLETE",
+                                classifier_meta=classifier_meta,
                             )
                         continue
 
@@ -1119,6 +1349,7 @@ class MergerArbBot:
                             severity=severity,
                             applied=applied_updates,
                             skipped=False,
+                            classifier_meta=classifier_meta,
                         )
 
                 idle_errors = 0
@@ -1492,17 +1723,28 @@ class MergerArbBot:
                         "STALE_ORDER_SECS": STALE_ORDER_SECS,
                         "TRADE_LOOP_SECS": TRADE_LOOP_SECS,
                         "NEWS_POLL_SECS": NEWS_POLL_SECS,
+                        "USE_FINBERT": USE_FINBERT,
+                        "FINBERT_ONNX_MODEL": FINBERT_ONNX_MODEL,
+                        "FINBERT_TOKENIZER_DIR": FINBERT_TOKENIZER_DIR,
+                        "FINBERT_MAX_LENGTH": FINBERT_MAX_LENGTH,
+                        "FINBERT_POS_THRESHOLD": FINBERT_POS_THRESHOLD,
+                        "FINBERT_NEG_THRESHOLD": FINBERT_NEG_THRESHOLD,
+                        "FINBERT_GAP_THRESHOLD": FINBERT_GAP_THRESHOLD,
+                        "FINBERT_OVERRIDE_GAP": FINBERT_OVERRIDE_GAP,
+                        "FINBERT_CATEGORY_FALLBACK": FINBERT_CATEGORY_FALLBACK,
                     },
                 }
             )
 
+        self._initialize_finbert()
         self.initialize()
         log(
             "Bot started. "
             f"threshold={MISPRICING_THRESHOLD:.3f} margin={DESIRED_PROFIT_MARGIN:.3f} "
             f"base_qty={BASE_ORDER_QTY} max_order={MAX_ORDER_SIZE} "
             f"gross/net={GROSS_LIMIT}/{NET_LIMIT} limit_offset={MARKETABLE_LIMIT_OFFSET:.2f} "
-            f"per_deal_target_cap={PER_DEAL_TARGET_MAX} stale_cancel={STALE_ORDER_SECS:.2f}s"
+            f"per_deal_target_cap={PER_DEAL_TARGET_MAX} stale_cancel={STALE_ORDER_SECS:.2f}s "
+            f"finbert={'ON' if self.finbert_enabled else 'OFF'}"
         )
 
         news_thread = threading.Thread(target=self.news_worker, name="news-worker", daemon=True)
@@ -1560,6 +1802,9 @@ class MergerArbBot:
                     "final_positions": final_positions,
                     "open_order_count": len(final_open_orders),
                     "tracked_open_order_count": len(self.open_order_meta),
+                    "finbert_enabled": self.finbert_enabled,
+                    "finbert_model_path": self.finbert_model_path,
+                    "finbert_tokenizer_path": self.finbert_tokenizer_path,
                 }
                 try:
                     out_path = RUN_RECORDER.flush(summary=summary)

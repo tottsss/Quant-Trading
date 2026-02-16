@@ -1,5 +1,8 @@
 Merger Arbitrage Case
 
+Primary guide
+- See `MERGER_ARBITRAGE_CASE_GUIDE.md` for full architecture, file map, defaults, and run instructions.
+
 Big picture
 - Trade spreads on five live M&A deals; news shifts completion probabilities.
 - Use deal structure (cash vs stock vs mixed) to hedge acquirer exposure.
