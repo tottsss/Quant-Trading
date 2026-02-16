@@ -664,6 +664,7 @@ def main():
     active_news_week = None
     delta_limit = 10000
     penalty_rate = 0.0
+    risk_free = RISK_FREE
     last_order_ts: dict[str, float] = {}
     last_straddle_ts = 0.0
     last_status_print = 0.0
@@ -705,6 +706,7 @@ def main():
                 last_news_id = max(n["news_id"] for n in news)
                 delta_limit = parse_delta_limit(news, delta_limit)
                 penalty_rate = parse_penalty_rate(news, penalty_rate)
+                risk_free = parse_risk_free_rate(news, risk_free)
                 forecasts = parse_vol_from_news(news, current_tick)
                 for target_week, vol in sorted(forecasts.items()):
                     vol_forecasts[int(target_week)] = float(vol)
@@ -726,6 +728,7 @@ def main():
                     queued_news_vol=vol_forecasts.get(current_week + 1),
                     delta_limit=int(delta_limit),
                     penalty_rate=float(penalty_rate),
+                    risk_free=float(risk_free),
                 )
 
             try:
@@ -755,7 +758,7 @@ def main():
             sigma = min(SIGMA_CAP, max(SIGMA_FLOOR, float(sigma_raw)))
 
             positions = {s["ticker"]: int(s.get("position", 0)) for s in client.get_securities()}
-            delta = compute_portfolio_delta(S, positions, sigma)
+            delta = compute_portfolio_delta(S, positions, sigma, r=risk_free)
             near_end = is_endgame(case)
             open_limit = max(100.0, SAFE_OPEN_DELTA_FRAC * abs(delta_limit))
             target_delta = max(50.0, TARGET_DELTA_FRAC * abs(delta_limit))
@@ -775,7 +778,7 @@ def main():
                         continue
 
                     mid = (bid + ask) / 2.0
-                    theo = bs_price(S, strike, ASSUMED_T_YEARS, RISK_FREE, sigma, call=call)
+                    theo = bs_price(S, strike, ASSUMED_T_YEARS, risk_free, sigma, call=call)
                     edge = theo - mid
 
                     if now - last_order_ts.get(ticker, 0.0) < ORDER_COOLDOWN_SECS:
@@ -796,7 +799,7 @@ def main():
                         continue
 
                     # Anti-fine guard: do not open a trade that pushes delta closer to breach.
-                    delta_after = delta + option_delta_change(S, sigma, ticker, action, ORDER_QTY)
+                    delta_after = delta + option_delta_change(S, sigma, ticker, action, ORDER_QTY, r=risk_free)
                     if abs(delta_after) > open_limit and abs(delta_after) >= abs(delta):
                         continue
 
@@ -840,8 +843,8 @@ def main():
                 if None not in (call_bid, call_ask, put_bid, put_ask):
                     call_mid = (call_bid + call_ask) / 2.0
                     put_mid = (put_bid + put_ask) / 2.0
-                    iv_call = implied_vol(S, float(atm), ASSUMED_T_YEARS, RISK_FREE, call_mid, call=True)
-                    iv_put = implied_vol(S, float(atm), ASSUMED_T_YEARS, RISK_FREE, put_mid, call=False)
+                    iv_call = implied_vol(S, float(atm), ASSUMED_T_YEARS, risk_free, call_mid, call=True)
+                    iv_put = implied_vol(S, float(atm), ASSUMED_T_YEARS, risk_free, put_mid, call=False)
                     if iv_call is not None and iv_put is not None:
                         iv_avg = (iv_call + iv_put) / 2.0
                         vol_edge = iv_avg - straddle_ref_vol
@@ -851,14 +854,18 @@ def main():
                         if vol_edge > STRADDLE_EDGE_THRESHOLD:
                             legs = 0
                             if can_open_option_trade(positions, call_ticker, "SELL", STRADDLE_QTY):
-                                call_delta_after = delta + option_delta_change(S, sigma, call_ticker, "SELL", STRADDLE_QTY)
+                                call_delta_after = delta + option_delta_change(
+                                    S, sigma, call_ticker, "SELL", STRADDLE_QTY, r=risk_free
+                                )
                                 if abs(call_delta_after) < open_limit or abs(call_delta_after) < abs(delta):
                                     place_limit_chunks(client, call_ticker, "SELL", STRADDLE_QTY, call_bid)
                                     positions[call_ticker] = call_pos - STRADDLE_QTY
                                     delta = call_delta_after
                                     legs += 1
                             if can_open_option_trade(positions, put_ticker, "SELL", STRADDLE_QTY):
-                                put_delta_after = delta + option_delta_change(S, sigma, put_ticker, "SELL", STRADDLE_QTY)
+                                put_delta_after = delta + option_delta_change(
+                                    S, sigma, put_ticker, "SELL", STRADDLE_QTY, r=risk_free
+                                )
                                 if abs(put_delta_after) < open_limit or abs(put_delta_after) < abs(delta):
                                     place_limit_chunks(client, put_ticker, "SELL", STRADDLE_QTY, put_bid)
                                     positions[put_ticker] = put_pos - STRADDLE_QTY
@@ -881,14 +888,18 @@ def main():
                         elif vol_edge < -STRADDLE_EDGE_THRESHOLD:
                             legs = 0
                             if can_open_option_trade(positions, call_ticker, "BUY", STRADDLE_QTY):
-                                call_delta_after = delta + option_delta_change(S, sigma, call_ticker, "BUY", STRADDLE_QTY)
+                                call_delta_after = delta + option_delta_change(
+                                    S, sigma, call_ticker, "BUY", STRADDLE_QTY, r=risk_free
+                                )
                                 if abs(call_delta_after) < open_limit or abs(call_delta_after) < abs(delta):
                                     place_limit_chunks(client, call_ticker, "BUY", STRADDLE_QTY, call_ask)
                                     positions[call_ticker] = call_pos + STRADDLE_QTY
                                     delta = call_delta_after
                                     legs += 1
                             if can_open_option_trade(positions, put_ticker, "BUY", STRADDLE_QTY):
-                                put_delta_after = delta + option_delta_change(S, sigma, put_ticker, "BUY", STRADDLE_QTY)
+                                put_delta_after = delta + option_delta_change(
+                                    S, sigma, put_ticker, "BUY", STRADDLE_QTY, r=risk_free
+                                )
                                 if abs(put_delta_after) < open_limit or abs(put_delta_after) < abs(delta):
                                     place_limit_chunks(client, put_ticker, "BUY", STRADDLE_QTY, put_ask)
                                     positions[put_ticker] = put_pos + STRADDLE_QTY
@@ -1041,7 +1052,7 @@ def main():
                 print(
                     f"[VOL] sigma={sigma:.3f} news={nv} queued={qv} realized={rv} "
                     f"delta={delta:.0f} limit={delta_limit} usage={usage:.1f}% "
-                    f"penalty_rate={penalty_rate:.2f} near_end={near_end}"
+                    f"penalty_rate={penalty_rate:.2f} rf={risk_free:.3%} near_end={near_end}"
                 )
                 _bump_counter("portfolio_logs", 1)
                 _record_portfolio_log(
@@ -1056,6 +1067,7 @@ def main():
                     delta_limit=int(delta_limit),
                     usage_pct=float(usage),
                     penalty_rate=float(penalty_rate),
+                    risk_free=float(risk_free),
                     near_end=bool(near_end),
                 )
                 last_status_print = now
