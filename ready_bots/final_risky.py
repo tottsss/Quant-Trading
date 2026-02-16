@@ -37,8 +37,8 @@ ORDER_DELAY = float(_env("RIT_FINAL_RISKY_ORDER_DELAY", "RIT_FINAL_ORDER_DELAY",
 AFTER_ACCEPT_DELAY = float(_env("RIT_FINAL_RISKY_AFTER_ACCEPT_DELAY", "RIT_FINAL_AFTER_ACCEPT_DELAY", "0.20"))
 MAX_ORDER_SIZE = 10000.0# Maximum order size
 DEPTH_LEVELS = max(1, int(_env("RIT_FINAL_RISKY_DEPTH_LEVELS", "RIT_DEPTH_LEVELS", "10")))
-ENDGAME_TICKS = int(_env("RIT_FINAL_RISKY_ENDGAME_TICKS", "RIT_FINAL_ENDGAME_TICKS", "2"))# Number of ticks to end the game
-FIXED_ONLY = _env_bool("RIT_FINAL_RISKY_FIXED_ONLY", "RIT_FINAL_FIXED_ONLY", "0")# Whether to only accept fixed tenders
+ENDGAME_TICKS = int(_env("RIT_FINAL_RISKY_ENDGAME_TICKS", "RIT_FINAL_ENDGAME_TICKS", "10"))# Number of ticks to end the game
+FIXED_ONLY = _env_bool("RIT_FINAL_RISKY_FIXED_ONLY", "RIT_FINAL_FIXED_ONLY", "1")# Whether to only accept fixed tenders
 AGGRESSIVE_MODE = _env_bool("RIT_FINAL_RISKY_AGGRESSIVE", "RIT_FINAL_AGGRESSIVE", "1")
 EDGE_FLOOR_RATIO = float(_env("RIT_FINAL_RISKY_EDGE_FLOOR_RATIO", "RIT_FINAL_EDGE_FLOOR_RATIO", "0.15"))
 EDGE_DECAY_PER_ATTEMPT = float(_env("RIT_FINAL_RISKY_EDGE_DECAY_PER_ATTEMPT", "RIT_FINAL_EDGE_DECAY_PER_ATTEMPT", "0.020"))
@@ -56,6 +56,23 @@ STOP_LOSS_PER_SHARE = float(_env("RIT_FINAL_RISKY_STOP_LOSS_PER_SHARE", "RIT_FIN
 STOP_LOSS_CHUNK_QTY = float(_env("RIT_FINAL_RISKY_STOP_LOSS_CHUNK_QTY", "RIT_FINAL_STOP_LOSS_CHUNK_QTY", "10000"))
 STOP_LOSS_CHUNK_QTY = max(1.0, STOP_LOSS_CHUNK_QTY)
 STOP_LOSS_COOLDOWN = float(_env("RIT_FINAL_RISKY_STOP_LOSS_COOLDOWN", "RIT_FINAL_STOP_LOSS_COOLDOWN", "2.0"))
+BOOK_OUTLIER_BPS = float(_env("RIT_FINAL_RISKY_BOOK_OUTLIER_BPS", "RIT_FINAL_BOOK_OUTLIER_BPS", "60"))
+BOOK_OUTLIER_SPREAD_MULT = float(_env("RIT_FINAL_RISKY_BOOK_OUTLIER_SPREAD_MULT", "RIT_FINAL_BOOK_OUTLIER_SPREAD_MULT", "8.0"))
+BOOK_MAX_LEVEL_QTY = float(_env("RIT_FINAL_RISKY_BOOK_MAX_LEVEL_QTY", "RIT_FINAL_BOOK_MAX_LEVEL_QTY", "25000"))
+BOOK_DECISION_QTY_CAP = float(_env("RIT_FINAL_RISKY_BOOK_DECISION_QTY_CAP", "RIT_FINAL_BOOK_DECISION_QTY_CAP", "15000"))
+MOM_TAS_LIMIT = max(10, int(_env("RIT_FINAL_RISKY_MOM_TAS_LIMIT", "RIT_FINAL_MOM_TAS_LIMIT", "60")))
+MOM_EMA_FAST = max(2, int(_env("RIT_FINAL_RISKY_MOM_EMA_FAST", "RIT_FINAL_MOM_EMA_FAST", "8")))
+MOM_EMA_SLOW = max(MOM_EMA_FAST + 1, int(_env("RIT_FINAL_RISKY_MOM_EMA_SLOW", "RIT_FINAL_MOM_EMA_SLOW", "21")))
+MOM_RSI_PERIOD = max(3, int(_env("RIT_FINAL_RISKY_MOM_RSI_PERIOD", "RIT_FINAL_MOM_RSI_PERIOD", "14")))
+MOM_IMBALANCE_LEVELS = max(1, int(_env("RIT_FINAL_RISKY_MOM_IMBALANCE_LEVELS", "RIT_FINAL_MOM_IMBALANCE_LEVELS", "5")))
+MOM_IMBALANCE_THRESHOLD = float(_env("RIT_FINAL_RISKY_MOM_IMBALANCE_THRESHOLD", "RIT_FINAL_MOM_IMBALANCE_THRESHOLD", "0.15"))
+FLATTEN_FAVORABLE_MULT = float(_env("RIT_FINAL_RISKY_FLATTEN_FAVORABLE_MULT", "RIT_FINAL_FLATTEN_FAVORABLE_MULT", "0.70"))
+FLATTEN_ADVERSE_MULT = float(_env("RIT_FINAL_RISKY_FLATTEN_ADVERSE_MULT", "RIT_FINAL_FLATTEN_ADVERSE_MULT", "1.40"))
+FLATTEN_MIN_TICKET_QTY = float(_env("RIT_FINAL_RISKY_FLATTEN_MIN_TICKET_QTY", "RIT_FINAL_FLATTEN_MIN_TICKET_QTY", "2000"))
+FLATTEN_HARD_DEADLINE_TICKS = max(
+    1,
+    int(_env("RIT_FINAL_RISKY_FLATTEN_HARD_DEADLINE_TICKS", "RIT_FINAL_FLATTEN_HARD_DEADLINE_TICKS", "2")),
+)
 SAVE_REPORT_ON_EXIT = _env_bool("RIT_FINAL_RISKY_SAVE_REPORT_ON_EXIT", "RIT_FINAL_SAVE_REPORT_ON_EXIT", "1")
 REPORT_PREFIX = _env("RIT_FINAL_RISKY_REPORT_PREFIX", "RIT_FINAL_REPORT_PREFIX", "final_risky_report")
 
@@ -181,6 +198,7 @@ def save_run_report(session, reason, run_error=None):
             "ORDER_DELAY": ORDER_DELAY,
             "AFTER_ACCEPT_DELAY": AFTER_ACCEPT_DELAY,
             "MAX_ORDER_SIZE": MAX_ORDER_SIZE,
+            "DEPTH_LEVELS": DEPTH_LEVELS,
             "ENDGAME_TICKS": ENDGAME_TICKS,
             "FIXED_ONLY": FIXED_ONLY,
             "AGGRESSIVE_MODE": AGGRESSIVE_MODE,
@@ -193,6 +211,20 @@ def save_run_report(session, reason, run_error=None):
             "STOP_LOSS_PER_SHARE": STOP_LOSS_PER_SHARE,
             "STOP_LOSS_CHUNK_QTY": STOP_LOSS_CHUNK_QTY,
             "STOP_LOSS_COOLDOWN": STOP_LOSS_COOLDOWN,
+            "BOOK_OUTLIER_BPS": BOOK_OUTLIER_BPS,
+            "BOOK_OUTLIER_SPREAD_MULT": BOOK_OUTLIER_SPREAD_MULT,
+            "BOOK_MAX_LEVEL_QTY": BOOK_MAX_LEVEL_QTY,
+            "BOOK_DECISION_QTY_CAP": BOOK_DECISION_QTY_CAP,
+            "MOM_TAS_LIMIT": MOM_TAS_LIMIT,
+            "MOM_EMA_FAST": MOM_EMA_FAST,
+            "MOM_EMA_SLOW": MOM_EMA_SLOW,
+            "MOM_RSI_PERIOD": MOM_RSI_PERIOD,
+            "MOM_IMBALANCE_LEVELS": MOM_IMBALANCE_LEVELS,
+            "MOM_IMBALANCE_THRESHOLD": MOM_IMBALANCE_THRESHOLD,
+            "FLATTEN_FAVORABLE_MULT": FLATTEN_FAVORABLE_MULT,
+            "FLATTEN_ADVERSE_MULT": FLATTEN_ADVERSE_MULT,
+            "FLATTEN_MIN_TICKET_QTY": FLATTEN_MIN_TICKET_QTY,
+            "FLATTEN_HARD_DEADLINE_TICKS": FLATTEN_HARD_DEADLINE_TICKS,
         },
         "case": case_info,
         "trader": trader_info,
@@ -237,36 +269,103 @@ def _related_tickers(session, ticker):
 
 def get_order_book_agg(session, ticker):
     books = {}
+    fetch_limit = max(20, DEPTH_LEVELS * 3)
     for tk in _related_tickers(session, ticker):
-        r = session.get(f"{BASE_URL}/securities/book", params={"ticker": tk, "limit": DEPTH_LEVELS})
+        r = session.get(f"{BASE_URL}/securities/book", params={"ticker": tk, "limit": fetch_limit})
         if r.ok:
             books[tk] = r.json()
 
-    bids = []
-    asks = []
+    raw_bids = []
+    raw_asks = []
     for tk, book in books.items():
         for b in book.get("bids", []):
             q = b.get("quantity", b.get("qty", 0))
             p = b.get("price")
             if isinstance(p, (int, float)) and isinstance(q, (int, float)) and q > 0:
-                bids.append({"ticker": tk, "price": float(p), "quantity": float(q)})
+                raw_bids.append({"ticker": tk, "price": float(p), "quantity": float(q)})
         for a in book.get("asks", []):
             q = a.get("quantity", a.get("qty", 0))
             p = a.get("price")
             if isinstance(p, (int, float)) and isinstance(q, (int, float)) and q > 0:
-                asks.append({"ticker": tk, "price": float(p), "quantity": float(q)})
+                raw_asks.append({"ticker": tk, "price": float(p), "quantity": float(q)})
 
-    bids.sort(key=lambda x: x["price"], reverse=True)
-    asks.sort(key=lambda x: x["price"])
-    bids = bids[:DEPTH_LEVELS]
-    asks = asks[:DEPTH_LEVELS]
+    raw_bids.sort(key=lambda x: x["price"], reverse=True)
+    raw_asks.sort(key=lambda x: x["price"])
+
+    best_bid = raw_bids[0]["price"] if raw_bids else None
+    best_ask = raw_asks[0]["price"] if raw_asks else None
+    mid = None
+    spread = None
+    max_dev = None
+    if best_bid is not None and best_ask is not None:
+        spread = max(0.01, best_ask - best_bid)
+        mid = (best_bid + best_ask) / 2.0
+        max_dev = max(
+            max(0.01, mid) * (BOOK_OUTLIER_BPS / 10000.0),
+            spread * BOOK_OUTLIER_SPREAD_MULT,
+            0.02,
+        )
+
+    def _cap_qty(qty):
+        q = float(qty)
+        if BOOK_MAX_LEVEL_QTY > 0:
+            q = min(q, BOOK_MAX_LEVEL_QTY)
+        return q
+
+    bids = []
+    for lv in raw_bids:
+        if max_dev is not None and lv["price"] < (best_bid - max_dev):
+            continue
+        q = _cap_qty(lv["quantity"])
+        if q <= 0:
+            continue
+        bids.append({"ticker": lv["ticker"], "price": lv["price"], "quantity": q})
+        if len(bids) >= DEPTH_LEVELS:
+            break
+
+    asks = []
+    for lv in raw_asks:
+        if max_dev is not None and lv["price"] > (best_ask + max_dev):
+            continue
+        q = _cap_qty(lv["quantity"])
+        if q <= 0:
+            continue
+        asks.append({"ticker": lv["ticker"], "price": lv["price"], "quantity": q})
+        if len(asks) >= DEPTH_LEVELS:
+            break
+
+    if not bids and raw_bids:
+        for lv in raw_bids[:DEPTH_LEVELS]:
+            q = _cap_qty(lv["quantity"])
+            if q <= 0:
+                continue
+            bids.append({"ticker": lv["ticker"], "price": lv["price"], "quantity": q})
+    if not asks and raw_asks:
+        for lv in raw_asks[:DEPTH_LEVELS]:
+            q = _cap_qty(lv["quantity"])
+            if q <= 0:
+                continue
+            asks.append({"ticker": lv["ticker"], "price": lv["price"], "quantity": q})
 
     bid_vol = sum(x["quantity"] for x in bids)
     ask_vol = sum(x["quantity"] for x in asks)
     vwap_bid = (sum(x["price"] * x["quantity"] for x in bids) / bid_vol) if bid_vol > 0 else 0.0
     vwap_ask = (sum(x["price"] * x["quantity"] for x in asks) / ask_vol) if ask_vol > 0 else 0.0
 
-    return {"books": books, "bids": bids, "asks": asks, "bid_volume": bid_vol, "ask_volume": ask_vol, "vwap_bid": vwap_bid, "vwap_ask": vwap_ask}
+    return {
+        "books": books,
+        "bids": bids,
+        "asks": asks,
+        "bid_volume": bid_vol,
+        "ask_volume": ask_vol,
+        "vwap_bid": vwap_bid,
+        "vwap_ask": vwap_ask,
+        "best_bid": bids[0]["price"] if bids else best_bid,
+        "best_ask": asks[0]["price"] if asks else best_ask,
+        "mid": mid,
+        "spread": spread,
+        "book_outlier_max_dev": max_dev,
+    }
 
 
 def get_inventory_total(session, ticker):
@@ -368,6 +467,168 @@ def _cost_basis(row):
         if isinstance(px, (int, float)):
             return float(px)
     return None
+
+
+def _infer_my_action(tender):
+    caption = str(tender.get("caption") or "").lower()
+    if "would you like to sell" in caption:
+        return "SELL"
+    if "would you like to buy" in caption:
+        return "BUY"
+
+    # API action is often institution side. Invert by default when caption is absent.
+    action = str(tender.get("action") or "").upper()
+    if action == "BUY":
+        return "SELL"
+    if action == "SELL":
+        return "BUY"
+    return action
+
+
+def _tender_quantity(tender):
+    qty = tender.get("quantity")
+    if isinstance(qty, (int, float)) and qty > 0:
+        return float(qty)
+    return 0.0
+
+
+def _weighted_exec_price(levels, target_qty):
+    if not levels:
+        return None
+
+    remaining = max(1.0, float(target_qty))
+    notional = 0.0
+    filled = 0.0
+    for lv in levels:
+        px = lv.get("price")
+        qty = lv.get("quantity")
+        if not isinstance(px, (int, float)) or not isinstance(qty, (int, float)):
+            continue
+        if qty <= 0:
+            continue
+        take = min(remaining, float(qty))
+        notional += float(px) * take
+        filled += take
+        remaining -= take
+        if remaining <= 0:
+            break
+
+    if filled <= 0:
+        return None
+    return notional / filled
+
+
+def _get_tas_prices(session, ticker, limit):
+    try:
+        r = session.get(f"{BASE_URL}/securities/tas", params={"ticker": ticker, "limit": limit})
+        if not r.ok:
+            return []
+        rows = r.json()
+    except Exception:
+        return []
+
+    prices = []
+    for row in rows if isinstance(rows, list) else []:
+        px = row.get("price")
+        if isinstance(px, (int, float)):
+            prices.append(float(px))
+    return prices
+
+
+def _ema(values, period):
+    if not values:
+        return None
+    alpha = 2.0 / (period + 1.0)
+    out = float(values[0])
+    for v in values[1:]:
+        out = (alpha * float(v)) + ((1.0 - alpha) * out)
+    return out
+
+
+def _rsi(values, period):
+    if len(values) < period + 1:
+        return None
+    gains = 0.0
+    losses = 0.0
+    for i in range(-period, 0):
+        delta = float(values[i]) - float(values[i - 1])
+        if delta > 0:
+            gains += delta
+        elif delta < 0:
+            losses -= delta
+    if losses == 0:
+        return 100.0
+    rs = gains / losses
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _order_book_imbalance(ob, levels):
+    bids = ob.get("bids", [])[:levels]
+    asks = ob.get("asks", [])[:levels]
+    bid_qty = sum(float(x.get("quantity", 0.0)) for x in bids)
+    ask_qty = sum(float(x.get("quantity", 0.0)) for x in asks)
+    total = bid_qty + ask_qty
+    if total <= 0:
+        return 0.0
+    return (bid_qty - ask_qty) / total
+
+
+def _flatten_regime(session, ticker, unwind_action, ob):
+    prices = _get_tas_prices(session, ticker, MOM_TAS_LIMIT)
+    ema_fast = _ema(prices, MOM_EMA_FAST) if prices else None
+    ema_slow = _ema(prices, MOM_EMA_SLOW) if prices else None
+    rsi = _rsi(prices, MOM_RSI_PERIOD) if prices else None
+    imbalance = _order_book_imbalance(ob, MOM_IMBALANCE_LEVELS)
+
+    favorable = 0
+    adverse = 0
+
+    if ema_fast is not None and ema_slow is not None:
+        trend_up = ema_fast >= ema_slow
+        if unwind_action == "SELL":
+            favorable += 1 if trend_up else 0
+            adverse += 0 if trend_up else 1
+        else:
+            favorable += 0 if trend_up else 1
+            adverse += 1 if trend_up else 0
+
+    if rsi is not None:
+        if unwind_action == "SELL":
+            if rsi >= 52:
+                favorable += 1
+            elif rsi <= 48:
+                adverse += 1
+        else:
+            if rsi <= 48:
+                favorable += 1
+            elif rsi >= 52:
+                adverse += 1
+
+    if unwind_action == "SELL":
+        if imbalance >= MOM_IMBALANCE_THRESHOLD:
+            favorable += 1
+        elif imbalance <= -MOM_IMBALANCE_THRESHOLD:
+            adverse += 1
+    else:
+        if imbalance <= -MOM_IMBALANCE_THRESHOLD:
+            favorable += 1
+        elif imbalance >= MOM_IMBALANCE_THRESHOLD:
+            adverse += 1
+
+    if adverse >= 2 and adverse > favorable:
+        state = "ADVERSE"
+    elif favorable >= 2 and favorable >= adverse:
+        state = "FAVORABLE"
+    else:
+        state = "NEUTRAL"
+
+    return {
+        "state": state,
+        "ema_fast": ema_fast,
+        "ema_slow": ema_slow,
+        "rsi": rsi,
+        "imbalance": imbalance,
+    }
 
 
 def _is_unresolved_tender(tender):
@@ -530,46 +791,67 @@ def unwind_inventory(session, ticker, inventory):
             submit_market_order(session, ticker, remaining, "SELL")
 
 
-def _action_edge_ok(action, tender_price, vwap_bid, vwap_ask, bid_volume, ask_volume, attempt_idx):
+def _action_edge_ok(my_action, tender_price, ob, tender_qty, attempt_idx):
     """
-    Hybrid accept rule:
-    1) Primary rule: same as sparsh-style method that already worked for you.
-    2) Fallback economic edge check: protect against action semantic mismatch in some feeds.
+    Decide tender acceptance from executable economics:
+    BUY tender -> hedge by selling into bids.
+    SELL tender -> hedge by buying from asks.
     """
     eff_edge = MIN_EDGE
-    eff_vol_factor = VOL_FACTOR
     if AGGRESSIVE_MODE:
         eff_edge = max(MIN_EDGE * EDGE_FLOOR_RATIO, MIN_EDGE - (EDGE_DECAY_PER_ATTEMPT * attempt_idx))
-        eff_vol_factor = max(0.40, VOL_FACTOR - (VOL_RELAX_PER_ATTEMPT * attempt_idx))
 
-    if action == "BUY":
-        # Sparsh-style condition
-        cond_primary = (tender_price < (vwap_bid + eff_edge)) and (bid_volume * eff_vol_factor > ask_volume)
-        # Economic fallback (if action semantics are inverted in this server feed)
-        cond_fallback = (tender_price - vwap_ask) >= eff_edge
-        return cond_primary or cond_fallback
-    if action == "SELL":
-        # Sparsh-style condition
-        cond_primary = (tender_price > (vwap_ask - eff_edge)) and (ask_volume * eff_vol_factor > bid_volume)
-        # Economic fallback
-        cond_fallback = (vwap_bid - tender_price) >= eff_edge
-        return cond_primary or cond_fallback
-    return False
+    decision_qty = max(1.0, min(float(tender_qty), BOOK_DECISION_QTY_CAP))
+    imbalance = _order_book_imbalance(ob, MOM_IMBALANCE_LEVELS)
+
+    if my_action == "BUY":
+        edge_top = None
+        if ob.get("best_bid") is not None:
+            edge_top = float(ob["best_bid"]) - tender_price
+
+        edge_exec = None
+        exec_px = _weighted_exec_price(ob.get("bids", []), decision_qty)
+        if exec_px is not None:
+            edge_exec = exec_px - tender_price
+
+        edge = max([e for e in (edge_top, edge_exec) if e is not None], default=None)
+        return (edge is not None and edge >= eff_edge), edge, eff_edge, imbalance, edge_top, edge_exec
+
+    if my_action == "SELL":
+        edge_top = None
+        if ob.get("best_ask") is not None:
+            edge_top = tender_price - float(ob["best_ask"])
+
+        edge_exec = None
+        exec_px = _weighted_exec_price(ob.get("asks", []), decision_qty)
+        if exec_px is not None:
+            edge_exec = tender_price - exec_px
+
+        edge = max([e for e in (edge_top, edge_exec) if e is not None], default=None)
+        return (edge is not None and edge >= eff_edge), edge, eff_edge, imbalance, edge_top, edge_exec
+
+    return False, None, eff_edge, imbalance, None, None
 
 
 def evaluate_tender(session, tender):
     ticker = tender.get("ticker")
     tid = tender.get("tender_id")
     raw_price = tender.get("price")
-    action = str(tender.get("action", "")).upper()
+    my_action = _infer_my_action(tender) or str(tender.get("action", "")).upper()
     is_fixed = bool(tender.get("is_fixed_bid"))
+    tender_qty = _tender_quantity(tender)
 
     if not ticker or tid is None:
         return
-    if FIXED_ONLY and not is_fixed:
+    if not is_fixed:
+        if not FIXED_ONLY:
+            print(f"Tender {tid} non-fixed; auction pricing disabled for this bot. Declining.")
         decline_tender(session, tender)
         return
     if not isinstance(raw_price, (int, float)):
+        decline_tender(session, tender)
+        return
+    if tender_qty <= 0:
         decline_tender(session, tender)
         return
 
@@ -597,19 +879,25 @@ def evaluate_tender(session, tender):
         if status and status not in {"OFFERED", "OPEN", "ACTIVE"}:
             print(f"Tender {tid} status={status}.")
             return
+        live_price = live.get("price")
+        if isinstance(live_price, (int, float)):
+            tender_price = float(live_price)
+        live_qty = _tender_quantity(live)
+        if live_qty > 0:
+            tender_qty = live_qty
+        live_action = _infer_my_action(live) or my_action
 
         ob = get_order_book_agg(session, ticker)
-        if _action_edge_ok(
-            action,
+        edge_ok, edge, eff_edge, imbalance, edge_top, edge_exec = _action_edge_ok(
+            live_action,
             tender_price,
-            ob["vwap_bid"],
-            ob["vwap_ask"],
-            ob["bid_volume"],
-            ob["ask_volume"],
+            ob,
+            tender_qty,
             i,
-        ):
+        )
+        if edge_ok:
             pre = get_inventory_total(session, ticker)
-            accepted = accept_tender(session, tender)
+            accepted = accept_tender(session, live)
             if accepted:
                 time.sleep(AFTER_ACCEPT_DELAY)
                 post = get_inventory_total(session, ticker)
@@ -625,10 +913,16 @@ def evaluate_tender(session, tender):
                             f"Holding risk on {ticker}: retained={retained:.0f} "
                             f"(hedge_ratio={HEDGE_RATIO:.2f})"
                         )
+                else:
+                    print(f"Tender {tid} accepted but no fill delta (likely lost auction or reserve miss).")
             break
         print(
             f"Evaluating tender {tid} ({i + 1}/{attempts}) "
-            f"px={tender_price:.2f} vb={ob['vwap_bid']:.2f} va={ob['vwap_ask']:.2f}"
+            f"px={tender_price:.2f} qty={tender_qty:.0f} side={live_action} "
+            f"edge={edge if edge is not None else 'N/A'} req={eff_edge:.3f} "
+            f"top={edge_top if edge_top is not None else 'N/A'} "
+            f"exec={edge_exec if edge_exec is not None else 'N/A'} "
+            f"imb={imbalance:.2f}"
         )
 
     if not accepted:
@@ -643,6 +937,57 @@ def close_positions(session):
         if ticker and abs(pos) >= 1:
             action = "SELL" if pos > 0 else "BUY"
             submit_market_order(session, ticker, abs(pos), action)
+
+
+def _ticket_qty_for_state(abs_pos, ticks_to_end, state):
+    base = abs_pos / max(1.0, float(ticks_to_end))
+    base = max(1.0, base)
+    ticket = max(base, min(FLATTEN_MIN_TICKET_QTY, abs_pos))
+
+    if state == "FAVORABLE":
+        ticket *= FLATTEN_FAVORABLE_MULT
+    elif state == "ADVERSE":
+        ticket *= FLATTEN_ADVERSE_MULT
+
+    ticket = max(1.0, ticket)
+    ticket = min(abs_pos, MAX_ORDER_SIZE, ticket)
+    return ticket
+
+
+def flatten_positions_ticketed(session, tick, tpp):
+    ticks_to_end = max(0, int(tpp) - int(tick))
+    any_pos = False
+    for s in get_securities(session):
+        ticker = s.get("ticker")
+        pos = float(s.get("position", 0.0))
+        if not ticker or abs(pos) < 1:
+            continue
+
+        any_pos = True
+        unwind_action = "SELL" if pos > 0 else "BUY"
+        abs_pos = abs(pos)
+        ob = get_order_book_agg(session, ticker)
+        regime = _flatten_regime(session, ticker, unwind_action, ob)
+
+        ticket_qty = _ticket_qty_for_state(abs_pos, ticks_to_end, regime["state"])
+        if ticks_to_end <= FLATTEN_HARD_DEADLINE_TICKS + 1:
+            ticket_qty = min(abs_pos, MAX_ORDER_SIZE)
+
+        submit_market_order(session, ticker, ticket_qty, unwind_action)
+        ema_fast = regime["ema_fast"]
+        ema_slow = regime["ema_slow"]
+        rsi = regime["rsi"]
+        ema_fast_s = f"{ema_fast:.3f}" if isinstance(ema_fast, (int, float)) else "N/A"
+        ema_slow_s = f"{ema_slow:.3f}" if isinstance(ema_slow, (int, float)) else "N/A"
+        rsi_s = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else "N/A"
+        print(
+            f"[ENDGAME] ticker={ticker} action={unwind_action} "
+            f"ticket={ticket_qty:.0f}/{abs_pos:.0f} state={regime['state']} "
+            f"ema_f={ema_fast_s} ema_s={ema_slow_s} rsi={rsi_s} "
+            f"imb={regime['imbalance']:.2f} ticks_to_end={ticks_to_end}"
+        )
+
+    return not any_pos
 
 
 def main():
@@ -665,9 +1010,23 @@ def main():
                     continue
 
                 if tick >= tpp - ENDGAME_TICKS:
-                    close_positions(session)
-                    exit_reason = "endgame_flatten"
-                    break
+                    try:
+                        flat_now = flatten_positions_ticketed(session, tick, tpp)
+                    except Exception as exc:
+                        print(f"Endgame ticketed flatten error: {exc}")
+                        flat_now = False
+
+                    if tick >= tpp - FLATTEN_HARD_DEADLINE_TICKS:
+                        close_positions(session)
+                        exit_reason = "endgame_hard_deadline_flatten"
+                        break
+
+                    if flat_now:
+                        exit_reason = "endgame_ticketed_flatten"
+                        break
+
+                    time.sleep(1.0)
+                    continue
 
                 try:
                     maybe_stop_loss_cut(session, last_sl_by_ticker)
