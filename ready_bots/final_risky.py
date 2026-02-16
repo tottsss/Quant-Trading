@@ -1,11 +1,13 @@
 import os
 import signal
 import time
-import json
 import math
-from datetime import datetime, timezone
-from pathlib import Path
 import requests
+
+try:
+    from final_risky_reporting import RuntimeTelemetry, write_run_report
+except ImportError:
+    from ready_bots.final_risky_reporting import RuntimeTelemetry, write_run_report
 
 
 class ApiException(Exception):
@@ -185,6 +187,59 @@ FLATTEN_HARD_DEADLINE_TICKS = max(
 )
 SAVE_REPORT_ON_EXIT = _env_bool("RIT_FINAL_RISKY_SAVE_REPORT_ON_EXIT", "RIT_FINAL_SAVE_REPORT_ON_EXIT", "1")
 REPORT_PREFIX = _env("RIT_FINAL_RISKY_REPORT_PREFIX", "RIT_FINAL_REPORT_PREFIX", "final_risky_report")
+REPORT_EVENTS_CAP = max(100, int(_env("RIT_FINAL_RISKY_REPORT_EVENTS_CAP", "RIT_FINAL_REPORT_EVENTS_CAP", "6000")))
+REPORT_TENDER_LOG_CAP = max(
+    100, int(_env("RIT_FINAL_RISKY_REPORT_TENDER_LOG_CAP", "RIT_FINAL_REPORT_TENDER_LOG_CAP", "5000"))
+)
+REPORT_HEDGE_LOG_CAP = max(
+    100, int(_env("RIT_FINAL_RISKY_REPORT_HEDGE_LOG_CAP", "RIT_FINAL_REPORT_HEDGE_LOG_CAP", "5000"))
+)
+REPORT_PORTFOLIO_LOG_CAP = max(
+    50, int(_env("RIT_FINAL_RISKY_REPORT_PORTFOLIO_LOG_CAP", "RIT_FINAL_REPORT_PORTFOLIO_LOG_CAP", "2000"))
+)
+REPORT_ORDER_LOG_CAP = max(
+    100, int(_env("RIT_FINAL_RISKY_REPORT_ORDER_LOG_CAP", "RIT_FINAL_REPORT_ORDER_LOG_CAP", "6000"))
+)
+REPORT_ERROR_LOG_CAP = max(
+    50, int(_env("RIT_FINAL_RISKY_REPORT_ERROR_LOG_CAP", "RIT_FINAL_REPORT_ERROR_LOG_CAP", "2000"))
+)
+
+REPORTER = RuntimeTelemetry(
+    event_cap=REPORT_EVENTS_CAP,
+    tender_log_cap=REPORT_TENDER_LOG_CAP,
+    hedge_log_cap=REPORT_HEDGE_LOG_CAP,
+    portfolio_log_cap=REPORT_PORTFOLIO_LOG_CAP,
+    order_log_cap=REPORT_ORDER_LOG_CAP,
+    error_log_cap=REPORT_ERROR_LOG_CAP,
+)
+
+
+def _bump_counter(key, inc=1):
+    REPORTER.bump_counter(key, inc)
+
+
+def _record_event(kind, message=None, **fields):
+    return REPORTER.record_event(kind, message=message, **fields)
+
+
+def _record_error(where, exc, **context):
+    REPORTER.record_error(where, exc, **context)
+
+
+def _record_tender_log(action, **fields):
+    REPORTER.record_tender_log(action, **fields)
+
+
+def _record_hedge_log(event, **fields):
+    REPORTER.record_hedge_log(event, **fields)
+
+
+def _record_portfolio_log(**fields):
+    REPORTER.record_portfolio_log(**fields)
+
+
+def _record_order_log(order_type, **fields):
+    REPORTER.record_order_log(order_type, **fields)
 
 
 def signal_handler(signum, frame):
@@ -200,6 +255,7 @@ signal.signal(signal.SIGINT, signal_handler)
 def get_case(session):
     r = session.get(f"{BASE_URL}/case")
     if not r.ok:
+        _record_error("get_case", f"http_{r.status_code}")
         raise ApiException("Failed to fetch case")
     return r.json()
 
@@ -212,6 +268,7 @@ def get_tick(session):
 def get_tenders(session):
     r = session.get(f"{BASE_URL}/tenders")
     if not r.ok:
+        _record_error("get_tenders", f"http_{r.status_code}")
         raise ApiException("Failed to fetch tenders")
     return r.json()
 
@@ -228,6 +285,7 @@ def get_tender_map(session):
 def get_securities(session):
     r = session.get(f"{BASE_URL}/securities")
     if not r.ok:
+        _record_error("get_securities", f"http_{r.status_code}")
         raise ApiException("Failed to fetch securities")
     return r.json()
 
@@ -236,6 +294,7 @@ def _safe_get_json(session, path, params=None):
     try:
         r = session.get(f"{BASE_URL}{path}", params=params)
         if not r.ok:
+            _record_error("_safe_get_json", f"http_{r.status_code}", path=path, params=params or {})
             return {
                 "_error": f"http_{r.status_code}",
                 "_path": path,
@@ -243,6 +302,7 @@ def _safe_get_json(session, path, params=None):
             }
         return r.json()
     except Exception as exc:
+        _record_error("_safe_get_json", exc, path=path, params=params or {})
         return {
             "_error": str(exc),
             "_path": path,
@@ -374,10 +434,6 @@ def _round_to_tick(price, tick, mode="nearest"):
 
 
 def save_run_report(session, reason, run_error=None):
-    ts = datetime.now(timezone.utc)
-    stamp = ts.strftime("%Y%m%d_%H%M%S")
-    out_path = Path(__file__).resolve().parent / f"{REPORT_PREFIX}_{stamp}.json"
-
     case_info = _safe_get_json(session, "/case")
     trader_info = _safe_get_json(session, "/trader")
     limits_info = _safe_get_json(session, "/limits")
@@ -387,115 +443,119 @@ def save_run_report(session, reason, run_error=None):
     orders_open = _safe_get_json(session, "/orders", params={"status": "OPEN"})
     orders_transacted = _safe_get_json(session, "/orders", params={"status": "TRANSACTED"})
     orders_cancelled = _safe_get_json(session, "/orders", params={"status": "CANCELLED"})
-
-    report = {
-        "saved_at_utc": ts.isoformat(),
-        "script": str(Path(__file__).resolve()),
-        "base_url": BASE_URL,
-        "exit_reason": reason,
-        "run_error": run_error,
-        "config": {
-            "MIN_EDGE": MIN_EDGE,
-            "VOL_FACTOR": VOL_FACTOR,
-            "MAX_ATTEMPTS": MAX_ATTEMPTS,
-            "EVAL_DELAY": EVAL_DELAY,
-            "TENDER_MONITOR_INTERVAL": TENDER_MONITOR_INTERVAL,
-            "TENDER_MONITOR_FAST_INTERVAL": TENDER_MONITOR_FAST_INTERVAL,
-            "TENDER_MONITOR_EDGE_INTERVAL": TENDER_MONITOR_EDGE_INTERVAL,
-            "TENDER_MONITOR_LOG_EVERY": TENDER_MONITOR_LOG_EVERY,
-            "TENDER_MONITOR_MAX_POLLS": TENDER_MONITOR_MAX_POLLS,
-            "TENDER_TICK_REFRESH_SECS": TENDER_TICK_REFRESH_SECS,
-            "ORDER_DELAY": ORDER_DELAY,
-            "AFTER_ACCEPT_DELAY": AFTER_ACCEPT_DELAY,
-            "MAX_ORDER_SIZE": MAX_ORDER_SIZE,
-            "DEPTH_LEVELS": DEPTH_LEVELS,
-            "BOOK_FETCH_LIMIT": BOOK_FETCH_LIMIT,
-            "ENDGAME_TICKS": ENDGAME_TICKS,
-            "FIXED_ONLY": FIXED_ONLY,
-            "AGGRESSIVE_MODE": AGGRESSIVE_MODE,
-            "HEDGE_RATIO": HEDGE_RATIO,
-            "DYN_HEDGE_RATIO_ENABLED": DYN_HEDGE_RATIO_ENABLED,
-            "DYN_HEDGE_RATIO_MIN": DYN_HEDGE_RATIO_MIN,
-            "DYN_HEDGE_RATIO_MAX": DYN_HEDGE_RATIO_MAX,
-            "DYN_HEDGE_VOL_WEIGHT": DYN_HEDGE_VOL_WEIGHT,
-            "DYN_HEDGE_SPREAD_WEIGHT": DYN_HEDGE_SPREAD_WEIGHT,
-            "DYN_HEDGE_ADVERSE_BONUS": DYN_HEDGE_ADVERSE_BONUS,
-            "DYN_HEDGE_FAVORABLE_DISCOUNT": DYN_HEDGE_FAVORABLE_DISCOUNT,
-            "DYN_HEDGE_VOL_REF": DYN_HEDGE_VOL_REF,
-            "DYN_HEDGE_SPREAD_BPS_REF": DYN_HEDGE_SPREAD_BPS_REF,
-            "TAKE_PROFIT_ENABLED": TAKE_PROFIT_ENABLED,
-            "TAKE_PROFIT_PER_SHARE": TAKE_PROFIT_PER_SHARE,
-            "TAKE_PROFIT_CHUNK_QTY": TAKE_PROFIT_CHUNK_QTY,
-            "TAKE_PROFIT_MIN_CHUNK_QTY": TAKE_PROFIT_MIN_CHUNK_QTY,
-            "TAKE_PROFIT_SPREAD_BPS_REF": TAKE_PROFIT_SPREAD_BPS_REF,
-            "TAKE_PROFIT_SPREAD_POWER": TAKE_PROFIT_SPREAD_POWER,
-            "TAKE_PROFIT_TOP_LEVEL_PARTICIPATION": TAKE_PROFIT_TOP_LEVEL_PARTICIPATION,
-            "TAKE_PROFIT_COOLDOWN": TAKE_PROFIT_COOLDOWN,
-            "STOP_LOSS_ENABLED": STOP_LOSS_ENABLED,
-            "STOP_LOSS_PER_SHARE": STOP_LOSS_PER_SHARE,
-            "STOP_LOSS_CHUNK_QTY": STOP_LOSS_CHUNK_QTY,
-            "STOP_LOSS_COOLDOWN": STOP_LOSS_COOLDOWN,
-            "BOOK_OUTLIER_BPS": BOOK_OUTLIER_BPS,
-            "BOOK_OUTLIER_SPREAD_MULT": BOOK_OUTLIER_SPREAD_MULT,
-            "BOOK_MAX_LEVEL_QTY": BOOK_MAX_LEVEL_QTY,
-            "BOOK_DECISION_MAX_LEVELS": BOOK_DECISION_MAX_LEVELS,
-            "BOOK_DECISION_MAX_BPS": BOOK_DECISION_MAX_BPS,
-            "BOOK_DECISION_MIN_LEVELS": BOOK_DECISION_MIN_LEVELS,
-            "BOOK_MIN_FILL_RATIO": BOOK_MIN_FILL_RATIO,
-            "LIMIT_FALLBACK_GROSS": LIMIT_FALLBACK_GROSS,
-            "LIMIT_FALLBACK_NET": LIMIT_FALLBACK_NET,
-            "AUCTION_TICK": AUCTION_TICK,
-            "MOM_TAS_LIMIT": MOM_TAS_LIMIT,
-            "MOM_EMA_FAST": MOM_EMA_FAST,
-            "MOM_EMA_SLOW": MOM_EMA_SLOW,
-            "MOM_RSI_PERIOD": MOM_RSI_PERIOD,
-            "MOM_IMBALANCE_LEVELS": MOM_IMBALANCE_LEVELS,
-            "MOM_IMBALANCE_THRESHOLD": MOM_IMBALANCE_THRESHOLD,
-            "HEDGE_MOMENTUM_AWARE": HEDGE_MOMENTUM_AWARE,
-            "HEDGE_MIN_TICKET_QTY": HEDGE_MIN_TICKET_QTY,
-            "HEDGE_FAVORABLE_MULT": HEDGE_FAVORABLE_MULT,
-            "HEDGE_ADVERSE_MULT": HEDGE_ADVERSE_MULT,
-            "HEDGE_REGIME_REFRESH_SECS": HEDGE_REGIME_REFRESH_SECS,
-            "HEDGE_MAX_TICKETS": HEDGE_MAX_TICKETS,
-            "HEDGE_MARKETABLE_OFFSET": HEDGE_MARKETABLE_OFFSET,
-            "HEDGE_MARKETABLE_OFFSET_MAX": HEDGE_MARKETABLE_OFFSET_MAX,
-            "HEDGE_FALLBACK_CHUNK_QTY": HEDGE_FALLBACK_CHUNK_QTY,
-            "HEDGE_MAX_FALLBACK_SLICES": HEDGE_MAX_FALLBACK_SLICES,
-            "HEDGE_ALLOW_MARKET_FALLBACK": HEDGE_ALLOW_MARKET_FALLBACK,
-            "REGIME_CACHE_TTL": REGIME_CACHE_TTL,
-            "TREND_EDGE_FAVORABLE_MULT": TREND_EDGE_FAVORABLE_MULT,
-            "TREND_EDGE_ADVERSE_MULT": TREND_EDGE_ADVERSE_MULT,
-            "TREND_STRICT_ACCEPT": TREND_STRICT_ACCEPT,
-            "TREND_STRICT_MIN_CONF": TREND_STRICT_MIN_CONF,
-            "REGIME_SCORE_FAVORABLE": REGIME_SCORE_FAVORABLE,
-            "REGIME_SCORE_ADVERSE": REGIME_SCORE_ADVERSE,
-            "TREND_MIN_GAP_BPS": TREND_MIN_GAP_BPS,
-            "RSI_HIGH": RSI_HIGH,
-            "RSI_LOW": RSI_LOW,
-            "VOL_LOOKBACK": VOL_LOOKBACK,
-            "VOL_HIGH": VOL_HIGH,
-            "VOL_SHOCK": VOL_SHOCK,
-            "FLATTEN_FAVORABLE_MULT": FLATTEN_FAVORABLE_MULT,
-            "FLATTEN_ADVERSE_MULT": FLATTEN_ADVERSE_MULT,
-            "FLATTEN_MIN_TICKET_QTY": FLATTEN_MIN_TICKET_QTY,
-            "FLATTEN_HARD_DEADLINE_TICKS": FLATTEN_HARD_DEADLINE_TICKS,
-        },
-        "case": case_info,
-        "trader": trader_info,
-        "limits": limits_info,
-        "securities": securities,
-        "position_summary": _compute_position_summary(securities),
-        "tenders_active": tenders,
-        "orders": {
-            "all": orders_all,
-            "open": orders_open,
-            "transacted": orders_transacted,
-            "cancelled": orders_cancelled,
-        },
+    config = {
+        "MIN_EDGE": MIN_EDGE,
+        "VOL_FACTOR": VOL_FACTOR,
+        "MAX_ATTEMPTS": MAX_ATTEMPTS,
+        "EVAL_DELAY": EVAL_DELAY,
+        "TENDER_MONITOR_INTERVAL": TENDER_MONITOR_INTERVAL,
+        "TENDER_MONITOR_FAST_INTERVAL": TENDER_MONITOR_FAST_INTERVAL,
+        "TENDER_MONITOR_EDGE_INTERVAL": TENDER_MONITOR_EDGE_INTERVAL,
+        "TENDER_MONITOR_LOG_EVERY": TENDER_MONITOR_LOG_EVERY,
+        "TENDER_MONITOR_MAX_POLLS": TENDER_MONITOR_MAX_POLLS,
+        "TENDER_TICK_REFRESH_SECS": TENDER_TICK_REFRESH_SECS,
+        "ORDER_DELAY": ORDER_DELAY,
+        "AFTER_ACCEPT_DELAY": AFTER_ACCEPT_DELAY,
+        "MAX_ORDER_SIZE": MAX_ORDER_SIZE,
+        "DEPTH_LEVELS": DEPTH_LEVELS,
+        "BOOK_FETCH_LIMIT": BOOK_FETCH_LIMIT,
+        "ENDGAME_TICKS": ENDGAME_TICKS,
+        "FIXED_ONLY": FIXED_ONLY,
+        "AGGRESSIVE_MODE": AGGRESSIVE_MODE,
+        "HEDGE_RATIO": HEDGE_RATIO,
+        "DYN_HEDGE_RATIO_ENABLED": DYN_HEDGE_RATIO_ENABLED,
+        "DYN_HEDGE_RATIO_MIN": DYN_HEDGE_RATIO_MIN,
+        "DYN_HEDGE_RATIO_MAX": DYN_HEDGE_RATIO_MAX,
+        "DYN_HEDGE_VOL_WEIGHT": DYN_HEDGE_VOL_WEIGHT,
+        "DYN_HEDGE_SPREAD_WEIGHT": DYN_HEDGE_SPREAD_WEIGHT,
+        "DYN_HEDGE_ADVERSE_BONUS": DYN_HEDGE_ADVERSE_BONUS,
+        "DYN_HEDGE_FAVORABLE_DISCOUNT": DYN_HEDGE_FAVORABLE_DISCOUNT,
+        "DYN_HEDGE_VOL_REF": DYN_HEDGE_VOL_REF,
+        "DYN_HEDGE_SPREAD_BPS_REF": DYN_HEDGE_SPREAD_BPS_REF,
+        "TAKE_PROFIT_ENABLED": TAKE_PROFIT_ENABLED,
+        "TAKE_PROFIT_PER_SHARE": TAKE_PROFIT_PER_SHARE,
+        "TAKE_PROFIT_CHUNK_QTY": TAKE_PROFIT_CHUNK_QTY,
+        "TAKE_PROFIT_MIN_CHUNK_QTY": TAKE_PROFIT_MIN_CHUNK_QTY,
+        "TAKE_PROFIT_SPREAD_BPS_REF": TAKE_PROFIT_SPREAD_BPS_REF,
+        "TAKE_PROFIT_SPREAD_POWER": TAKE_PROFIT_SPREAD_POWER,
+        "TAKE_PROFIT_TOP_LEVEL_PARTICIPATION": TAKE_PROFIT_TOP_LEVEL_PARTICIPATION,
+        "TAKE_PROFIT_COOLDOWN": TAKE_PROFIT_COOLDOWN,
+        "STOP_LOSS_ENABLED": STOP_LOSS_ENABLED,
+        "STOP_LOSS_PER_SHARE": STOP_LOSS_PER_SHARE,
+        "STOP_LOSS_CHUNK_QTY": STOP_LOSS_CHUNK_QTY,
+        "STOP_LOSS_COOLDOWN": STOP_LOSS_COOLDOWN,
+        "BOOK_OUTLIER_BPS": BOOK_OUTLIER_BPS,
+        "BOOK_OUTLIER_SPREAD_MULT": BOOK_OUTLIER_SPREAD_MULT,
+        "BOOK_MAX_LEVEL_QTY": BOOK_MAX_LEVEL_QTY,
+        "BOOK_DECISION_MAX_LEVELS": BOOK_DECISION_MAX_LEVELS,
+        "BOOK_DECISION_MAX_BPS": BOOK_DECISION_MAX_BPS,
+        "BOOK_DECISION_MIN_LEVELS": BOOK_DECISION_MIN_LEVELS,
+        "BOOK_MIN_FILL_RATIO": BOOK_MIN_FILL_RATIO,
+        "LIMIT_FALLBACK_GROSS": LIMIT_FALLBACK_GROSS,
+        "LIMIT_FALLBACK_NET": LIMIT_FALLBACK_NET,
+        "AUCTION_TICK": AUCTION_TICK,
+        "MOM_TAS_LIMIT": MOM_TAS_LIMIT,
+        "MOM_EMA_FAST": MOM_EMA_FAST,
+        "MOM_EMA_SLOW": MOM_EMA_SLOW,
+        "MOM_RSI_PERIOD": MOM_RSI_PERIOD,
+        "MOM_IMBALANCE_LEVELS": MOM_IMBALANCE_LEVELS,
+        "MOM_IMBALANCE_THRESHOLD": MOM_IMBALANCE_THRESHOLD,
+        "HEDGE_MOMENTUM_AWARE": HEDGE_MOMENTUM_AWARE,
+        "HEDGE_MIN_TICKET_QTY": HEDGE_MIN_TICKET_QTY,
+        "HEDGE_FAVORABLE_MULT": HEDGE_FAVORABLE_MULT,
+        "HEDGE_ADVERSE_MULT": HEDGE_ADVERSE_MULT,
+        "HEDGE_REGIME_REFRESH_SECS": HEDGE_REGIME_REFRESH_SECS,
+        "HEDGE_MAX_TICKETS": HEDGE_MAX_TICKETS,
+        "HEDGE_MARKETABLE_OFFSET": HEDGE_MARKETABLE_OFFSET,
+        "HEDGE_MARKETABLE_OFFSET_MAX": HEDGE_MARKETABLE_OFFSET_MAX,
+        "HEDGE_FALLBACK_CHUNK_QTY": HEDGE_FALLBACK_CHUNK_QTY,
+        "HEDGE_MAX_FALLBACK_SLICES": HEDGE_MAX_FALLBACK_SLICES,
+        "HEDGE_ALLOW_MARKET_FALLBACK": HEDGE_ALLOW_MARKET_FALLBACK,
+        "REGIME_CACHE_TTL": REGIME_CACHE_TTL,
+        "TREND_EDGE_FAVORABLE_MULT": TREND_EDGE_FAVORABLE_MULT,
+        "TREND_EDGE_ADVERSE_MULT": TREND_EDGE_ADVERSE_MULT,
+        "TREND_STRICT_ACCEPT": TREND_STRICT_ACCEPT,
+        "TREND_STRICT_MIN_CONF": TREND_STRICT_MIN_CONF,
+        "REGIME_SCORE_FAVORABLE": REGIME_SCORE_FAVORABLE,
+        "REGIME_SCORE_ADVERSE": REGIME_SCORE_ADVERSE,
+        "TREND_MIN_GAP_BPS": TREND_MIN_GAP_BPS,
+        "RSI_HIGH": RSI_HIGH,
+        "RSI_LOW": RSI_LOW,
+        "VOL_LOOKBACK": VOL_LOOKBACK,
+        "VOL_HIGH": VOL_HIGH,
+        "VOL_SHOCK": VOL_SHOCK,
+        "FLATTEN_FAVORABLE_MULT": FLATTEN_FAVORABLE_MULT,
+        "FLATTEN_ADVERSE_MULT": FLATTEN_ADVERSE_MULT,
+        "FLATTEN_MIN_TICKET_QTY": FLATTEN_MIN_TICKET_QTY,
+        "FLATTEN_HARD_DEADLINE_TICKS": FLATTEN_HARD_DEADLINE_TICKS,
+        "REPORT_EVENTS_CAP": REPORT_EVENTS_CAP,
+        "REPORT_TENDER_LOG_CAP": REPORT_TENDER_LOG_CAP,
+        "REPORT_HEDGE_LOG_CAP": REPORT_HEDGE_LOG_CAP,
+        "REPORT_PORTFOLIO_LOG_CAP": REPORT_PORTFOLIO_LOG_CAP,
+        "REPORT_ORDER_LOG_CAP": REPORT_ORDER_LOG_CAP,
+        "REPORT_ERROR_LOG_CAP": REPORT_ERROR_LOG_CAP,
     }
 
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, sort_keys=True)
+    out_path = write_run_report(
+        script_path=__file__,
+        report_prefix=REPORT_PREFIX,
+        base_url=BASE_URL,
+        reason=reason,
+        run_error=run_error,
+        config=config,
+        case_info=case_info,
+        trader_info=trader_info,
+        limits_info=limits_info,
+        securities=securities,
+        position_summary=_compute_position_summary(securities),
+        tenders=tenders,
+        orders_all=orders_all,
+        orders_open=orders_open,
+        orders_transacted=orders_transacted,
+        orders_cancelled=orders_cancelled,
+        telemetry=REPORTER,
+    )
+
     print(f"[REPORT] saved: {out_path}")
     return out_path
 
@@ -641,10 +701,30 @@ def accept_tender(session, tender, submit_price=None):
     r = session.post(f"{BASE_URL}/tenders/{tid}", params=params or None)
     if not r.ok:
         print(f"Accept failed tender {tid}: status={r.status_code}")
+        _bump_counter("tenders_submit_failed", 1)
+        _record_tender_log(
+            "accept_failed",
+            tender_id=tid,
+            ticker=tender.get("ticker"),
+            action=tender.get("action"),
+            submit_price=submit_price,
+            status_code=r.status_code,
+        )
         return False
     mode = "auction_bid" if submit_price is not None else "fixed_accept"
     px_str = f" submit={float(submit_price):.2f}" if submit_price is not None else ""
     print(f"Accepted Tender {tid}: {tender.get('ticker')} {tender.get('action')} @ {tender.get('price')} [{mode}]{px_str}")
+    _bump_counter("tenders_accepted", 1)
+    _record_tender_log(
+        "accepted",
+        tender_id=tid,
+        ticker=tender.get("ticker"),
+        action=tender.get("action"),
+        tender_price=tender.get("price"),
+        submit_price=submit_price,
+        mode=mode,
+        quantity=tender.get("quantity"),
+    )
     return True
 
 
@@ -653,8 +733,25 @@ def decline_tender(session, tender):
     r = session.delete(f"{BASE_URL}/tenders/{tid}")
     if not r.ok:
         print(f"Decline failed tender {tid}: status={r.status_code}")
+        _record_tender_log(
+            "decline_failed",
+            tender_id=tid,
+            ticker=tender.get("ticker"),
+            action=tender.get("action"),
+            status_code=r.status_code,
+        )
         return False
     print(f"Declined Tender {tid}: {tender.get('ticker')} {tender.get('action')} @ {tender.get('price')}")
+    _bump_counter("tenders_declined", 1)
+    _record_tender_log(
+        "declined",
+        tender_id=tid,
+        ticker=tender.get("ticker"),
+        action=tender.get("action"),
+        tender_price=tender.get("price"),
+        quantity=tender.get("quantity"),
+        is_fixed=tender.get("is_fixed_bid"),
+    )
     return True
 
 
@@ -666,8 +763,26 @@ def submit_limit_order(session, ticker, quantity, price, action):
     order = {"ticker": ticker, "type": "LIMIT", "quantity": qty_i, "action": action, "price": price}
     r = session.post(f"{BASE_URL}/orders", params=order)
     if not r.ok:
+        _record_order_log(
+            "LIMIT",
+            ticker=ticker,
+            action=action,
+            quantity=qty_i,
+            price=price,
+            status="failed",
+            status_code=r.status_code,
+        )
         raise ApiException(f"LIMIT order failed {ticker} {action} {qty_i} @ {price}")
     print(f"Placed {action} LIMIT order: {qty_i} @ {price:.2f} on {ticker}")
+    _bump_counter("limit_orders_submitted", 1)
+    _record_order_log(
+        "LIMIT",
+        ticker=ticker,
+        action=action,
+        quantity=qty_i,
+        price=price,
+        status="submitted",
+    )
 
 
 def submit_market_order(session, ticker, quantity, action):
@@ -680,8 +795,24 @@ def submit_market_order(session, ticker, quantity, action):
         order = {"ticker": ticker, "type": "MARKET", "quantity": chunk, "action": action}
         r = session.post(f"{BASE_URL}/orders", params=order)
         if not r.ok:
+            _record_order_log(
+                "MARKET",
+                ticker=ticker,
+                action=action,
+                quantity=chunk,
+                status="failed",
+                status_code=r.status_code,
+            )
             raise ApiException(f"MARKET order failed {ticker} {action} {chunk}")
         print(f"Placed {action} MARKET order: {chunk} on {ticker}")
+        _bump_counter("market_orders_submitted", 1)
+        _record_order_log(
+            "MARKET",
+            ticker=ticker,
+            action=action,
+            quantity=chunk,
+            status="submitted",
+        )
         qty -= chunk
         time.sleep(0.08)
 
@@ -719,6 +850,16 @@ def log_portfolio(session, tick, tpp):
 
     if not lines:
         print(f"[PORTFOLIO] tick={tick}/{tpp} flat")
+        _bump_counter("portfolio_logs", 1)
+        _record_portfolio_log(
+            tick=int(tick),
+            ticks_per_period=int(tpp),
+            flat=True,
+            net_position=0.0,
+            gross_position=0.0,
+            gross_notional=0.0,
+            positions=[],
+        )
         return
 
     print(
@@ -726,6 +867,16 @@ def log_portfolio(session, tick, tpp):
         f"gross={gross_pos:.0f} gross_notional={gross_notional:.2f}"
     )
     print("[PORTFOLIO] " + " | ".join(lines))
+    _bump_counter("portfolio_logs", 1)
+    _record_portfolio_log(
+        tick=int(tick),
+        ticks_per_period=int(tpp),
+        flat=False,
+        net_position=float(net_pos),
+        gross_position=float(gross_pos),
+        gross_notional=float(gross_notional),
+        positions=list(lines),
+    )
 
 
 def _cost_basis(row):
@@ -1193,6 +1344,17 @@ def maybe_take_profit_cover(session, last_tp_by_ticker):
 
         submit_market_order(session, ticker, cover_qty, action)
         last_tp_by_ticker[ticker] = now
+        _bump_counter("take_profit_orders", 1)
+        _record_event(
+            "take_profit",
+            ticker=ticker,
+            action=action,
+            quantity=int(cover_qty),
+            edge=float(edge),
+            cost=float(cost),
+            exec_price=float(exec_px),
+            spread_bps=float(spread_bps),
+        )
         print(
             f"[TAKE_PROFIT] {ticker} {action} {cover_qty:.0f} "
             f"edge={edge:.3f} cost={cost:.2f} exec={exec_px:.2f} "
@@ -1245,6 +1407,16 @@ def maybe_stop_loss_cut(session, last_sl_by_ticker):
 
         submit_market_order(session, ticker, cut_qty, action)
         last_sl_by_ticker[ticker] = now
+        _bump_counter("stop_loss_orders", 1)
+        _record_event(
+            "stop_loss",
+            ticker=ticker,
+            action=action,
+            quantity=int(cut_qty),
+            loss=float(loss),
+            cost=float(cost),
+            exec_price=float(exec_px),
+        )
         print(
             f"[STOP_LOSS] {ticker} {action} {cut_qty:.0f} "
             f"loss={loss:.3f} cost={cost:.2f} exec={exec_px:.2f}"
@@ -1268,6 +1440,14 @@ def unwind_inventory(session, ticker, inventory, excluded_tender_ids=None):
     while remaining > 0 and tickets < HEDGE_MAX_TICKETS:
         blocked_ids = _unresolved_tender_ids_for_base(session, ticker, exclude_tids=excluded_tender_ids)
         if blocked_ids:
+            _bump_counter("hedge_blocks", 1)
+            _record_hedge_log(
+                "blocked",
+                ticker=ticker,
+                action=unwind_action,
+                remaining=float(remaining),
+                unresolved_tenders=list(blocked_ids),
+            )
             print(
                 f"[HEDGE BLOCK] ticker={ticker} unresolved_tenders={blocked_ids} "
                 f"rem={remaining:.0f}; stopping hedge."
@@ -1379,6 +1559,18 @@ def unwind_inventory(session, ticker, inventory, excluded_tender_ids=None):
 
         remaining = max(0.0, remaining - filled)
         tickets += 1
+        _bump_counter("hedge_tickets", 1)
+        _record_hedge_log(
+            "ticket",
+            ticker=ticker,
+            action=unwind_action,
+            state=state,
+            confidence=float(confidence),
+            requested=float(q),
+            filled=float(filled),
+            remaining=float(remaining),
+            fallback_slices=int(fallback_slices),
+        )
         print(
             f"[HEDGE] ticker={ticker} action={unwind_action} state={state} "
             f"conf={confidence:.2f} ticket={q:.0f} filled={filled:.0f} rem={remaining:.0f}"
@@ -1387,6 +1579,14 @@ def unwind_inventory(session, ticker, inventory, excluded_tender_ids=None):
     if remaining > 0:
         blocked_ids = _unresolved_tender_ids_for_base(session, ticker, exclude_tids=excluded_tender_ids)
         if blocked_ids:
+            _bump_counter("hedge_blocks", 1)
+            _record_hedge_log(
+                "blocked_final_fallback",
+                ticker=ticker,
+                action=unwind_action,
+                remaining=float(remaining),
+                unresolved_tenders=list(blocked_ids),
+            )
             print(
                 f"[HEDGE BLOCK] ticker={ticker} unresolved_tenders={blocked_ids} "
                 f"rem={remaining:.0f}; skipping final fallback."
@@ -1404,11 +1604,33 @@ def unwind_inventory(session, ticker, inventory, excluded_tender_ids=None):
                 else:
                     mkt_filled = max(0.0, pos_before - pos_after)
                 pos_before = pos_after
+                _bump_counter("hedge_market_fallback_tickets", 1)
+                _record_hedge_log(
+                    "market_fallback",
+                    ticker=ticker,
+                    action=unwind_action,
+                    requested=float(market_q),
+                    filled=float(mkt_filled),
+                    remaining_before=float(remaining),
+                )
                 if mkt_filled <= 0.5:
+                    _record_hedge_log(
+                        "market_fallback_no_fill",
+                        ticker=ticker,
+                        action=unwind_action,
+                        requested=float(market_q),
+                        remaining=float(remaining),
+                    )
                     print(f"[HEDGE WARN] market fallback no fill on {ticker}; rem={remaining:.0f}")
                     break
                 remaining = max(0.0, remaining - mkt_filled)
         else:
+            _record_hedge_log(
+                "remaining_no_market_fallback",
+                ticker=ticker,
+                action=unwind_action,
+                remaining=float(remaining),
+            )
             print(f"[HEDGE WARN] remaining {remaining:.0f} on {ticker}; no market fallback allowed.")
 
 
@@ -1520,7 +1742,18 @@ def evaluate_tender(session, tender):
     tender_qty = _tender_quantity(tender)
 
     if not ticker or tid is None:
+        _record_tender_log("invalid_tender", tender=tender)
         return
+    _record_tender_log(
+        "evaluate_start",
+        tender_id=tid,
+        ticker=ticker,
+        action=my_action,
+        is_fixed=is_fixed,
+        quantity=tender_qty,
+        tender_price=tender.get("price"),
+        expires=tender.get("expires"),
+    )
     if FIXED_ONLY and not is_fixed:
         print(f"Tender {tid} non-fixed while FIXED_ONLY=1; declining.")
         decline_tender(session, tender)
@@ -1566,10 +1799,12 @@ def evaluate_tender(session, tender):
         live = get_tender_map(session).get(tid)
         if live is None:
             print(f"Tender {tid} unavailable.")
+            _record_tender_log("unavailable_during_eval", tender_id=tid, ticker=ticker, poll_idx=poll_idx)
             return
         status = str(live.get("status", "")).upper()
         if status and status not in {"OFFERED", "OPEN", "ACTIVE"}:
             print(f"Tender {tid} status={status}.")
+            _record_tender_log("status_closed", tender_id=tid, ticker=ticker, status=status, poll_idx=poll_idx)
             return
         is_fixed_live = bool(live.get("is_fixed_bid"))
         if FIXED_ONLY and not is_fixed_live:
@@ -1601,6 +1836,7 @@ def evaluate_tender(session, tender):
         if is_fixed_live:
             if not isinstance(last_fixed_price, (int, float)):
                 print(f"HOLD tender {tid}: fixed price missing")
+                _record_tender_log("fixed_price_missing", tender_id=tid, ticker=ticker, poll_idx=poll_idx)
                 poll_idx += 1
                 time.sleep(monitor_interval)
                 continue
@@ -1630,6 +1866,18 @@ def evaluate_tender(session, tender):
         if should_submit:
             ok_limits, lim = _pretrade_limit_gate(session, ticker, live_action, tender_qty)
             if not ok_limits:
+                _bump_counter("tenders_limit_blocked", 1)
+                _record_tender_log(
+                    "limit_blocked",
+                    tender_id=tid,
+                    ticker=ticker,
+                    side=live_action,
+                    quantity=float(tender_qty),
+                    gross_after=float(lim["gross_after"]),
+                    gross_limit=float(lim["gross_limit"]),
+                    net_after=float(lim["net_after"]),
+                    net_limit=float(lim["net_limit"]),
+                )
                 print(
                     f"DECLINE tender {tid}: limits gate "
                     f"gross {lim['gross_after']:.0f}/{lim['gross_limit']:.0f} "
@@ -1657,19 +1905,42 @@ def evaluate_tender(session, tender):
                 regime_post = _flatten_regime(session, ticker, hedge_unwind_action, ob_post, cache=regime_cache)
                 hedge_ratio_now, hedge_meta = _dynamic_hedge_ratio(HEDGE_RATIO, ob_post, regime=regime_post)
                 hedge_delta = delta * hedge_ratio_now
+                retained = delta - hedge_delta
+                _record_tender_log(
+                    "accepted_fill_delta",
+                    tender_id=tid,
+                    ticker=ticker,
+                    side=live_action,
+                    quantity=float(tender_qty),
+                    mode=mode,
+                    submit_price=float(submit_price) if isinstance(submit_price, (int, float)) else None,
+                    delta=float(delta),
+                    hedge_ratio=float(hedge_ratio_now),
+                    hedge_delta=float(hedge_delta),
+                    retained=float(retained),
+                    regime=regime_post.get("state"),
+                )
                 print(
                     f"[HEDGE_RATIO] {ticker} base={HEDGE_RATIO:.2f} dyn={hedge_ratio_now:.2f} "
                     f"spread_bps={hedge_meta['spread_bps']:.2f} vol={hedge_meta['realized_vol']} "
                     f"state={hedge_meta['state']} conf={hedge_meta['confidence']:.2f}"
                 )
                 unwind_inventory(session, ticker, hedge_delta, excluded_tender_ids={tid})
-                retained = delta - hedge_delta
                 if abs(retained) >= 1:
                     print(
                         f"Holding risk on {ticker}: retained={retained:.0f} "
                         f"(hedge_ratio={hedge_ratio_now:.2f})"
                     )
             else:
+                _record_tender_log(
+                    "accepted_no_fill",
+                    tender_id=tid,
+                    ticker=ticker,
+                    side=live_action,
+                    quantity=float(tender_qty),
+                    mode=mode,
+                    submit_price=float(submit_price) if isinstance(submit_price, (int, float)) else None,
+                )
                 print(f"Tender {tid} accepted but no fill delta (likely lost auction or reserve miss).")
             break
 
@@ -1684,6 +1955,28 @@ def evaluate_tender(session, tender):
             or (ticks_left_live is not None and ticks_left_live <= 2)
         )
         if should_log:
+            _record_tender_log(
+                "poll_snapshot",
+                tender_id=tid,
+                ticker=ticker,
+                poll_idx=int(poll_idx),
+                max_polls=int(max_polls),
+                mode=mode,
+                side=live_action,
+                tender_qty=float(tender_qty),
+                tender_price=float(last_fixed_price) if isinstance(last_fixed_price, (int, float)) else None,
+                submit_price=float(submit_price) if isinstance(submit_price, (int, float)) else None,
+                edge=float(edge) if isinstance(edge, (int, float)) else None,
+                required_edge=float(eff_edge),
+                edge_top=float(edge_top) if isinstance(edge_top, (int, float)) else None,
+                edge_exec=float(edge_exec) if isinstance(edge_exec, (int, float)) else None,
+                fill_ratio=float(fill_ratio),
+                imbalance=float(imbalance),
+                regime=regime.get("state"),
+                confidence=float(regime.get("confidence", 0.0)),
+                trend_bias=regime.get("trend_bias"),
+                ticks_left=ticks_left_live,
+            )
             print(
                 f"Evaluating tender {tid} ({poll_idx + 1}/{max_polls}) "
                 f"mode={mode} px={(f'{last_fixed_price:.2f}' if isinstance(last_fixed_price, (int, float)) else 'N/A')} "
@@ -1707,16 +2000,27 @@ def evaluate_tender(session, tender):
         poll_idx += 1
 
     if not accepted:
+        _record_tender_log(
+            "decline_after_eval",
+            tender_id=tid,
+            ticker=ticker,
+            quantity=float(tender_qty),
+            last_fixed_price=float(last_fixed_price) if isinstance(last_fixed_price, (int, float)) else None,
+            polls=int(poll_idx),
+            max_polls=int(max_polls),
+        )
         decline_tender(session, tender)
 
 
 def close_positions(session):
     print("Closing all positions before trading ends.")
+    _record_event("close_positions_start")
     for s in get_securities(session):
         ticker = s.get("ticker")
         pos = float(s.get("position", 0.0))
         if ticker and abs(pos) >= 1:
             action = "SELL" if pos > 0 else "BUY"
+            _record_event("close_position_order", ticker=ticker, action=action, quantity=float(abs(pos)))
             submit_market_order(session, ticker, abs(pos), action)
 
 
@@ -1773,6 +2077,16 @@ def flatten_positions_ticketed(session, tick, tpp):
             ticket_qty = min(abs_pos, MAX_ORDER_SIZE)
 
         submit_market_order(session, ticker, ticket_qty, unwind_action)
+        _record_hedge_log(
+            "endgame_ticket",
+            ticker=ticker,
+            action=unwind_action,
+            ticket=float(ticket_qty),
+            abs_position=float(abs_pos),
+            state=regime["state"],
+            confidence=float(regime.get("confidence", 0.0)),
+            ticks_to_end=int(ticks_to_end),
+        )
         ema_fast = regime["ema_fast"]
         ema_slow = regime["ema_slow"]
         rsi = regime["rsi"]
@@ -1800,10 +2114,12 @@ def main():
     last_sl_by_ticker = {}
     exit_reason = "shutdown_or_manual_stop"
     run_error = None
+    _record_event("run_start", base_url=BASE_URL, report_prefix=REPORT_PREFIX)
     with requests.Session() as session:
         session.headers.update(HEADERS)
         try:
             while not SHUTDOWN:
+                _bump_counter("loops", 1)
                 tick, tpp, status = get_tick(session)
                 if status != "ACTIVE":
                     time.sleep(1.0)
@@ -1814,14 +2130,17 @@ def main():
                         flat_now = flatten_positions_ticketed(session, tick, tpp)
                     except Exception as exc:
                         print(f"Endgame ticketed flatten error: {exc}")
+                        _record_error("flatten_positions_ticketed", exc, tick=tick, tpp=tpp)
                         flat_now = False
 
                     if tick >= tpp - FLATTEN_HARD_DEADLINE_TICKS:
                         close_positions(session)
+                        _record_event("endgame_hard_deadline_flatten", tick=tick, tpp=tpp)
                         exit_reason = "endgame_hard_deadline_flatten"
                         break
 
                     if flat_now:
+                        _record_event("endgame_ticketed_flatten", tick=tick, tpp=tpp)
                         exit_reason = "endgame_ticketed_flatten"
                         break
 
@@ -1832,11 +2151,13 @@ def main():
                     maybe_stop_loss_cut(session, last_sl_by_ticker)
                 except Exception as exc:
                     print(f"Stop-loss error: {exc}")
+                    _record_error("maybe_stop_loss_cut", exc, tick=tick, tpp=tpp)
 
                 try:
                     maybe_take_profit_cover(session, last_tp_by_ticker)
                 except Exception as exc:
                     print(f"Take-profit error: {exc}")
+                    _record_error("maybe_take_profit_cover", exc, tick=tick, tpp=tpp)
 
                 if PORTFOLIO_PRINT_INTERVAL > 0:
                     now = time.monotonic()
@@ -1845,29 +2166,36 @@ def main():
                             log_portfolio(session, tick, tpp)
                         except Exception as exc:
                             print(f"Portfolio log error: {exc}")
+                            _record_error("log_portfolio", exc, tick=tick, tpp=tpp)
                         next_portfolio_print = now + PORTFOLIO_PRINT_INTERVAL
 
                 for tender in get_tenders(session):
                     tid = tender.get("tender_id")
                     if tid in processed:
                         continue
+                    _bump_counter("tenders_seen", 1)
                     try:
                         evaluate_tender(session, tender)
                     except Exception as exc:
                         print(f"Tender error {tid}: {exc}")
+                        _record_error("evaluate_tender", exc, tender_id=tid, ticker=tender.get("ticker"))
                         continue
                     processed.add(tid)
+                    _bump_counter("tenders_processed", 1)
                 time.sleep(1.0)
         except Exception as exc:
             run_error = str(exc)
             exit_reason = "fatal_error"
             print(f"Fatal error: {exc}")
+            _record_error("main_loop", exc)
         finally:
+            _record_event("run_end", exit_reason=exit_reason, run_error=run_error)
             if SAVE_REPORT_ON_EXIT:
                 try:
                     save_run_report(session, exit_reason, run_error=run_error)
                 except Exception as exc:
                     print(f"Report save error: {exc}")
+                    _record_error("save_run_report", exc, exit_reason=exit_reason)
 
 
 if __name__ == "__main__":
