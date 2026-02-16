@@ -2,6 +2,7 @@ import os
 import signal
 import time
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 import requests
@@ -72,6 +73,19 @@ HEDGE_FAVORABLE_MULT = float(_env("RIT_FINAL_RISKY_HEDGE_FAVORABLE_MULT", "RIT_F
 HEDGE_ADVERSE_MULT = float(_env("RIT_FINAL_RISKY_HEDGE_ADVERSE_MULT", "RIT_FINAL_HEDGE_ADVERSE_MULT", "1.35"))
 HEDGE_REGIME_REFRESH_SECS = float(_env("RIT_FINAL_RISKY_HEDGE_REGIME_REFRESH_SECS", "RIT_FINAL_HEDGE_REGIME_REFRESH_SECS", "0.35"))
 HEDGE_MAX_TICKETS = max(1, int(_env("RIT_FINAL_RISKY_HEDGE_MAX_TICKETS", "RIT_FINAL_HEDGE_MAX_TICKETS", "30")))
+REGIME_CACHE_TTL = float(_env("RIT_FINAL_RISKY_REGIME_CACHE_TTL", "RIT_FINAL_REGIME_CACHE_TTL", "0.45"))
+TREND_EDGE_FAVORABLE_MULT = float(_env("RIT_FINAL_RISKY_TREND_EDGE_FAVORABLE_MULT", "RIT_FINAL_TREND_EDGE_FAVORABLE_MULT", "0.88"))
+TREND_EDGE_ADVERSE_MULT = float(_env("RIT_FINAL_RISKY_TREND_EDGE_ADVERSE_MULT", "RIT_FINAL_TREND_EDGE_ADVERSE_MULT", "1.25"))
+TREND_STRICT_ACCEPT = _env_bool("RIT_FINAL_RISKY_TREND_STRICT_ACCEPT", "RIT_FINAL_TREND_STRICT_ACCEPT", "0")
+TREND_STRICT_MIN_CONF = float(_env("RIT_FINAL_RISKY_TREND_STRICT_MIN_CONF", "RIT_FINAL_TREND_STRICT_MIN_CONF", "0.75"))
+REGIME_SCORE_FAVORABLE = float(_env("RIT_FINAL_RISKY_REGIME_SCORE_FAVORABLE", "RIT_FINAL_REGIME_SCORE_FAVORABLE", "1.25"))
+REGIME_SCORE_ADVERSE = float(_env("RIT_FINAL_RISKY_REGIME_SCORE_ADVERSE", "RIT_FINAL_REGIME_SCORE_ADVERSE", "-1.25"))
+TREND_MIN_GAP_BPS = float(_env("RIT_FINAL_RISKY_TREND_MIN_GAP_BPS", "RIT_FINAL_TREND_MIN_GAP_BPS", "2.0"))
+RSI_HIGH = float(_env("RIT_FINAL_RISKY_RSI_HIGH", "RIT_FINAL_RSI_HIGH", "56"))
+RSI_LOW = float(_env("RIT_FINAL_RISKY_RSI_LOW", "RIT_FINAL_RSI_LOW", "44"))
+VOL_LOOKBACK = max(8, int(_env("RIT_FINAL_RISKY_VOL_LOOKBACK", "RIT_FINAL_VOL_LOOKBACK", "24")))
+VOL_HIGH = float(_env("RIT_FINAL_RISKY_VOL_HIGH", "RIT_FINAL_VOL_HIGH", "0.0030"))
+VOL_SHOCK = float(_env("RIT_FINAL_RISKY_VOL_SHOCK", "RIT_FINAL_VOL_SHOCK", "0.0060"))
 FLATTEN_FAVORABLE_MULT = float(_env("RIT_FINAL_RISKY_FLATTEN_FAVORABLE_MULT", "RIT_FINAL_FLATTEN_FAVORABLE_MULT", "0.70"))
 FLATTEN_ADVERSE_MULT = float(_env("RIT_FINAL_RISKY_FLATTEN_ADVERSE_MULT", "RIT_FINAL_FLATTEN_ADVERSE_MULT", "1.40"))
 FLATTEN_MIN_TICKET_QTY = float(_env("RIT_FINAL_RISKY_FLATTEN_MIN_TICKET_QTY", "RIT_FINAL_FLATTEN_MIN_TICKET_QTY", "2000"))
@@ -233,6 +247,19 @@ def save_run_report(session, reason, run_error=None):
             "HEDGE_ADVERSE_MULT": HEDGE_ADVERSE_MULT,
             "HEDGE_REGIME_REFRESH_SECS": HEDGE_REGIME_REFRESH_SECS,
             "HEDGE_MAX_TICKETS": HEDGE_MAX_TICKETS,
+            "REGIME_CACHE_TTL": REGIME_CACHE_TTL,
+            "TREND_EDGE_FAVORABLE_MULT": TREND_EDGE_FAVORABLE_MULT,
+            "TREND_EDGE_ADVERSE_MULT": TREND_EDGE_ADVERSE_MULT,
+            "TREND_STRICT_ACCEPT": TREND_STRICT_ACCEPT,
+            "TREND_STRICT_MIN_CONF": TREND_STRICT_MIN_CONF,
+            "REGIME_SCORE_FAVORABLE": REGIME_SCORE_FAVORABLE,
+            "REGIME_SCORE_ADVERSE": REGIME_SCORE_ADVERSE,
+            "TREND_MIN_GAP_BPS": TREND_MIN_GAP_BPS,
+            "RSI_HIGH": RSI_HIGH,
+            "RSI_LOW": RSI_LOW,
+            "VOL_LOOKBACK": VOL_LOOKBACK,
+            "VOL_HIGH": VOL_HIGH,
+            "VOL_SHOCK": VOL_SHOCK,
             "FLATTEN_FAVORABLE_MULT": FLATTEN_FAVORABLE_MULT,
             "FLATTEN_ADVERSE_MULT": FLATTEN_ADVERSE_MULT,
             "FLATTEN_MIN_TICKET_QTY": FLATTEN_MIN_TICKET_QTY,
@@ -585,62 +612,132 @@ def _order_book_imbalance(ob, levels):
     return (bid_qty - ask_qty) / total
 
 
-def _flatten_regime(session, ticker, unwind_action, ob):
+def _clip01(x):
+    return max(0.0, min(1.0, float(x)))
+
+
+def _stdev(values):
+    if not values:
+        return 0.0
+    mean = sum(values) / len(values)
+    var = sum((x - mean) ** 2 for x in values) / len(values)
+    return math.sqrt(max(0.0, var))
+
+
+def _realized_volatility(prices, lookback):
+    if len(prices) < 3:
+        return None
+    rets = []
+    start = max(1, len(prices) - lookback)
+    for i in range(start, len(prices)):
+        prev = max(0.01, float(prices[i - 1]))
+        curr = float(prices[i])
+        rets.append((curr - prev) / prev)
+    if len(rets) < 2:
+        return None
+    return _stdev(rets)
+
+
+def _flatten_regime(session, ticker, unwind_action, ob, cache=None):
+    now = time.monotonic()
+    cache_key = f"{ticker}|{unwind_action}"
+    if cache is not None:
+        cached = cache.get(cache_key)
+        if cached and (now - cached.get("ts", 0.0)) <= REGIME_CACHE_TTL:
+            return cached["regime"]
+
     prices = _get_tas_prices(session, ticker, MOM_TAS_LIMIT)
     ema_fast = _ema(prices, MOM_EMA_FAST) if prices else None
     ema_slow = _ema(prices, MOM_EMA_SLOW) if prices else None
     rsi = _rsi(prices, MOM_RSI_PERIOD) if prices else None
     imbalance = _order_book_imbalance(ob, MOM_IMBALANCE_LEVELS)
+    realized_vol = _realized_volatility(prices, VOL_LOOKBACK) if prices else None
 
-    favorable = 0
-    adverse = 0
+    score = 0.0
+    trend_bias = "FLAT"
+    momentum_bias = "NEUTRAL"
 
     if ema_fast is not None and ema_slow is not None:
-        trend_up = ema_fast >= ema_slow
-        if unwind_action == "SELL":
-            favorable += 1 if trend_up else 0
-            adverse += 0 if trend_up else 1
+        mid = max(0.01, (abs(ema_fast) + abs(ema_slow)) / 2.0)
+        gap_bps = ((ema_fast - ema_slow) / mid) * 10000.0
+        if gap_bps >= TREND_MIN_GAP_BPS:
+            trend_bias = "UP"
+        elif gap_bps <= -TREND_MIN_GAP_BPS:
+            trend_bias = "DOWN"
         else:
-            favorable += 0 if trend_up else 1
-            adverse += 1 if trend_up else 0
+            trend_bias = "FLAT"
+
+        if unwind_action == "SELL":
+            if trend_bias == "UP":
+                score += 1.4
+            elif trend_bias == "DOWN":
+                score -= 1.4
+        else:
+            if trend_bias == "DOWN":
+                score += 1.4
+            elif trend_bias == "UP":
+                score -= 1.4
 
     if rsi is not None:
-        if unwind_action == "SELL":
-            if rsi >= 52:
-                favorable += 1
-            elif rsi <= 48:
-                adverse += 1
+        if rsi >= RSI_HIGH:
+            momentum_bias = "UP"
+        elif rsi <= RSI_LOW:
+            momentum_bias = "DOWN"
         else:
-            if rsi <= 48:
-                favorable += 1
-            elif rsi >= 52:
-                adverse += 1
+            momentum_bias = "NEUTRAL"
+
+        if unwind_action == "SELL":
+            if momentum_bias == "UP":
+                score += 0.9
+            elif momentum_bias == "DOWN":
+                score -= 0.9
+        else:
+            if momentum_bias == "DOWN":
+                score += 0.9
+            elif momentum_bias == "UP":
+                score -= 0.9
 
     if unwind_action == "SELL":
         if imbalance >= MOM_IMBALANCE_THRESHOLD:
-            favorable += 1
+            score += 1.0
         elif imbalance <= -MOM_IMBALANCE_THRESHOLD:
-            adverse += 1
+            score -= 1.0
     else:
         if imbalance <= -MOM_IMBALANCE_THRESHOLD:
-            favorable += 1
+            score += 1.0
         elif imbalance >= MOM_IMBALANCE_THRESHOLD:
-            adverse += 1
+            score -= 1.0
 
-    if adverse >= 2 and adverse > favorable:
-        state = "ADVERSE"
-    elif favorable >= 2 and favorable >= adverse:
+    if realized_vol is not None:
+        if realized_vol >= VOL_SHOCK:
+            score -= 0.6
+        elif realized_vol >= VOL_HIGH:
+            score -= 0.3
+
+    if score >= REGIME_SCORE_FAVORABLE:
         state = "FAVORABLE"
+    elif score <= REGIME_SCORE_ADVERSE:
+        state = "ADVERSE"
     else:
         state = "NEUTRAL"
 
-    return {
+    confidence = _clip01(abs(score) / max(0.1, abs(REGIME_SCORE_FAVORABLE)))
+
+    regime = {
         "state": state,
+        "score": score,
+        "confidence": confidence,
+        "trend_bias": trend_bias,
+        "momentum_bias": momentum_bias,
+        "realized_vol": realized_vol,
         "ema_fast": ema_fast,
         "ema_slow": ema_slow,
         "rsi": rsi,
         "imbalance": imbalance,
     }
+    if cache is not None:
+        cache[cache_key] = {"ts": now, "regime": regime}
+    return regime
 
 
 def _is_unresolved_tender(tender):
@@ -774,6 +871,7 @@ def unwind_inventory(session, ticker, inventory):
     tickets = 0
     regime = {"state": "NEUTRAL", "imbalance": 0.0, "ema_fast": None, "ema_slow": None, "rsi": None}
     last_regime_refresh = 0.0
+    regime_cache = {}
 
     while remaining > 0 and tickets < HEDGE_MAX_TICKETS:
         ob = get_order_book_agg(session, ticker)
@@ -785,10 +883,11 @@ def unwind_inventory(session, ticker, inventory):
         if HEDGE_MOMENTUM_AWARE and (
             tickets == 0 or (now - last_regime_refresh) >= HEDGE_REGIME_REFRESH_SECS
         ):
-            regime = _flatten_regime(session, ticker, unwind_action, ob)
+            regime = _flatten_regime(session, ticker, unwind_action, ob, cache=regime_cache)
             last_regime_refresh = now
 
         state = regime["state"] if HEDGE_MOMENTUM_AWARE else "NEUTRAL"
+        confidence = float(regime.get("confidence", 0.0)) if HEDGE_MOMENTUM_AWARE else 0.0
         base_ticket = min(remaining, MAX_ORDER_SIZE, max(HEDGE_MIN_TICKET_QTY, remaining * 0.5))
         ticket_qty = _state_scaled_ticket(
             remaining,
@@ -796,6 +895,7 @@ def unwind_inventory(session, ticker, inventory):
             HEDGE_FAVORABLE_MULT,
             HEDGE_ADVERSE_MULT,
             state,
+            confidence=confidence,
         )
 
         top = levels[0]
@@ -810,18 +910,21 @@ def unwind_inventory(session, ticker, inventory):
         else:
             px = max(0.01, float(top["price"]) - 0.01)
 
-        submit_limit_order(session, top["ticker"], q, px, unwind_action)
-        time.sleep(ORDER_DELAY)
+        filled = 0.0
+        use_market_first = (state == "ADVERSE" and confidence >= 0.65)
+        if not use_market_first:
+            submit_limit_order(session, top["ticker"], q, px, unwind_action)
+            time.sleep(ORDER_DELAY)
 
-        pos_after = get_inventory_total(session, ticker)
-        if unwind_action == "BUY":
-            filled = max(0.0, pos_after - pos_before)
-        else:
-            filled = max(0.0, pos_before - pos_after)
-        pos_before = pos_after
+            pos_after = get_inventory_total(session, ticker)
+            if unwind_action == "BUY":
+                filled = max(0.0, pos_after - pos_before)
+            else:
+                filled = max(0.0, pos_before - pos_after)
+            pos_before = pos_after
 
-        # If a marketable limit does not fill quickly, use market ticket fallback.
-        if filled <= 0.5:
+        # If regime is adverse/high-confidence or a marketable limit did not fill quickly, use market fallback.
+        if use_market_first or filled <= 0.5:
             market_q = min(remaining, q, MAX_ORDER_SIZE)
             submit_market_order(session, ticker, market_q, unwind_action)
             pos_after = get_inventory_total(session, ticker)
@@ -835,14 +938,14 @@ def unwind_inventory(session, ticker, inventory):
         tickets += 1
         print(
             f"[HEDGE] ticker={ticker} action={unwind_action} state={state} "
-            f"ticket={q:.0f} filled={filled:.0f} rem={remaining:.0f}"
+            f"conf={confidence:.2f} ticket={q:.0f} filled={filled:.0f} rem={remaining:.0f}"
         )
 
     if remaining > 0:
         submit_market_order(session, ticker, remaining, unwind_action)
 
 
-def _action_edge_ok(my_action, tender_price, ob, tender_qty, attempt_idx):
+def _action_edge_ok(my_action, tender_price, ob, tender_qty, attempt_idx, regime=None):
     """
     Decide tender acceptance from executable economics:
     BUY tender -> hedge by selling into bids.
@@ -851,6 +954,16 @@ def _action_edge_ok(my_action, tender_price, ob, tender_qty, attempt_idx):
     eff_edge = MIN_EDGE
     if AGGRESSIVE_MODE:
         eff_edge = max(MIN_EDGE * EDGE_FLOOR_RATIO, MIN_EDGE - (EDGE_DECAY_PER_ATTEMPT * attempt_idx))
+    trend_blocked = False
+    if regime:
+        state = regime.get("state", "NEUTRAL")
+        conf = float(regime.get("confidence", 0.0))
+        if state == "FAVORABLE":
+            eff_edge *= TREND_EDGE_FAVORABLE_MULT
+        elif state == "ADVERSE":
+            eff_edge *= TREND_EDGE_ADVERSE_MULT
+            if TREND_STRICT_ACCEPT and conf >= TREND_STRICT_MIN_CONF:
+                trend_blocked = True
 
     decision_qty = max(1.0, min(float(tender_qty), BOOK_DECISION_QTY_CAP))
     imbalance = _order_book_imbalance(ob, MOM_IMBALANCE_LEVELS)
@@ -866,7 +979,8 @@ def _action_edge_ok(my_action, tender_price, ob, tender_qty, attempt_idx):
             edge_exec = exec_px - tender_price
 
         edge = max([e for e in (edge_top, edge_exec) if e is not None], default=None)
-        return (edge is not None and edge >= eff_edge), edge, eff_edge, imbalance, edge_top, edge_exec
+        ok = (edge is not None and edge >= eff_edge and not trend_blocked)
+        return ok, edge, eff_edge, imbalance, edge_top, edge_exec
 
     if my_action == "SELL":
         edge_top = None
@@ -879,7 +993,8 @@ def _action_edge_ok(my_action, tender_price, ob, tender_qty, attempt_idx):
             edge_exec = tender_price - exec_px
 
         edge = max([e for e in (edge_top, edge_exec) if e is not None], default=None)
-        return (edge is not None and edge >= eff_edge), edge, eff_edge, imbalance, edge_top, edge_exec
+        ok = (edge is not None and edge >= eff_edge and not trend_blocked)
+        return ok, edge, eff_edge, imbalance, edge_top, edge_exec
 
     return False, None, eff_edge, imbalance, None, None
 
@@ -920,8 +1035,10 @@ def evaluate_tender(session, tender):
         pass
 
     accepted = False
+    regime_cache = {}
     for i in range(attempts):
-        time.sleep(EVAL_DELAY)
+        if i > 0:
+            time.sleep(EVAL_DELAY)
         live = get_tender_map(session).get(tid)
         if live is None:
             print(f"Tender {tid} unavailable.")
@@ -937,14 +1054,17 @@ def evaluate_tender(session, tender):
         if live_qty > 0:
             tender_qty = live_qty
         live_action = _infer_my_action(live) or my_action
+        hedge_action = "SELL" if live_action == "BUY" else "BUY"
 
         ob = get_order_book_agg(session, ticker)
+        regime = _flatten_regime(session, ticker, hedge_action, ob, cache=regime_cache)
         edge_ok, edge, eff_edge, imbalance, edge_top, edge_exec = _action_edge_ok(
             live_action,
             tender_price,
             ob,
             tender_qty,
             i,
+            regime=regime,
         )
         if edge_ok:
             pre = get_inventory_total(session, ticker)
@@ -973,7 +1093,9 @@ def evaluate_tender(session, tender):
             f"edge={edge if edge is not None else 'N/A'} req={eff_edge:.3f} "
             f"top={edge_top if edge_top is not None else 'N/A'} "
             f"exec={edge_exec if edge_exec is not None else 'N/A'} "
-            f"imb={imbalance:.2f}"
+            f"imb={imbalance:.2f} regime={regime['state']} "
+            f"conf={regime.get('confidence', 0.0):.2f} "
+            f"trend={regime.get('trend_bias', 'N/A')}"
         )
 
     if not accepted:
@@ -990,26 +1112,37 @@ def close_positions(session):
             submit_market_order(session, ticker, abs(pos), action)
 
 
-def _state_scaled_ticket(abs_qty, min_ticket_qty, favorable_mult, adverse_mult, state):
+def _state_scaled_ticket(abs_qty, min_ticket_qty, favorable_mult, adverse_mult, state, confidence=1.0):
     ticket = max(1.0, min(float(abs_qty), float(min_ticket_qty)))
+    conf = _clip01(confidence)
+    scale = 1.0
     if state == "FAVORABLE":
-        ticket *= favorable_mult
+        scale = 1.0 + ((float(favorable_mult) - 1.0) * conf)
     elif state == "ADVERSE":
-        ticket *= adverse_mult
+        scale = 1.0 + ((float(adverse_mult) - 1.0) * conf)
+    ticket *= scale
     return max(1.0, min(float(abs_qty), float(MAX_ORDER_SIZE), ticket))
 
 
-def _ticket_qty_for_state(abs_pos, ticks_to_end, state):
+def _ticket_qty_for_state(abs_pos, ticks_to_end, state, confidence=1.0):
     base = abs_pos / max(1.0, float(ticks_to_end))
     base = max(1.0, base)
     ticket = max(base, min(FLATTEN_MIN_TICKET_QTY, abs_pos))
-    ticket = _state_scaled_ticket(abs_pos, ticket, FLATTEN_FAVORABLE_MULT, FLATTEN_ADVERSE_MULT, state)
+    ticket = _state_scaled_ticket(
+        abs_pos,
+        ticket,
+        FLATTEN_FAVORABLE_MULT,
+        FLATTEN_ADVERSE_MULT,
+        state,
+        confidence=confidence,
+    )
     return ticket
 
 
 def flatten_positions_ticketed(session, tick, tpp):
     ticks_to_end = max(0, int(tpp) - int(tick))
     any_pos = False
+    regime_cache = {}
     for s in get_securities(session):
         ticker = s.get("ticker")
         pos = float(s.get("position", 0.0))
@@ -1020,9 +1153,14 @@ def flatten_positions_ticketed(session, tick, tpp):
         unwind_action = "SELL" if pos > 0 else "BUY"
         abs_pos = abs(pos)
         ob = get_order_book_agg(session, ticker)
-        regime = _flatten_regime(session, ticker, unwind_action, ob)
+        regime = _flatten_regime(session, ticker, unwind_action, ob, cache=regime_cache)
 
-        ticket_qty = _ticket_qty_for_state(abs_pos, ticks_to_end, regime["state"])
+        ticket_qty = _ticket_qty_for_state(
+            abs_pos,
+            ticks_to_end,
+            regime["state"],
+            confidence=float(regime.get("confidence", 0.0)),
+        )
         if ticks_to_end <= FLATTEN_HARD_DEADLINE_TICKS + 1:
             ticket_qty = min(abs_pos, MAX_ORDER_SIZE)
 
@@ -1037,7 +1175,8 @@ def flatten_positions_ticketed(session, tick, tpp):
             f"[ENDGAME] ticker={ticker} action={unwind_action} "
             f"ticket={ticket_qty:.0f}/{abs_pos:.0f} state={regime['state']} "
             f"ema_f={ema_fast_s} ema_s={ema_slow_s} rsi={rsi_s} "
-            f"imb={regime['imbalance']:.2f} ticks_to_end={ticks_to_end}"
+            f"imb={regime['imbalance']:.2f} conf={regime.get('confidence', 0.0):.2f} "
+            f"trend={regime.get('trend_bias', 'N/A')} ticks_to_end={ticks_to_end}"
         )
 
     return not any_pos
