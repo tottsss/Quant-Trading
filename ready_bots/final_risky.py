@@ -36,6 +36,7 @@ EVAL_DELAY = float(_env("RIT_FINAL_RISKY_EVAL_DELAY", "RIT_FINAL_EVAL_DELAY", "0
 ORDER_DELAY = float(_env("RIT_FINAL_RISKY_ORDER_DELAY", "RIT_FINAL_ORDER_DELAY", "0.05"))
 AFTER_ACCEPT_DELAY = float(_env("RIT_FINAL_RISKY_AFTER_ACCEPT_DELAY", "RIT_FINAL_AFTER_ACCEPT_DELAY", "0.20"))
 MAX_ORDER_SIZE = 10000.0# Maximum order size
+DEPTH_LEVELS = max(1, int(_env("RIT_FINAL_RISKY_DEPTH_LEVELS", "RIT_DEPTH_LEVELS", "10")))
 ENDGAME_TICKS = int(_env("RIT_FINAL_RISKY_ENDGAME_TICKS", "RIT_FINAL_ENDGAME_TICKS", "2"))# Number of ticks to end the game
 FIXED_ONLY = _env_bool("RIT_FINAL_RISKY_FIXED_ONLY", "RIT_FINAL_FIXED_ONLY", "0")# Whether to only accept fixed tenders
 AGGRESSIVE_MODE = _env_bool("RIT_FINAL_RISKY_AGGRESSIVE", "RIT_FINAL_AGGRESSIVE", "1")
@@ -237,7 +238,7 @@ def _related_tickers(session, ticker):
 def get_order_book_agg(session, ticker):
     books = {}
     for tk in _related_tickers(session, ticker):
-        r = session.get(f"{BASE_URL}/securities/book", params={"ticker": tk, "limit": 60})
+        r = session.get(f"{BASE_URL}/securities/book", params={"ticker": tk, "limit": DEPTH_LEVELS})
         if r.ok:
             books[tk] = r.json()
 
@@ -257,6 +258,8 @@ def get_order_book_agg(session, ticker):
 
     bids.sort(key=lambda x: x["price"], reverse=True)
     asks.sort(key=lambda x: x["price"])
+    bids = bids[:DEPTH_LEVELS]
+    asks = asks[:DEPTH_LEVELS]
 
     bid_vol = sum(x["quantity"] for x in bids)
     ask_vol = sum(x["quantity"] for x in asks)
