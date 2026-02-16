@@ -64,12 +64,15 @@ TARGET_DELTA_FRAC = _envf("RIT_VOL2026_TARGET_DELTA_FRAC", "0.35")
 SAFE_OPEN_DELTA_FRAC = _envf("RIT_VOL2026_SAFE_OPEN_DELTA_FRAC", "0.60")
 MAX_HEDGE_STEPS = _envi("RIT_VOL2026_MAX_HEDGE_STEPS", "4")
 ENDGAME_BUFFER_TICKS = _envi("RIT_VOL2026_ENDGAME_BUFFER_TICKS", "20")
+VOL_WEEK_TICKS = max(1, _envi("RIT_VOL2026_VOL_WEEK_TICKS", "75"))
 
 OPTION_MAX_TRADE_SIZE = _envi("RIT_VOL2026_OPTION_MAX_TRADE_SIZE", "100")
 RTM_MAX_TRADE_SIZE = _envi("RIT_VOL2026_RTM_MAX_TRADE_SIZE", "10000")
 OPTION_CONTRACT_MULTIPLIER = 100
 OPTION_GROSS_LIMIT = _envi("RIT_VOL2026_OPTION_GROSS_LIMIT", "2500")
 OPTION_NET_LIMIT = _envi("RIT_VOL2026_OPTION_NET_LIMIT", "1000")
+PASSIVE_HEDGE_ENABLED = _env_bool("RIT_VOL2026_PASSIVE_HEDGE_ENABLED", "1")
+PASSIVE_HEDGE_QTY = max(1, _envi("RIT_VOL2026_PASSIVE_HEDGE_QTY", "500"))
 SAVE_REPORT_ON_EXIT = _env_bool("RIT_VOL2026_SAVE_REPORT_ON_EXIT", "1")
 REPORT_PREFIX = _env("RIT_VOL2026_REPORT_PREFIX", "volatility_ritc_2026_hybrid_report")
 REPORT_EVENTS_CAP = max(100, _envi("RIT_VOL2026_REPORT_EVENTS_CAP", "4000"))
@@ -191,11 +194,14 @@ def save_run_report(client: "RITClient", reason: str, run_error: str | None = No
         "SAFE_OPEN_DELTA_FRAC": SAFE_OPEN_DELTA_FRAC,
         "MAX_HEDGE_STEPS": MAX_HEDGE_STEPS,
         "ENDGAME_BUFFER_TICKS": ENDGAME_BUFFER_TICKS,
+        "VOL_WEEK_TICKS": VOL_WEEK_TICKS,
         "OPTION_MAX_TRADE_SIZE": OPTION_MAX_TRADE_SIZE,
         "RTM_MAX_TRADE_SIZE": RTM_MAX_TRADE_SIZE,
         "OPTION_CONTRACT_MULTIPLIER": OPTION_CONTRACT_MULTIPLIER,
         "OPTION_GROSS_LIMIT": OPTION_GROSS_LIMIT,
         "OPTION_NET_LIMIT": OPTION_NET_LIMIT,
+        "PASSIVE_HEDGE_ENABLED": PASSIVE_HEDGE_ENABLED,
+        "PASSIVE_HEDGE_QTY": PASSIVE_HEDGE_QTY,
         "REPORT_EVENTS_CAP": REPORT_EVENTS_CAP,
         "REPORT_TENDER_LOG_CAP": REPORT_TENDER_LOG_CAP,
         "REPORT_HEDGE_LOG_CAP": REPORT_HEDGE_LOG_CAP,
@@ -263,6 +269,19 @@ class RITClient:
 
     def get_limits(self):
         r = self._get("/limits")
+        r.raise_for_status()
+        return r.json()
+
+    def get_open_orders(self, ticker: str | None = None):
+        params = {"status": "OPEN"}
+        if ticker:
+            params["ticker"] = ticker
+        r = self._get("/orders", params=params)
+        r.raise_for_status()
+        return r.json()
+
+    def cancel_order(self, order_id: int):
+        r = self.session.delete(f"{self.base_url}/orders/{order_id}", timeout=self.timeout)
         r.raise_for_status()
         return r.json()
 
@@ -335,18 +354,39 @@ def best_bid_ask(client: RITClient, ticker: str):
     return bids[0]["price"], asks[0]["price"]
 
 
-def parse_vol_from_news(news_items):
-    vol = None
+def _extract_vol_from_text(text: str) -> float | None:
+    m = re.search(r"between\s+(\d+(?:\.\d+)?)%\s+and\s+(\d+(?:\.\d+)?)%", text, re.IGNORECASE)
+    if m:
+        return (float(m.group(1)) + float(m.group(2))) / 200.0
+    m = re.search(r"volatility[^\d]*(\d+(?:\.\d+)?)%", text, re.IGNORECASE)
+    if m:
+        return float(m.group(1)) / 100.0
+    m = re.search(r"\biv\b[^\d]*(\d+(?:\.\d+)?)%", text, re.IGNORECASE)
+    if m:
+        return float(m.group(1)) / 100.0
+    return None
+
+
+def _current_week_from_tick(current_tick: int | float) -> int:
+    return max(1, (int(current_tick) // VOL_WEEK_TICKS) + 1)
+
+
+def parse_vol_from_news(news_items, current_tick: int | float):
+    """
+    Returns a mapping {target_week: volatility_float}.
+    Vol forecasts tagged as "next week" are scheduled to next week.
+    """
+    current_week = _current_week_from_tick(current_tick)
+    forecasts = {}
     for n in news_items:
         text = (n.get("headline") or "") + " " + (n.get("body") or "")
-        m = re.search(r"between\s+(\d+(?:\.\d+)?)%\s+and\s+(\d+(?:\.\d+)?)%", text, re.IGNORECASE)
-        if m:
-            vol = (float(m.group(1)) + float(m.group(2))) / 200.0
+        vol = _extract_vol_from_text(text)
+        if vol is None:
             continue
-        m = re.search(r"volatility[^\d]*(\d+(?:\.\d+)?)%", text, re.IGNORECASE)
-        if m:
-            vol = float(m.group(1)) / 100.0
-    return vol
+        is_next_week = "next week" in text.lower()
+        target_week = current_week + 1 if is_next_week else current_week
+        forecasts[target_week] = float(vol)
+    return forecasts
 
 
 def parse_delta_limit(news_items, current_limit: int) -> int:
@@ -474,6 +514,36 @@ def place_limit_chunks(client: RITClient, ticker: str, action: str, qty: int, pr
         remaining -= chunk
 
 
+def place_rtm_limit_chunks(client: RITClient, action: str, qty: int, price: float):
+    remaining = int(max(0, qty))
+    while remaining > 0:
+        chunk = min(RTM_MAX_TRADE_SIZE, remaining)
+        try:
+            client.place_order("RTM", "LIMIT", chunk, action, price=price)
+            _bump_counter("limit_orders_submitted", 1)
+            _record_order_log(
+                "LIMIT",
+                ticker="RTM",
+                action=action,
+                quantity=int(chunk),
+                price=float(price),
+                status="submitted",
+            )
+        except Exception as exc:
+            _record_order_log(
+                "LIMIT",
+                ticker="RTM",
+                action=action,
+                quantity=int(chunk),
+                price=float(price),
+                status="failed",
+                error=str(exc),
+            )
+            _record_error("place_rtm_limit_chunks", exc, action=action, quantity=int(chunk), price=float(price))
+            raise
+        remaining -= chunk
+
+
 def place_rtm_market_chunks(client: RITClient, action: str, qty: int):
     remaining = int(max(0, qty))
     while remaining > 0:
@@ -510,6 +580,29 @@ def is_endgame(case: dict) -> bool:
     return int(tick) >= int(tpp) - ENDGAME_BUFFER_TICKS
 
 
+def _to_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _open_order_unfilled_qty(order: dict) -> int:
+    qty = _to_float(order.get("quantity", order.get("qty", 0.0)), 0.0)
+    filled = _to_float(
+        order.get(
+            "quantity_filled",
+            order.get("qty_filled", order.get("filled_quantity", order.get("quantity_transacted", 0.0))),
+        ),
+        0.0,
+    )
+    return max(0, int(qty - filled))
+
+
+def _same_price(a: float, b: float, tick_tol: float = 0.005) -> bool:
+    return abs(float(a) - float(b)) <= float(tick_tol)
+
+
 def main():
     if API_KEY == "YOUR_API_KEY":
         raise RuntimeError("Set RIT_API_KEY before running.")
@@ -518,7 +611,9 @@ def main():
     wait_until_active(client)
 
     last_news_id = 0
-    news_vol = None
+    vol_forecasts: dict[int, float] = {}
+    active_news_vol = None
+    active_news_week = None
     delta_limit = 10000
     penalty_rate = 0.0
     last_order_ts: dict[str, float] = {}
@@ -542,18 +637,45 @@ def main():
                 exit_reason = "case_inactive"
                 break
 
+            raw_tick = case.get("tick", 0)
+            current_tick = int(raw_tick) if isinstance(raw_tick, (int, float)) else 0
+            current_week = _current_week_from_tick(current_tick)
+
+            if active_news_week != current_week and current_week in vol_forecasts:
+                active_news_vol = float(vol_forecasts[current_week])
+                prior_week = active_news_week
+                active_news_week = current_week
+                _record_event(
+                    "news_vol_activated",
+                    week_index=int(current_week),
+                    active_news_vol=float(active_news_vol),
+                    previous_week=prior_week,
+                )
+
             news = client.get_news(since=last_news_id)
             if news:
                 last_news_id = max(n["news_id"] for n in news)
-                news_vol = parse_vol_from_news(news) or news_vol
                 delta_limit = parse_delta_limit(news, delta_limit)
                 penalty_rate = parse_penalty_rate(news, penalty_rate)
+                forecasts = parse_vol_from_news(news, current_tick)
+                for target_week, vol in sorted(forecasts.items()):
+                    vol_forecasts[int(target_week)] = float(vol)
+                    _record_event(
+                        "vol_forecast_update",
+                        target_week=int(target_week),
+                        vol=float(vol),
+                    )
+                if current_week in vol_forecasts:
+                    active_news_vol = float(vol_forecasts[current_week])
+                    active_news_week = current_week
                 _bump_counter("news_updates", 1)
                 _record_event(
                     "news_update",
                     count=len(news),
                     last_news_id=int(last_news_id),
-                    news_vol=news_vol,
+                    active_news_vol=active_news_vol,
+                    active_news_week=active_news_week,
+                    queued_news_vol=vol_forecasts.get(current_week + 1),
                     delta_limit=int(delta_limit),
                     penalty_rate=float(penalty_rate),
                 )
@@ -581,13 +703,12 @@ def main():
             last_rtm_mid = S
 
             realized_vol = compute_realized_vol(rtm_returns)
-            sigma = news_vol if news_vol is not None else (realized_vol if realized_vol is not None else FALLBACK_SIGMA)
+            sigma = active_news_vol if active_news_vol is not None else (realized_vol if realized_vol is not None else FALLBACK_SIGMA)
 
             positions = {s["ticker"]: int(s.get("position", 0)) for s in client.get_securities()}
             delta = compute_portfolio_delta(S, positions, sigma)
             near_end = is_endgame(case)
             open_limit = max(100.0, SAFE_OPEN_DELTA_FRAC * abs(delta_limit))
-            hedge_limit = max(100.0, HEDGE_TRIGGER * abs(delta_limit))
             target_delta = max(50.0, TARGET_DELTA_FRAC * abs(delta_limit))
 
             now = time.time()
@@ -612,10 +733,10 @@ def main():
                     price = None
                     if edge > PRICE_THRESHOLD:
                         action = "BUY"
-                        price = bid
+                        price = ask
                     elif edge < -PRICE_THRESHOLD:
                         action = "SELL"
-                        price = ask
+                        price = bid
                     else:
                         continue
 
@@ -642,7 +763,9 @@ def main():
                         sigma=float(sigma),
                     )
 
-            if not near_end and realized_vol is not None and now - last_straddle_ts >= STRADDLE_COOLDOWN_SECS:
+            straddle_ref_vol = active_news_vol if active_news_vol is not None else realized_vol
+            straddle_ref_source = "news" if active_news_vol is not None else "realized"
+            if not near_end and straddle_ref_vol is not None and now - last_straddle_ts >= STRADDLE_COOLDOWN_SECS:
                 atm = choose_atm_strike(S)
                 call_ticker = f"RTM1C{atm}"
                 put_ticker = f"RTM1P{atm}"
@@ -656,7 +779,7 @@ def main():
                     iv_put = implied_vol(S, float(atm), ASSUMED_T_YEARS, RISK_FREE, put_mid, call=False)
                     if iv_call is not None and iv_put is not None:
                         iv_avg = (iv_call + iv_put) / 2.0
-                        vol_edge = iv_avg - realized_vol
+                        vol_edge = iv_avg - straddle_ref_vol
                         call_pos = positions.get(call_ticker, 0)
                         put_pos = positions.get(put_ticker, 0)
 
@@ -665,14 +788,14 @@ def main():
                             if can_open_option_trade(positions, call_ticker, "SELL", STRADDLE_QTY):
                                 call_delta_after = delta + option_delta_change(S, sigma, call_ticker, "SELL", STRADDLE_QTY)
                                 if abs(call_delta_after) < open_limit or abs(call_delta_after) < abs(delta):
-                                    place_limit_chunks(client, call_ticker, "SELL", STRADDLE_QTY, call_ask)
+                                    place_limit_chunks(client, call_ticker, "SELL", STRADDLE_QTY, call_bid)
                                     positions[call_ticker] = call_pos - STRADDLE_QTY
                                     delta = call_delta_after
                                     legs += 1
                             if can_open_option_trade(positions, put_ticker, "SELL", STRADDLE_QTY):
                                 put_delta_after = delta + option_delta_change(S, sigma, put_ticker, "SELL", STRADDLE_QTY)
                                 if abs(put_delta_after) < open_limit or abs(put_delta_after) < abs(delta):
-                                    place_limit_chunks(client, put_ticker, "SELL", STRADDLE_QTY, put_ask)
+                                    place_limit_chunks(client, put_ticker, "SELL", STRADDLE_QTY, put_bid)
                                     positions[put_ticker] = put_pos - STRADDLE_QTY
                                     delta = put_delta_after
                                     legs += 1
@@ -686,21 +809,23 @@ def main():
                                     legs=int(legs),
                                     vol_edge=float(vol_edge),
                                     iv_avg=float(iv_avg),
-                                    realized_vol=float(realized_vol),
+                                    ref_vol=float(straddle_ref_vol),
+                                    ref_source=straddle_ref_source,
+                                    realized_vol=realized_vol,
                                 )
                         elif vol_edge < -STRADDLE_EDGE_THRESHOLD:
                             legs = 0
                             if can_open_option_trade(positions, call_ticker, "BUY", STRADDLE_QTY):
                                 call_delta_after = delta + option_delta_change(S, sigma, call_ticker, "BUY", STRADDLE_QTY)
                                 if abs(call_delta_after) < open_limit or abs(call_delta_after) < abs(delta):
-                                    place_limit_chunks(client, call_ticker, "BUY", STRADDLE_QTY, call_bid)
+                                    place_limit_chunks(client, call_ticker, "BUY", STRADDLE_QTY, call_ask)
                                     positions[call_ticker] = call_pos + STRADDLE_QTY
                                     delta = call_delta_after
                                     legs += 1
                             if can_open_option_trade(positions, put_ticker, "BUY", STRADDLE_QTY):
                                 put_delta_after = delta + option_delta_change(S, sigma, put_ticker, "BUY", STRADDLE_QTY)
                                 if abs(put_delta_after) < open_limit or abs(put_delta_after) < abs(delta):
-                                    place_limit_chunks(client, put_ticker, "BUY", STRADDLE_QTY, put_bid)
+                                    place_limit_chunks(client, put_ticker, "BUY", STRADDLE_QTY, put_ask)
                                     positions[put_ticker] = put_pos + STRADDLE_QTY
                                     delta = put_delta_after
                                     legs += 1
@@ -714,35 +839,136 @@ def main():
                                     legs=int(legs),
                                     vol_edge=float(vol_edge),
                                     iv_avg=float(iv_avg),
-                                    realized_vol=float(realized_vol),
+                                    ref_vol=float(straddle_ref_vol),
+                                    ref_source=straddle_ref_source,
+                                    realized_vol=realized_vol,
                                 )
 
-            if abs(delta_limit) > 0 and abs(delta) > hedge_limit:
-                for _ in range(MAX_HEDGE_STEPS):
-                    if abs(delta) <= target_delta:
-                        break
+            if abs(delta_limit) > 0:
+                soft_limit = max(100.0, SAFE_OPEN_DELTA_FRAC * abs(delta_limit))
+                hard_limit = max(100.0, HEDGE_TRIGGER * abs(delta_limit))
+                if abs(delta) > soft_limit:
                     action = "SELL" if delta > 0 else "BUY"
-                    required = max(1, int(abs(delta) - target_delta))
-                    hedge_qty = min(RTM_HEDGE_QTY, RTM_MAX_TRADE_SIZE, required)
-                    before_delta = delta
-                    place_rtm_market_chunks(client, action, hedge_qty)
-                    delta = delta - hedge_qty if action == "SELL" else delta + hedge_qty
-                    _bump_counter("delta_hedge_steps", 1)
-                    _record_event(
-                        "delta_hedge",
-                        action=action,
-                        quantity=int(hedge_qty),
-                        delta_before=float(before_delta),
-                        delta_after=float(delta),
-                        target_delta=float(target_delta),
-                    )
+                    passive_price = rtm_ask if action == "SELL" else rtm_bid
+
+                    try:
+                        open_rtm_orders = client.get_open_orders(ticker="RTM")
+                    except Exception as exc:
+                        _record_error("get_open_orders", exc)
+                        open_rtm_orders = []
+
+                    pending_hedge_qty = 0
+                    for order in open_rtm_orders if isinstance(open_rtm_orders, list) else []:
+                        order_id = order.get("order_id")
+                        order_action = str(order.get("action", "")).upper()
+                        order_price = _to_float(order.get("price", 0.0), 0.0)
+                        unfilled_qty = _open_order_unfilled_qty(order)
+                        is_stale = (order_action != action) or (not _same_price(order_price, passive_price))
+                        if is_stale:
+                            if order_id is None:
+                                continue
+                            try:
+                                client.cancel_order(int(order_id))
+                                _bump_counter("cancelled_orders", 1)
+                                _record_order_log(
+                                    "CANCEL",
+                                    ticker="RTM",
+                                    order_id=int(order_id),
+                                    action=order_action,
+                                    price=order_price,
+                                    quantity_unfilled=int(unfilled_qty),
+                                    status="cancelled",
+                                )
+                            except Exception as exc:
+                                _record_error("cancel_order", exc, order_id=order_id, ticker="RTM")
+                        else:
+                            pending_hedge_qty += int(unfilled_qty)
+
+                    total_required = max(0, int(abs(delta) - target_delta))
+                    net_required = max(0, total_required - int(pending_hedge_qty))
+                    if net_required > 0:
+                        hedge_qty = min(RTM_HEDGE_QTY, RTM_MAX_TRADE_SIZE, net_required)
+
+                        if abs(delta) > hard_limit:
+                            before_delta = delta
+                            place_rtm_market_chunks(client, action, hedge_qty)
+                            delta = delta - hedge_qty if action == "SELL" else delta + hedge_qty
+                            _bump_counter("hard_delta_hedges", 1)
+                            _record_event(
+                                "delta_hedge_hard_market",
+                                action=action,
+                                quantity=int(hedge_qty),
+                                delta_before=float(before_delta),
+                                delta_after=float(delta),
+                                soft_limit=float(soft_limit),
+                                hard_limit=float(hard_limit),
+                                target_delta=float(target_delta),
+                                pending_hedge_qty=int(pending_hedge_qty),
+                                total_required=int(total_required),
+                                net_required=int(net_required),
+                            )
+                        elif PASSIVE_HEDGE_ENABLED:
+                            place_rtm_limit_chunks(client, action, hedge_qty, passive_price)
+                            _bump_counter("soft_delta_hedges", 1)
+                            _record_event(
+                                "delta_hedge_soft_passive",
+                                action=action,
+                                quantity=int(hedge_qty),
+                                price=float(passive_price),
+                                delta=float(delta),
+                                soft_limit=float(soft_limit),
+                                hard_limit=float(hard_limit),
+                                target_delta=float(target_delta),
+                                pending_hedge_qty=int(pending_hedge_qty),
+                                total_required=int(total_required),
+                                net_required=int(net_required),
+                            )
+                    else:
+                        _record_event(
+                            "delta_hedge_pending_sufficient",
+                            action=action,
+                            delta=float(delta),
+                            soft_limit=float(soft_limit),
+                            hard_limit=float(hard_limit),
+                            target_delta=float(target_delta),
+                            pending_hedge_qty=int(pending_hedge_qty),
+                            total_required=int(total_required),
+                            net_required=int(net_required),
+                        )
+                else:
+                    # No hedge needed: clear resting RTM hedge orders to avoid stale exposure.
+                    try:
+                        open_rtm_orders = client.get_open_orders(ticker="RTM")
+                    except Exception as exc:
+                        _record_error("get_open_orders_clear", exc)
+                        open_rtm_orders = []
+                    for order in open_rtm_orders if isinstance(open_rtm_orders, list) else []:
+                        order_id = order.get("order_id")
+                        if order_id is None:
+                            continue
+                        try:
+                            client.cancel_order(int(order_id))
+                            _bump_counter("cancelled_orders", 1)
+                            _record_order_log(
+                                "CANCEL",
+                                ticker="RTM",
+                                order_id=int(order_id),
+                                action=str(order.get("action", "")).upper(),
+                                price=_to_float(order.get("price", 0.0), 0.0),
+                                quantity_unfilled=int(_open_order_unfilled_qty(order)),
+                                status="cancelled",
+                            )
+                        except Exception as exc:
+                            _record_error("cancel_order_clear", exc, order_id=order_id, ticker="RTM")
 
             if now - last_status_print >= PRINT_INTERVAL_SECS:
                 rv = f"{realized_vol:.3f}" if realized_vol is not None else "n/a"
-                nv = f"{news_vol:.3f}" if news_vol is not None else "n/a"
+                nv = f"{active_news_vol:.3f}" if active_news_vol is not None else "n/a"
+                queued_news_vol = vol_forecasts.get(current_week + 1)
+                qv = f"{queued_news_vol:.3f}" if queued_news_vol is not None else "n/a"
                 usage = (abs(delta) / max(1.0, abs(delta_limit))) * 100.0
                 print(
-                    f"[VOL] sigma={sigma:.3f} news={nv} realized={rv} "
+                    f"[VOL] sigma={sigma:.3f} news={nv} queued={qv} realized={rv} "
                     f"delta={delta:.0f} limit={delta_limit} usage={usage:.1f}% "
                     f"penalty_rate={penalty_rate:.2f} near_end={near_end}"
                 )
@@ -751,7 +977,9 @@ def main():
                     tick=case.get("tick"),
                     ticks_per_period=case.get("ticks_per_period"),
                     sigma=float(sigma),
-                    news_vol=news_vol,
+                    news_vol=active_news_vol,
+                    queued_news_vol=queued_news_vol,
+                    current_week=int(current_week),
                     realized_vol=realized_vol,
                     delta=float(delta),
                     delta_limit=int(delta_limit),
