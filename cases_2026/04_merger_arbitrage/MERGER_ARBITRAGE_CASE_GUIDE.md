@@ -62,6 +62,12 @@ The production script in this repo is:
 - `ready_bots/finbert_hft/fast_inference.py`
   - Low-latency ONNX Runtime inference wrapper (`FinBERTTrader`) for batch-size=1 loops.
 
+- `ready_bots/finbert_hft/README.md`
+  - End-to-end setup commands (deps, export, benchmark, merger bot integration).
+
+- `ready_bots/finbert_hft/requirements.txt`
+  - Python dependencies for the FinBERT ONNX toolchain.
+
 ## 3) What The Production Bot Does
 
 ## 3.1 Startup and model init
@@ -82,8 +88,8 @@ The news worker polls `/news` incrementally (`since=last_news_id`) and classifie
 
 Parser stack:
 
-- keyword/rule parser (with negation handling),
-- optional FinBERT sentiment override layer,
+- FinBERT sentiment classifier (primary and required),
+- explicit category tag parsing (`REG/FIN/SHR/ALT/PRC`) from headline/body when present,
 - manual console override (`D1 POS L`, `D3 P 0.72`).
 
 Probability update:
@@ -134,7 +140,7 @@ Default log path:
 
 ## 4) FinBERT Defaults (Now Default-On)
 
-FinBERT mode is enabled by default:
+FinBERT mode is enabled by default and required:
 
 - `RIT_MA_USE_FINBERT=1` (default)
 
@@ -143,7 +149,7 @@ Default path assumptions:
 - ONNX model: `ready_bots/finbert_hft/model_opt_int8.onnx`
 - tokenizer/model dir: `ready_bots/finbert_hft/local_finbert`
 
-If those exact paths are missing, the bot tries nearby fallback paths and then safely falls back to keyword-only parsing.
+If those exact paths are missing, the bot tries nearby fallback paths and then exits with an explicit startup error (no keyword fallback).
 
 Override env vars when needed:
 
@@ -152,7 +158,6 @@ Override env vars when needed:
 - `RIT_MA_FINBERT_POS_THRESHOLD`
 - `RIT_MA_FINBERT_NEG_THRESHOLD`
 - `RIT_MA_FINBERT_GAP_THRESHOLD`
-- `RIT_MA_FINBERT_OVERRIDE_GAP`
 - `RIT_MA_FINBERT_CATEGORY_FALLBACK`
 
 ## 5) Typical Run Flow
@@ -172,4 +177,3 @@ Override env vars when needed:
 - Stale order cancellation.
 - Hedge drift correction.
 - Full post-heat observability in one JSON record.
-

@@ -149,10 +149,14 @@ FINBERT_MAX_LENGTH = int(os.environ.get("RIT_MA_FINBERT_MAX_LENGTH", "128"))
 FINBERT_POS_THRESHOLD = float(os.environ.get("RIT_MA_FINBERT_POS_THRESHOLD", "0.56"))
 FINBERT_NEG_THRESHOLD = float(os.environ.get("RIT_MA_FINBERT_NEG_THRESHOLD", "0.56"))
 FINBERT_GAP_THRESHOLD = float(os.environ.get("RIT_MA_FINBERT_GAP_THRESHOLD", "0.08"))
-FINBERT_OVERRIDE_GAP = float(os.environ.get("RIT_MA_FINBERT_OVERRIDE_GAP", "0.22"))
 FINBERT_SEV_MEDIUM = float(os.environ.get("RIT_MA_FINBERT_SEV_MEDIUM", "0.65"))
 FINBERT_SEV_LARGE = float(os.environ.get("RIT_MA_FINBERT_SEV_LARGE", "0.80"))
 FINBERT_CATEGORY_FALLBACK = os.environ.get("RIT_MA_FINBERT_CATEGORY_FALLBACK", "FIN").strip().upper()
+
+if not USE_FINBERT:
+    raise RuntimeError(
+        "Keyword parser has been removed. This strategy is FinBERT-only; set RIT_MA_USE_FINBERT=1."
+    )
 
 # Risk limits from case package
 GROSS_LIMIT = 100_000
@@ -226,126 +230,9 @@ BASE_CHANGE = {
 
 CATEGORY_MULT = {"REG": 1.25, "FIN": 1.00, "SHR": 0.90, "ALT": 1.40, "PRC": 0.70}
 
-CATEGORY_KEYWORDS = {
-    "REG": [
-        "regulator",
-        "regulatory",
-        "antitrust",
-        "doj",
-        "cma",
-        "competition",
-        "clearance",
-        "approval",
-        "approved",
-        "blocked",
-        "injunction",
-        "ftc",
-    ],
-    "FIN": [
-        "financing",
-        "financing package",
-        "financing secured",
-        "debt",
-        "credit",
-        "loan",
-        "bridge loan",
-        "covenant",
-        "liquidity",
-        "capital raise",
-        "funding",
-    ],
-    "SHR": [
-        "shareholder",
-        "board",
-        "proxy",
-        "vote",
-        "investor",
-        "activist",
-        "recommendation",
-        "special committee",
-    ],
-    "ALT": [
-        "competing bid",
-        "rival bid",
-        "topping bid",
-        "alternative proposal",
-        "go-shop",
-        "renegotiate",
-        "higher offer",
-        "counterbid",
-    ],
-    "PRC": [
-        "timeline",
-        "delay",
-        "extended",
-        "extension",
-        "process",
-        "closing date",
-        "condition",
-        "termination right",
-        "deadline",
-    ],
-}
-
-POSITIVE_WORDS = [
-    "approve",
-    "approved",
-    "clear",
-    "cleared",
-    "support",
-    "favorable",
-    "progress",
-    "secured",
-    "confident",
-    "raised bid",
-    "sweetened",
-]
-NEGATIVE_WORDS = [
-    "block",
-    "blocked",
-    "reject",
-    "rejected",
-    "sue",
-    "lawsuit",
-    "terminate",
-    "termination",
-    "withdraw",
-    "delay",
-    "challenge",
-    "concern",
-]
-
-LARGE_WORDS = [
-    "major",
-    "significant",
-    "material",
-    "definitive",
-    "terminated",
-    "blocked",
-    "injunction granted",
-    "deal canceled",
-]
-MEDIUM_WORDS = [
-    "review",
-    "investigation",
-    "concern",
-    "hearing",
-    "vote scheduled",
-    "financing risk",
-    "renegotiate",
-]
-
-NEGATION_WORDS = ["not", "no", "never", "without"]
-NEGATIVE_WORD_REVERSAL = ["dismissed", "dropped", "denied", "cleared", "rejected"]
-
 # Explicit code parsing (works if RIT headline includes tags like "REG", "NEG", "L").
 CATEGORY_RE = re.compile(r"\b(REG|FIN|SHR|ALT|PRC)\b", re.IGNORECASE)
-DIRECTION_RE = re.compile(r"\b(POS|NEG|POSITIVE|NEGATIVE)\b", re.IGNORECASE)
-SEVERITY_WORD_RE = re.compile(r"\b(SMALL|MEDIUM|LARGE)\b", re.IGNORECASE)
-SEVERITY_TAG_RE = re.compile(r"\bSEV(?:ERITY)?\s*[:=]\s*(S|M|L)\b", re.IGNORECASE)
 DEAL_RE = re.compile(r"\bD([1-5])\b", re.IGNORECASE)
-NEG_BEFORE_TEMPLATE = rf"\b(?:{'|'.join(NEGATION_WORDS)})\b(?:\W+\w+){{0,3}}\W+{{}}"
-REVERSAL_AFTER_TEMPLATE = rf"{{}}\W+(?:\w+\W+){{0,3}}\b(?:{'|'.join(NEGATIVE_WORD_REVERSAL)})\b"
 
 
 def now_ts() -> str:
@@ -604,98 +491,11 @@ def infer_standalone_value(target_start: float, p0: float, k0: float) -> float:
     return (target_start - p0 * k0) / (1.0 - p0)
 
 
-def classify_category(text_lower: str) -> Optional[str]:
-    code_match = CATEGORY_RE.search(text_lower.upper())
+def classify_category(text: str) -> Optional[str]:
+    code_match = CATEGORY_RE.search(text.upper())
     if code_match:
         return code_match.group(1).upper()
-    best_cat = None
-    best_score = 0
-    for cat, words in CATEGORY_KEYWORDS.items():
-        score = sum(1 for w in words if w in text_lower)
-        if score > best_score:
-            best_score = score
-            best_cat = cat
-    return best_cat
-
-
-def _count_keyword_occurrences(text_lower: str, keyword: str) -> int:
-    return len(re.findall(rf"\b{re.escape(keyword)}\b", text_lower))
-
-
-def _count_negated_keyword_occurrences(text_lower: str, keyword: str) -> int:
-    pattern = NEG_BEFORE_TEMPLATE.format(rf"\b{re.escape(keyword)}\b")
-    return len(re.findall(pattern, text_lower, flags=re.IGNORECASE))
-
-
-def _count_reversed_negative_occurrences(text_lower: str, keyword: str) -> int:
-    pattern = REVERSAL_AFTER_TEMPLATE.format(rf"\b{re.escape(keyword)}\b")
-    return len(re.findall(pattern, text_lower, flags=re.IGNORECASE))
-
-
-def classify_direction(text_lower: str) -> Optional[str]:
-    code_match = DIRECTION_RE.search(text_lower.upper())
-    if code_match:
-        token = code_match.group(1).upper()
-        return "POS" if token.startswith("POS") else "NEG"
-
-    pos_score = 0.0
-    neg_score = 0.0
-
-    for kw in POSITIVE_WORDS:
-        total = _count_keyword_occurrences(text_lower, kw)
-        if total == 0:
-            continue
-        negated = _count_negated_keyword_occurrences(text_lower, kw)
-        pos_score += max(0, total - negated)
-        neg_score += 1.20 * negated
-
-    for kw in NEGATIVE_WORDS:
-        total = _count_keyword_occurrences(text_lower, kw)
-        if total == 0:
-            continue
-        negated = _count_negated_keyword_occurrences(text_lower, kw)
-        reversed_after = _count_reversed_negative_occurrences(text_lower, kw)
-        effective_negated = negated + reversed_after
-        neg_score += max(0, total - effective_negated)
-        pos_score += 1.25 * effective_negated
-
-    # Extra explicit phrase handling for double negatives like "not to block".
-    if re.search(r"\b(?:not|never|no)\b(?:\W+\w+){0,3}\W+\b(?:block|reject|terminate|withdraw)\b", text_lower):
-        pos_score += 2.0
-    if re.search(r"\b(?:not|never|no)\b(?:\W+\w+){0,3}\W+\b(?:approve|clear|support|secure)\b", text_lower):
-        neg_score += 2.0
-
-    if pos_score == neg_score == 0:
-        return None
-    if abs(pos_score - neg_score) < 0.2:
-        return None
-    if pos_score >= neg_score:
-        return "POS"
-    return "NEG"
-
-
-def classify_severity(text_lower: str) -> str:
-    code_match = SEVERITY_TAG_RE.search(text_lower.upper())
-    if code_match:
-        token = code_match.group(1).upper()
-        if token == "L":
-            return "L"
-        if token == "M":
-            return "M"
-        return "S"
-    code_match = SEVERITY_WORD_RE.search(text_lower.upper())
-    if code_match:
-        token = code_match.group(1).upper()
-        if token == "LARGE":
-            return "L"
-        if token == "MEDIUM":
-            return "M"
-        return "S"
-    if any(w in text_lower for w in LARGE_WORDS):
-        return "L"
-    if any(w in text_lower for w in MEDIUM_WORDS):
-        return "M"
-    return "S"
+    return None
 
 
 def extract_referenced_deals(text: str, deal_tickers: Dict[str, str]) -> List[str]:
@@ -967,15 +767,13 @@ class MergerArbBot:
 
     def _initialize_finbert(self) -> None:
         if not USE_FINBERT:
-            return
+            raise RuntimeError("This strategy is FinBERT-only and requires RIT_MA_USE_FINBERT=1.")
         model_path, tokenizer_path, note = _detect_finbert_assets(FINBERT_ONNX_MODEL, FINBERT_TOKENIZER_DIR)
         if model_path is None or tokenizer_path is None:
-            log(f"FINBERT disabled: {note}", level="WARN")
-            return
+            raise RuntimeError(f"FinBERT assets missing: {note}")
         trader_cls, err = _load_finbert_trader_class()
         if trader_cls is None:
-            log(f"FINBERT unavailable: {err}", level="WARN")
-            return
+            raise RuntimeError(f"FinBERT module unavailable: {err}")
         try:
             self.finbert = trader_cls(
                 onnx_model_path=str(model_path),
@@ -990,11 +788,7 @@ class MergerArbBot:
                 f"pos_thr={FINBERT_POS_THRESHOLD:.2f} neg_thr={FINBERT_NEG_THRESHOLD:.2f}",
             )
         except Exception as exc:
-            self.finbert = None
-            self.finbert_enabled = False
-            self.finbert_model_path = None
-            self.finbert_tokenizer_path = None
-            log(f"FINBERT init failed: {exc}", level="WARN")
+            raise RuntimeError(f"FinBERT init failed: {exc}") from exc
 
     def _finbert_infer_direction(self, text: str) -> Tuple[Optional[str], str, Optional[dict]]:
         if self.finbert is None:
@@ -1241,7 +1035,6 @@ class MergerArbBot:
                     headline = str(item.get("headline") or "")
                     body = str(item.get("body") or "")
                     text = (headline + " " + body).strip()
-                    text_lower = text.lower()
                     refs = extract_referenced_deals(text, self.deal_ticker_to_id)
 
                     self.last_news_id = max(self.last_news_id, news_id)
@@ -1259,38 +1052,16 @@ class MergerArbBot:
                             )
                         continue
 
-                    cat = classify_category(text_lower)
-                    keyword_direction = classify_direction(text_lower)
-                    keyword_severity = classify_severity(text_lower)
-                    direction = keyword_direction
-                    severity = keyword_severity
+                    cat = classify_category(text)
+                    if cat is None and FINBERT_CATEGORY_FALLBACK in CATEGORY_MULT:
+                        cat = FINBERT_CATEGORY_FALLBACK
 
-                    finbert_direction = None
-                    finbert_severity = "S"
-                    finbert_meta = None
-                    if self.finbert_enabled:
-                        finbert_direction, finbert_severity, finbert_meta = self._finbert_infer_direction(text)
-                        if direction is None and finbert_direction is not None:
-                            direction = finbert_direction
-                        elif (
-                            direction is not None
-                            and finbert_direction is not None
-                            and finbert_direction != direction
-                            and finbert_meta is not None
-                            and float(finbert_meta.get("gap", 0.0)) >= FINBERT_OVERRIDE_GAP
-                        ):
-                            # Allow high-confidence model prediction to override ambiguous keyword polarity.
-                            direction = finbert_direction
-                        if finbert_severity == "L" or (finbert_severity == "M" and severity == "S"):
-                            severity = finbert_severity
-                        if cat is None and direction is not None and FINBERT_CATEGORY_FALLBACK in CATEGORY_MULT:
-                            cat = FINBERT_CATEGORY_FALLBACK
+                    finbert_direction, finbert_severity, finbert_meta = self._finbert_infer_direction(text)
+                    direction = finbert_direction
+                    severity = finbert_severity
 
                     classifier_meta = {
-                        "keyword": {
-                            "direction": keyword_direction,
-                            "severity": keyword_severity,
-                        },
+                        "mode": "finbert_only",
                         "finbert": {
                             "enabled": self.finbert_enabled,
                             "direction": finbert_direction,
@@ -1300,6 +1071,7 @@ class MergerArbBot:
                     }
 
                     if cat is None or direction is None:
+                        skip_reason = "CLASSIFICATION_INCOMPLETE" if cat is None else "NO_FINBERT_SIGNAL"
                         log(
                             f"NEWS_SKIP id={news_id} refs={','.join(refs)} "
                             f"cat={cat} dir={direction} sev={severity} head='{headline[:90]}'"
@@ -1313,7 +1085,7 @@ class MergerArbBot:
                                 severity=severity,
                                 applied=[],
                                 skipped=True,
-                                skip_reason="CLASSIFICATION_INCOMPLETE",
+                                skip_reason=skip_reason,
                                 classifier_meta=classifier_meta,
                             )
                         continue
@@ -1730,7 +1502,6 @@ class MergerArbBot:
                         "FINBERT_POS_THRESHOLD": FINBERT_POS_THRESHOLD,
                         "FINBERT_NEG_THRESHOLD": FINBERT_NEG_THRESHOLD,
                         "FINBERT_GAP_THRESHOLD": FINBERT_GAP_THRESHOLD,
-                        "FINBERT_OVERRIDE_GAP": FINBERT_OVERRIDE_GAP,
                         "FINBERT_CATEGORY_FALLBACK": FINBERT_CATEGORY_FALLBACK,
                     },
                 }
