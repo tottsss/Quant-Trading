@@ -68,8 +68,30 @@ AGGRESSIVE_MODE = _env_bool("RIT_FINAL_RISKY_AGGRESSIVE", "RIT_FINAL_AGGRESSIVE"
 EDGE_FLOOR_RATIO = float(_env("RIT_FINAL_RISKY_EDGE_FLOOR_RATIO", "RIT_FINAL_EDGE_FLOOR_RATIO", "0.15"))
 EDGE_DECAY_PER_ATTEMPT = float(_env("RIT_FINAL_RISKY_EDGE_DECAY_PER_ATTEMPT", "RIT_FINAL_EDGE_DECAY_PER_ATTEMPT", "0.020"))
 VOL_RELAX_PER_ATTEMPT = float(_env("RIT_FINAL_RISKY_VOL_RELAX_PER_ATTEMPT", "RIT_FINAL_VOL_RELAX_PER_ATTEMPT", "0.12"))
-HEDGE_RATIO = float(_env("RIT_FINAL_RISKY_HEDGE_RATIO", "RIT_FINAL_HEDGE_RATIO", "0.25" if AGGRESSIVE_MODE else "0.70"))
+HEDGE_RATIO = float(_env("RIT_FINAL_RISKY_HEDGE_RATIO", "RIT_FINAL_HEDGE_RATIO", "0.40" if AGGRESSIVE_MODE else "0.70"))
 HEDGE_RATIO = max(0.0, min(1.0, HEDGE_RATIO))
+# Ticker-specific baseline hedge ratios from the case package; dynamic hedge still adjusts on top.
+TICKER_PROPERTIES = {
+    # Sub-Heat 1
+    "RITC": {"vol": "LOW", "liq": "MEDIUM", "base_hedge": 0.40},
+    "COMP": {"vol": "MEDIUM", "liq": "HIGH", "base_hedge": 0.70},
+    # Sub-Heat 2
+    "TRNT": {"vol": "HIGH", "liq": "MEDIUM", "base_hedge": 0.90},
+    "MTRL": {"vol": "LOW", "liq": "LOW", "base_hedge": 0.40},
+    # Sub-Heat 3
+    "BLU": {"vol": "HIGH", "liq": "HIGH", "base_hedge": 0.95},
+    "RED": {"vol": "LOW", "liq": "MEDIUM", "base_hedge": 0.40},
+    "GRN": {"vol": "MEDIUM", "liq": "MEDIUM", "base_hedge": 0.70},
+    # Sub-Heat 4
+    "WDY": {"vol": "MEDIUM", "liq": "HIGH", "base_hedge": 0.70},
+    "BZZ": {"vol": "HIGH", "liq": "MEDIUM", "base_hedge": 0.90},
+    "BNN": {"vol": "MEDIUM", "liq": "MEDIUM", "base_hedge": 0.70},
+    # Sub-Heat 5
+    "VNS": {"vol": "HIGH", "liq": "MEDIUM", "base_hedge": 0.90},
+    "MRS": {"vol": "MEDIUM", "liq": "HIGH", "base_hedge": 0.70},
+    "JPTR": {"vol": "LOW", "liq": "MEDIUM", "base_hedge": 0.40},
+    "STRN": {"vol": "HIGH", "liq": "MEDIUM", "base_hedge": 0.90},
+}
 DYN_HEDGE_RATIO_ENABLED = _env_bool("RIT_FINAL_RISKY_DYN_HEDGE_RATIO_ENABLED", "RIT_FINAL_DYN_HEDGE_RATIO_ENABLED", "1")
 DYN_HEDGE_RATIO_MIN = max(
     0.0, min(1.0, float(_env("RIT_FINAL_RISKY_DYN_HEDGE_RATIO_MIN", "RIT_FINAL_DYN_HEDGE_RATIO_MIN", "0.25")))
@@ -576,6 +598,15 @@ def _base_symbol(ticker):
     if ticker.endswith("_M") or ticker.endswith("_A"):
         return ticker[:-2]
     return ticker
+
+
+def _ticker_base_hedge(ticker):
+    base = _base_symbol(str(ticker or "")).upper()
+    row = TICKER_PROPERTIES.get(base, {})
+    bh = row.get("base_hedge")
+    if isinstance(bh, (int, float)):
+        return max(0.0, min(1.0, float(bh)))
+    return HEDGE_RATIO
 
 
 def _related_tickers(session, ticker):
@@ -1978,7 +2009,8 @@ def evaluate_tender(session, tender):
                 hedge_unwind_action = "BUY" if delta < 0 else "SELL"
                 ob_post = get_order_book_agg(session, ticker)
                 regime_post = _flatten_regime(session, ticker, hedge_unwind_action, ob_post, cache=regime_cache)
-                hedge_ratio_now, hedge_meta = _dynamic_hedge_ratio(HEDGE_RATIO, ob_post, regime=regime_post)
+                stock_base_hedge = _ticker_base_hedge(ticker)
+                hedge_ratio_now, hedge_meta = _dynamic_hedge_ratio(stock_base_hedge, ob_post, regime=regime_post)
                 hedge_delta = delta * hedge_ratio_now
                 retained = delta - hedge_delta
                 _record_tender_log(
@@ -1990,13 +2022,14 @@ def evaluate_tender(session, tender):
                     mode=mode,
                     submit_price=float(submit_price) if isinstance(submit_price, (int, float)) else None,
                     delta=float(delta),
+                    base_hedge=float(stock_base_hedge),
                     hedge_ratio=float(hedge_ratio_now),
                     hedge_delta=float(hedge_delta),
                     retained=float(retained),
                     regime=regime_post.get("state"),
                 )
                 print(
-                    f"[HEDGE_RATIO] {ticker} base={HEDGE_RATIO:.2f} dyn={hedge_ratio_now:.2f} "
+                    f"[HEDGE_RATIO] {ticker} base={stock_base_hedge:.2f} dyn={hedge_ratio_now:.2f} "
                     f"spread_bps={hedge_meta['spread_bps']:.2f} vol={hedge_meta['realized_vol']} "
                     f"state={hedge_meta['state']} conf={hedge_meta['confidence']:.2f}"
                 )
