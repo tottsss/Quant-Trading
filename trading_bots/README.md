@@ -1,18 +1,23 @@
 # Trading Bots
 
-Organized strategy folder for production bots.
+Organized bot library by RITC case.
 
-## Current Structure
+## Case Folders
 
+- `trading_bots/social_outcry/`
+  - Social Outcry scripts from `ready_bots`.
+- `trading_bots/liquidity_risk/`
+  - Liquidity Risk tender/arbitrage variants from `ready_bots`.
+- `trading_bots/volatility_trading/`
+  - Volatility trading bots from `ready_bots`.
+- `trading_bots/gbe_electricity/`
+  - GBE electricity planner bot from `ready_bots`.
 - `trading_bots/merger_arbitrage/`
-  - Canonical merger-arbitrage bot and FinBERT toolchain.
-  - Start here for merger case development and runs.
+  - Merger arbitrage HFT bot, standalone bot, and FinBERT toolchain.
+- `trading_bots/algo_market_making/`
+  - Algo MM bots from `ready_bots`.
 
-## Canonical Merger Files
+## Notes
 
-- `trading_bots/merger_arbitrage/merger_arb_event_driven_hft.py`
-- `trading_bots/merger_arbitrage/MERGER_ARBITRAGE_CASE_GUIDE.md`
-- `trading_bots/merger_arbitrage/finbert_hft/export_quantize.py`
-- `trading_bots/merger_arbitrage/finbert_hft/fast_inference.py`
-- `trading_bots/merger_arbitrage/finbert_hft/README.md`
-- `trading_bots/merger_arbitrage/finbert_hft/requirements.txt`
+- Sources are copied from `ready_bots` to keep old run paths working.
+- New development should target `trading_bots/*` folders.
