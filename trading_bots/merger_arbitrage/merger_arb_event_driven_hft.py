@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
@@ -183,6 +183,11 @@ STALE_CANCEL_CHECK_SECS = float(os.environ.get("RIT_MA_STALE_CANCEL_CHECK_SECS",
 CAPACITY_RECYCLE_TRIGGER_UTIL = float(os.environ.get("RIT_MA_CAPACITY_RECYCLE_TRIGGER_UTIL", "0.94"))
 CAPACITY_RECYCLE_TARGET_UTIL = float(os.environ.get("RIT_MA_CAPACITY_RECYCLE_TARGET_UTIL", "0.88"))
 CAPACITY_RECYCLE_REDUCE_FRACTION = float(os.environ.get("RIT_MA_CAPACITY_RECYCLE_REDUCE_FRACTION", "0.50"))
+ENABLE_IOC_EMULATION = env_bool("RIT_MA_ENABLE_IOC_EMULATION", "1")
+IOC_CANCEL_SECS = float(os.environ.get("RIT_MA_IOC_CANCEL_SECS", "0.20"))
+PING_AT_TOUCH = env_bool("RIT_MA_PING_AT_TOUCH", "1")
+HEDGE_TOP_BOOK_MULT = float(os.environ.get("RIT_MA_HEDGE_TOP_BOOK_MULT", "1.10"))
+HEDGE_MIN_TOP_SIZE = int(os.environ.get("RIT_MA_HEDGE_MIN_TOP_SIZE", "600"))
 
 # Deal definitions requested by user
 DEALS = {
@@ -549,16 +554,39 @@ class RITClient:
         return self._request("POST", "/orders", params=params, retries=3)
 
 
-def best_bid_ask_from_book(book: dict) -> Tuple[Optional[float], Optional[float]]:
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(float(value))
+    except Exception:
+        return 0
+
+
+def top_of_book_from_book(book: dict) -> Tuple[Optional[float], Optional[float], int, int]:
     bids = book.get("bids") or []
     asks = book.get("asks") or []
     if not bids or not asks:
-        return None, None
-    bid = bids[0].get("price")
-    ask = asks[0].get("price")
-    if bid is None or ask is None:
-        return None, None
-    return float(bid), float(ask)
+        return None, None, 0, 0
+
+    bid_px = _safe_float(bids[0].get("price"))
+    ask_px = _safe_float(asks[0].get("price"))
+    if bid_px is None or ask_px is None:
+        return None, None, 0, 0
+
+    bid_qty = max(0, _safe_int(bids[0].get("quantity")) - _safe_int(bids[0].get("quantity_filled")))
+    ask_qty = max(0, _safe_int(asks[0].get("quantity")) - _safe_int(asks[0].get("quantity_filled")))
+    return float(bid_px), float(ask_px), int(bid_qty), int(ask_qty)
+
+
+def best_bid_ask_from_book(book: dict) -> Tuple[Optional[float], Optional[float]]:
+    bid, ask, _, _ = top_of_book_from_book(book)
+    return bid, ask
 
 
 def deal_value(deal: dict, acquirer_price: float) -> float:
@@ -814,6 +842,17 @@ class DealState:
     last_hedge_rebalance_ts: float = 0.0
 
 
+@dataclass
+class TrackedOrder:
+    ts: float
+    ticker: str
+    reason: str
+    action: str
+    quantity: int
+    pending_delta: int
+    cancel_after_ts: float = 0.0
+
+
 class MergerArbBot:
     def __init__(self, client: RITClient):
         self.client = client
@@ -827,7 +866,8 @@ class MergerArbBot:
         self.book_executor: Optional[ThreadPoolExecutor] = None
         self.order_executor: Optional[ThreadPoolExecutor] = None
         self.order_meta_lock = threading.Lock()
-        self.open_order_meta: Dict[int, Tuple[float, str, str]] = {}
+        self.open_order_meta: Dict[int, TrackedOrder] = {}
+        self.pending_pos_deltas: Dict[str, int] = {}
         self.last_stale_check_ts = 0.0
         self.finbert = None
         self.finbert_enabled = False
@@ -872,16 +912,16 @@ class MergerArbBot:
                     f"acq={acquirer} mid0={mids[acquirer]:.2f} K0={k0:.2f} V0={v0:.2f} p0={p0:.3f}"
                 )
 
-    def _fetch_books_parallel(self) -> Dict[str, Tuple[float, float, float]]:
-        books: Dict[str, Tuple[float, float, float]] = {}
+    def _fetch_books_parallel(self) -> Dict[str, Tuple[float, float, float, int, int]]:
+        books: Dict[str, Tuple[float, float, float, int, int]] = {}
 
-        def one(ticker: str) -> Tuple[str, Optional[Tuple[float, float, float]]]:
+        def one(ticker: str) -> Tuple[str, Optional[Tuple[float, float, float, int, int]]]:
             try:
                 b = self.client.get_book(ticker)
-                bid, ask = best_bid_ask_from_book(b)
+                bid, ask, bid_qty, ask_qty = top_of_book_from_book(b)
                 if bid is None or ask is None:
                     return ticker, None
-                return ticker, (bid, ask, (bid + ask) / 2.0)
+                return ticker, (bid, ask, (bid + ask) / 2.0, bid_qty, ask_qty)
             except Exception:
                 return ticker, None
 
@@ -898,6 +938,61 @@ class MergerArbBot:
     def _safe_positions(self) -> Dict[str, int]:
         sec = self.client.get_securities()
         return {s["ticker"].upper(): int(s.get("position", 0)) for s in sec}
+
+    def _signed_qty(self, action: str, quantity: int) -> int:
+        return quantity if action == "BUY" else -quantity
+
+    def _apply_pending_delta_locked(self, ticker: str, delta: int) -> None:
+        if delta == 0:
+            return
+        cur = int(self.pending_pos_deltas.get(ticker, 0))
+        nxt = cur + int(delta)
+        if nxt == 0:
+            self.pending_pos_deltas.pop(ticker, None)
+        else:
+            self.pending_pos_deltas[ticker] = nxt
+
+    def _effective_positions(self, live_positions: Dict[str, int]) -> Dict[str, int]:
+        merged = {k.upper(): int(v) for k, v in live_positions.items()}
+        with self.order_meta_lock:
+            for ticker, delta in self.pending_pos_deltas.items():
+                merged[ticker] = int(merged.get(ticker, 0) + delta)
+        return merged
+
+    def _directional_pstars(self, st: DealState, deal: dict, a_bid: float, a_ask: float) -> Tuple[float, float, float, float]:
+        k_buy_target = deal_value(deal, a_bid)
+        k_sell_target = deal_value(deal, a_ask)
+        p_star_buy = st.probability * k_buy_target + (1.0 - st.probability) * st.standalone_value
+        p_star_sell = st.probability * k_sell_target + (1.0 - st.probability) * st.standalone_value
+        return p_star_buy, p_star_sell, k_buy_target, k_sell_target
+
+    def _cap_target_qty_by_hedge_liquidity(
+        self,
+        action: str,
+        ratio: float,
+        target_qty: int,
+        hedge_qty: int,
+        a_bid_qty: int,
+        a_ask_qty: int,
+    ) -> Tuple[int, int]:
+        if ratio <= 0 or hedge_qty <= 0 or target_qty <= 0:
+            return target_qty, hedge_qty
+        hedge_side = "SELL" if action == "BUY" else "BUY"
+        top_qty = a_bid_qty if hedge_side == "SELL" else a_ask_qty
+        if top_qty < HEDGE_MIN_TOP_SIZE:
+            return 0, 0
+        max_hedge_by_top = int(top_qty * max(0.2, HEDGE_TOP_BOOK_MULT))
+        max_hedge_by_top = max(0, max_hedge_by_top - (max_hedge_by_top % ORDER_STEP))
+        if max_hedge_by_top < ORDER_STEP:
+            return 0, 0
+        capped_hedge = min(hedge_qty, max_hedge_by_top)
+        max_target_by_hedge = int(capped_hedge / max(1e-9, ratio))
+        max_target_by_hedge = max(0, max_target_by_hedge - (max_target_by_hedge % ORDER_STEP))
+        capped_target = min(target_qty, max_target_by_hedge)
+        if capped_target < MIN_ORDER_QTY:
+            return 0, 0
+        capped_hedge = int(round(ratio * capped_target))
+        return capped_target, capped_hedge
 
     def _initialize_finbert(self) -> None:
         if not USE_FINBERT:
@@ -959,11 +1054,20 @@ class MergerArbBot:
         }
 
     def _marketable_limit_price(self, action: str, bid: float, ask: float) -> float:
+        if PING_AT_TOUCH:
+            return round(ask if action == "BUY" else bid, 2)
         if action == "BUY":
             return round(ask + MARKETABLE_LIMIT_OFFSET, 2)
         return round(max(0.01, bid - MARKETABLE_LIMIT_OFFSET), 2)
 
-    def _track_order(self, response: Optional[dict], ticker: str, reason: str) -> None:
+    def _track_order(
+        self,
+        response: Optional[dict],
+        ticker: str,
+        reason: str,
+        action: str,
+        quantity: int,
+    ) -> None:
         if not response:
             return
         order_id = response.get("order_id")
@@ -973,8 +1077,26 @@ class MergerArbBot:
             oid = int(order_id)
         except Exception:
             return
+        qty_resp = response.get("quantity")
+        tracked_qty = _safe_int(qty_resp) if qty_resp is not None else int(quantity)
+        if tracked_qty <= 0:
+            tracked_qty = int(quantity)
+        pending_delta = self._signed_qty(action, tracked_qty)
+        cancel_after_ts = 0.0
+        if ENABLE_IOC_EMULATION:
+            cancel_after_ts = time.time() + max(0.05, IOC_CANCEL_SECS)
+        meta = TrackedOrder(
+            ts=time.time(),
+            ticker=ticker,
+            reason=reason,
+            action=action,
+            quantity=tracked_qty,
+            pending_delta=pending_delta,
+            cancel_after_ts=cancel_after_ts,
+        )
         with self.order_meta_lock:
-            self.open_order_meta[oid] = (time.time(), ticker, reason)
+            self.open_order_meta[oid] = meta
+            self._apply_pending_delta_locked(ticker, pending_delta)
 
     def _cancel_stale_orders(self, now: float) -> None:
         if now - self.last_stale_check_ts < STALE_CANCEL_CHECK_SECS:
@@ -986,31 +1108,58 @@ class MergerArbBot:
             log(f"ORDERS_WARN unable to poll open orders: {exc}")
             return
 
-        open_ids = set()
+        open_by_id: Dict[int, dict] = {}
         for order in open_orders:
             oid = order.get("order_id")
             if oid is None:
                 continue
             try:
-                open_ids.add(int(oid))
+                open_by_id[int(oid)] = order
             except Exception:
                 continue
 
+        stale_candidates: List[Tuple[int, TrackedOrder, str]] = []
         with self.order_meta_lock:
             tracked_ids = set(self.open_order_meta.keys())
-            for oid in tracked_ids - open_ids:
-                self.open_order_meta.pop(oid, None)
-            stale = [(oid, meta) for oid, meta in self.open_order_meta.items() if oid in open_ids and now - meta[0] >= STALE_ORDER_SECS]
+            for oid in tracked_ids - set(open_by_id.keys()):
+                meta = self.open_order_meta.pop(oid, None)
+                if meta is not None:
+                    self._apply_pending_delta_locked(meta.ticker, -meta.pending_delta)
 
-        for oid, (_, ticker, reason) in stale:
+            for oid, meta in list(self.open_order_meta.items()):
+                open_order = open_by_id.get(oid)
+                if open_order is None:
+                    continue
+                open_qty = _safe_int(open_order.get("quantity", meta.quantity))
+                if open_qty <= 0:
+                    open_qty = meta.quantity
+                filled_qty = _safe_int(open_order.get("quantity_filled"))
+                remaining_qty = max(0, open_qty - filled_qty)
+                expected_pending = self._signed_qty(meta.action, remaining_qty)
+                if expected_pending != meta.pending_delta:
+                    self._apply_pending_delta_locked(meta.ticker, expected_pending - meta.pending_delta)
+                    meta.pending_delta = expected_pending
+                    self.open_order_meta[oid] = meta
+
+                is_stale = now - meta.ts >= STALE_ORDER_SECS
+                is_ioc_timeout = ENABLE_IOC_EMULATION and meta.cancel_after_ts > 0 and now >= meta.cancel_after_ts
+                if is_stale or is_ioc_timeout:
+                    stale_candidates.append((oid, meta, "IOC_TIMEOUT" if is_ioc_timeout else "STALE"))
+
+        for oid, meta, cancel_reason in stale_candidates:
             try:
                 self.client.cancel_order(oid)
-                log(f"CANCEL stale order_id={oid} ticker={ticker} reason={reason} age>{STALE_ORDER_SECS:.2f}s")
+                age = now - meta.ts
+                log(
+                    f"CANCEL order_id={oid} ticker={meta.ticker} reason={meta.reason} "
+                    f"cancel_reason={cancel_reason} age={age:.2f}s"
+                )
+                with self.order_meta_lock:
+                    active = self.open_order_meta.pop(oid, None)
+                    if active is not None:
+                        self._apply_pending_delta_locked(active.ticker, -active.pending_delta)
             except Exception:
                 pass
-            finally:
-                with self.order_meta_lock:
-                    self.open_order_meta.pop(oid, None)
 
     def _submit_pair(
         self,
@@ -1058,7 +1207,7 @@ class MergerArbBot:
             )
             try:
                 tgt_resp = f_target.result()
-                self._track_order(tgt_resp, target, reason)
+                self._track_order(tgt_resp, target, reason, signal_action, target_qty)
             except Exception as exc:
                 log(
                     f"ORDER_FAIL {deal_id} reason={reason} target={target} side={signal_action} "
@@ -1066,7 +1215,7 @@ class MergerArbBot:
                 )
             try:
                 hedge_resp = f_hedge.result()
-                self._track_order(hedge_resp, acquirer, reason)
+                self._track_order(hedge_resp, acquirer, reason, hedge_side, hedge_qty)
             except Exception as exc:
                 log(
                     f"HEDGE_FAIL {deal_id} reason={reason} acq={acquirer} side={hedge_side} "
@@ -1081,7 +1230,7 @@ class MergerArbBot:
                     order_type="LIMIT",
                     price=target_px,
                 )
-                self._track_order(tgt_resp, target, reason)
+                self._track_order(tgt_resp, target, reason, signal_action, target_qty)
             except Exception as exc:
                 log(
                     f"ORDER_FAIL {deal_id} reason={reason} target={target} side={signal_action} "
@@ -1097,7 +1246,7 @@ class MergerArbBot:
                         order_type="LIMIT",
                         price=hedge_px,
                     )
-                    self._track_order(hedge_resp, acquirer, reason)
+                    self._track_order(hedge_resp, acquirer, reason, hedge_side, hedge_qty)
                 except Exception as exc:
                     log(
                         f"HEDGE_FAIL {deal_id} reason={reason} acq={acquirer} side={hedge_side} "
@@ -1137,7 +1286,7 @@ class MergerArbBot:
                 order_type="LIMIT",
                 price=px,
             )
-            self._track_order(resp, ticker, reason)
+            self._track_order(resp, ticker, reason, action, qty)
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             log(
                 f"TRADE {deal_id} reason={reason} side={action} single={ticker} qty={qty}@{px:.2f} "
@@ -1412,7 +1561,7 @@ class MergerArbBot:
 
     def _periodic_snapshot(
         self,
-        books: Dict[str, Tuple[float, float, float]],
+        books: Dict[str, Tuple[float, float, float, int, int]],
         positions: Dict[str, int],
     ) -> None:
         now = time.time()
@@ -1430,19 +1579,20 @@ class MergerArbBot:
                 if target not in books or acquirer not in books:
                     continue
                 st = self.deal_states[deal_id]
-                _, _, a_mid = books[acquirer]
-                t_bid, t_ask, _ = books[target]
-                k = deal_value(deal, a_mid)
-                p_star = st.probability * k + (1.0 - st.probability) * st.standalone_value
+                a_bid, a_ask, _, _, _ = books[acquirer]
+                t_bid, t_ask, _, _, _ = books[target]
+                p_star_buy, p_star_sell, k_buy, k_sell = self._directional_pstars(st, deal, a_bid, a_ask)
                 log(
                     f"MODEL {deal_id} p={st.probability:.4f} V={st.standalone_value:.2f} "
-                    f"K={k:.2f} P*={p_star:.2f} tgt_bid/ask={t_bid:.2f}/{t_ask:.2f}"
+                    f"Kbuy={k_buy:.2f} Ksell={k_sell:.2f} "
+                    f"P*buy={p_star_buy:.2f} P*sell={p_star_sell:.2f} "
+                    f"tgt_bid/ask={t_bid:.2f}/{t_ask:.2f}"
                 )
 
     def _capacity_recycler(
         self,
         now: float,
-        books: Dict[str, Tuple[float, float, float]],
+        books: Dict[str, Tuple[float, float, float, int, int]],
         positions: Dict[str, int],
         states_copy: Dict[str, DealState],
         gross_used: int,
@@ -1465,10 +1615,10 @@ class MergerArbBot:
             if abs(target_pos) < ORDER_STEP:
                 continue
             st = states_copy[deal_id]
-            t_bid, t_ask, t_mid = books[target]
-            _, _, a_mid = books[acquirer]
-            k = deal_value(deal, a_mid)
-            p_star = st.probability * k + (1.0 - st.probability) * st.standalone_value
+            t_bid, t_ask, t_mid, _, _ = books[target]
+            a_bid, a_ask, _, _, _ = books[acquirer]
+            p_star_buy, p_star_sell, _, _ = self._directional_pstars(st, deal, a_bid, a_ask)
+            p_star = p_star_buy if target_pos > 0 else p_star_sell
             candidates.append((abs(t_mid - p_star), deal_id))
 
         if not candidates:
@@ -1487,17 +1637,27 @@ class MergerArbBot:
             if abs(target_pos) < ORDER_STEP:
                 continue
 
-            t_bid, t_ask, _ = books[target]
-            a_bid, a_ask, a_mid = books[acquirer]
+            t_bid, t_ask, _, _, _ = books[target]
+            a_bid, a_ask, _, a_bid_qty, a_ask_qty = books[acquirer]
             st = states_copy[deal_id]
-            k = deal_value(deal, a_mid)
-            p_star = st.probability * k + (1.0 - st.probability) * st.standalone_value
+            p_star_buy, p_star_sell, _, _ = self._directional_pstars(st, deal, a_bid, a_ask)
             ratio = float(deal["ratio"]) if deal["structure"] in {"stock", "mixed"} else 0.0
             signal_action = "SELL" if target_pos > 0 else "BUY"
+            p_star_action = p_star_sell if signal_action == "SELL" else p_star_buy
             close_qty = scaled_close_qty(abs(target_pos), CAPACITY_RECYCLE_REDUCE_FRACTION)
             if close_qty < ORDER_STEP:
                 continue
             hedge_close_qty = compute_hedge_close_qty(signal_action, ratio, close_qty, acq_pos)
+            close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity(
+                action=signal_action,
+                ratio=ratio,
+                target_qty=close_qty,
+                hedge_qty=hedge_close_qty,
+                a_bid_qty=a_bid_qty,
+                a_ask_qty=a_ask_qty,
+            )
+            if close_qty < ORDER_STEP:
+                continue
 
             target_ok, hedge_ok = self._submit_pair(
                 deal_id=deal_id,
@@ -1506,8 +1666,8 @@ class MergerArbBot:
                 signal_action=signal_action,
                 target_qty=close_qty,
                 hedge_qty=hedge_close_qty,
-                edge=abs(((t_bid + t_ask) / 2.0) - p_star),
-                p_star=p_star,
+                edge=abs(((t_bid + t_ask) / 2.0) - p_star_action),
+                p_star=p_star_action,
                 t_bid=t_bid,
                 t_ask=t_ask,
                 a_bid=a_bid,
@@ -1544,17 +1704,17 @@ class MergerArbBot:
                     self.running = False
                     break
 
-                positions = self._safe_positions()
+                live_positions = self._safe_positions()
                 books = self._fetch_books_parallel()
                 if len(books) < len(self.trade_tickers):
                     missing = sorted(set(self.trade_tickers) - set(books.keys()))
                     if missing:
                         log(f"BOOK_WARN missing={','.join(missing)}")
 
-                self._periodic_snapshot(books, positions)
-
                 now = time.time()
                 self._cancel_stale_orders(now)
+                positions = self._effective_positions(live_positions)
+                self._periodic_snapshot(books, positions)
                 with self.lock:
                     for deal_id, deal in DEALS.items():
                         target = deal["target"].upper()
@@ -1609,10 +1769,9 @@ class MergerArbBot:
                     st = states_copy[deal_id]
                     can_enter = (now - st.last_trade_ts) >= TRADE_COOLDOWN_SECS
 
-                    t_bid, t_ask, _ = books[target]
-                    a_bid, a_ask, a_mid = books[acquirer]
-                    k = deal_value(deal, a_mid)
-                    p_star = st.probability * k + (1.0 - st.probability) * st.standalone_value
+                    t_bid, t_ask, _, _, _ = books[target]
+                    a_bid, a_ask, _, a_bid_qty, a_ask_qty = books[acquirer]
+                    p_star_buy, p_star_sell, _, _ = self._directional_pstars(st, deal, a_bid, a_ask)
                     ratio = float(deal["ratio"]) if deal["structure"] in {"stock", "mixed"} else 0.0
                     commission_cost = COMMISSION_PER_SHARE * (1.0 + ratio)
                     target_pos = int(positions.get(target, 0))
@@ -1620,9 +1779,19 @@ class MergerArbBot:
                     held_secs = (now - st.hold_start_ts) if st.hold_start_ts > 0 else 0.0
 
                     # Hard stop: adverse move far enough from model to protect risk budget.
-                    if target_pos > 0 and t_bid <= p_star - commission_cost - STOP_LOSS_BUFFER:
+                    if target_pos > 0 and t_bid <= p_star_buy - commission_cost - STOP_LOSS_BUFFER:
                         close_qty = close_qty_for_position(abs(target_pos))
                         hedge_close_qty = compute_hedge_close_qty("SELL", ratio, close_qty, acq_pos)
+                        close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity(
+                            action="SELL",
+                            ratio=ratio,
+                            target_qty=close_qty,
+                            hedge_qty=hedge_close_qty,
+                            a_bid_qty=a_bid_qty,
+                            a_ask_qty=a_ask_qty,
+                        )
+                        if close_qty < ORDER_STEP:
+                            continue
                         target_ok, hedge_ok = self._submit_pair(
                             deal_id=deal_id,
                             target=target,
@@ -1630,8 +1799,8 @@ class MergerArbBot:
                             signal_action="SELL",
                             target_qty=close_qty,
                             hedge_qty=hedge_close_qty,
-                            edge=p_star - t_bid,
-                            p_star=p_star,
+                            edge=p_star_buy - t_bid,
+                            p_star=p_star_buy,
                             t_bid=t_bid,
                             t_ask=t_ask,
                             a_bid=a_bid,
@@ -1651,9 +1820,19 @@ class MergerArbBot:
                                 live.hold_start_ts = 0.0 if int(positions.get(target, 0)) == 0 else now
                         continue
 
-                    if target_pos < 0 and t_ask >= p_star + commission_cost + STOP_LOSS_BUFFER:
+                    if target_pos < 0 and t_ask >= p_star_sell + commission_cost + STOP_LOSS_BUFFER:
                         close_qty = close_qty_for_position(abs(target_pos))
                         hedge_close_qty = compute_hedge_close_qty("BUY", ratio, close_qty, acq_pos)
+                        close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity(
+                            action="BUY",
+                            ratio=ratio,
+                            target_qty=close_qty,
+                            hedge_qty=hedge_close_qty,
+                            a_bid_qty=a_bid_qty,
+                            a_ask_qty=a_ask_qty,
+                        )
+                        if close_qty < ORDER_STEP:
+                            continue
                         target_ok, hedge_ok = self._submit_pair(
                             deal_id=deal_id,
                             target=target,
@@ -1661,8 +1840,8 @@ class MergerArbBot:
                             signal_action="BUY",
                             target_qty=close_qty,
                             hedge_qty=hedge_close_qty,
-                            edge=t_ask - p_star,
-                            p_star=p_star,
+                            edge=t_ask - p_star_sell,
+                            p_star=p_star_sell,
                             t_bid=t_bid,
                             t_ask=t_ask,
                             a_bid=a_bid,
@@ -1683,9 +1862,19 @@ class MergerArbBot:
                         continue
 
                     # Exit logic: flatten when price converges back to model.
-                    if target_pos > 0 and t_bid >= p_star - commission_cost - EXIT_BUFFER:
+                    if target_pos > 0 and t_bid >= p_star_buy - commission_cost - EXIT_BUFFER:
                         close_qty = close_qty_for_position(abs(target_pos))
                         hedge_close_qty = compute_hedge_close_qty("SELL", ratio, close_qty, acq_pos)
+                        close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity(
+                            action="SELL",
+                            ratio=ratio,
+                            target_qty=close_qty,
+                            hedge_qty=hedge_close_qty,
+                            a_bid_qty=a_bid_qty,
+                            a_ask_qty=a_ask_qty,
+                        )
+                        if close_qty < ORDER_STEP:
+                            continue
                         target_ok, hedge_ok = self._submit_pair(
                             deal_id=deal_id,
                             target=target,
@@ -1693,8 +1882,8 @@ class MergerArbBot:
                             signal_action="SELL",
                             target_qty=close_qty,
                             hedge_qty=hedge_close_qty,
-                            edge=t_bid - p_star,
-                            p_star=p_star,
+                            edge=t_bid - p_star_buy,
+                            p_star=p_star_buy,
                             t_bid=t_bid,
                             t_ask=t_ask,
                             a_bid=a_bid,
@@ -1713,9 +1902,19 @@ class MergerArbBot:
                                 live.hold_start_ts = 0.0 if int(positions.get(target, 0)) == 0 else live.hold_start_ts
                         continue
 
-                    if target_pos < 0 and t_ask <= p_star + commission_cost + EXIT_BUFFER:
+                    if target_pos < 0 and t_ask <= p_star_sell + commission_cost + EXIT_BUFFER:
                         close_qty = close_qty_for_position(abs(target_pos))
                         hedge_close_qty = compute_hedge_close_qty("BUY", ratio, close_qty, acq_pos)
+                        close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity(
+                            action="BUY",
+                            ratio=ratio,
+                            target_qty=close_qty,
+                            hedge_qty=hedge_close_qty,
+                            a_bid_qty=a_bid_qty,
+                            a_ask_qty=a_ask_qty,
+                        )
+                        if close_qty < ORDER_STEP:
+                            continue
                         target_ok, hedge_ok = self._submit_pair(
                             deal_id=deal_id,
                             target=target,
@@ -1723,8 +1922,8 @@ class MergerArbBot:
                             signal_action="BUY",
                             target_qty=close_qty,
                             hedge_qty=hedge_close_qty,
-                            edge=p_star - t_ask,
-                            p_star=p_star,
+                            edge=p_star_sell - t_ask,
+                            p_star=p_star_sell,
                             t_bid=t_bid,
                             t_ask=t_ask,
                             a_bid=a_bid,
@@ -1753,7 +1952,18 @@ class MergerArbBot:
                     ):
                         close_qty = scaled_close_qty(abs(target_pos), TIME_STOP_REDUCE_FRACTION)
                         close_action = "SELL" if target_pos > 0 else "BUY"
+                        p_star_close = p_star_sell if close_action == "SELL" else p_star_buy
                         hedge_close_qty = compute_hedge_close_qty(close_action, ratio, close_qty, acq_pos)
+                        close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity(
+                            action=close_action,
+                            ratio=ratio,
+                            target_qty=close_qty,
+                            hedge_qty=hedge_close_qty,
+                            a_bid_qty=a_bid_qty,
+                            a_ask_qty=a_ask_qty,
+                        )
+                        if close_qty < ORDER_STEP:
+                            continue
                         target_ok, hedge_ok = self._submit_pair(
                             deal_id=deal_id,
                             target=target,
@@ -1761,8 +1971,8 @@ class MergerArbBot:
                             signal_action=close_action,
                             target_qty=close_qty,
                             hedge_qty=hedge_close_qty,
-                            edge=abs(((t_bid + t_ask) / 2.0) - p_star),
-                            p_star=p_star,
+                            edge=abs(((t_bid + t_ask) / 2.0) - p_star_close),
+                            p_star=p_star_close,
                             t_bid=t_bid,
                             t_ask=t_ask,
                             a_bid=a_bid,
@@ -1843,12 +2053,15 @@ class MergerArbBot:
                     # Entry / add-reduce logic with dynamic friction-aware threshold.
                     action = None
                     edge = 0.0
-                    if t_ask < p_star:
+                    p_star_action = 0.0
+                    if t_ask < p_star_buy:
                         action = "BUY"
-                        edge = p_star - t_ask
-                    elif t_bid > p_star:
+                        edge = p_star_buy - t_ask
+                        p_star_action = p_star_buy
+                    elif t_bid > p_star_sell:
                         action = "SELL"
-                        edge = t_bid - p_star
+                        edge = t_bid - p_star_sell
+                        p_star_action = p_star_sell
                     if action is None:
                         continue
 
@@ -1887,6 +2100,16 @@ class MergerArbBot:
                     )
                     if target_qty < MIN_ORDER_QTY:
                         continue
+                    target_qty, hedge_qty = self._cap_target_qty_by_hedge_liquidity(
+                        action=action,
+                        ratio=ratio,
+                        target_qty=target_qty,
+                        hedge_qty=hedge_qty,
+                        a_bid_qty=a_bid_qty,
+                        a_ask_qty=a_ask_qty,
+                    )
+                    if target_qty < MIN_ORDER_QTY:
+                        continue
 
                     target_ok, hedge_ok = self._submit_pair(
                         deal_id=deal_id,
@@ -1896,7 +2119,7 @@ class MergerArbBot:
                         target_qty=target_qty,
                         hedge_qty=hedge_qty,
                         edge=edge,
-                        p_star=p_star,
+                        p_star=p_star_action,
                         t_bid=t_bid,
                         t_ask=t_ask,
                         a_bid=a_bid,
@@ -1955,6 +2178,11 @@ class MergerArbBot:
                         "CAPACITY_RECYCLE_TARGET_UTIL": CAPACITY_RECYCLE_TARGET_UTIL,
                         "CAPACITY_RECYCLE_REDUCE_FRACTION": CAPACITY_RECYCLE_REDUCE_FRACTION,
                         "STALE_ORDER_SECS": STALE_ORDER_SECS,
+                        "ENABLE_IOC_EMULATION": ENABLE_IOC_EMULATION,
+                        "IOC_CANCEL_SECS": IOC_CANCEL_SECS,
+                        "PING_AT_TOUCH": PING_AT_TOUCH,
+                        "HEDGE_TOP_BOOK_MULT": HEDGE_TOP_BOOK_MULT,
+                        "HEDGE_MIN_TOP_SIZE": HEDGE_MIN_TOP_SIZE,
                         "TRADE_LOOP_SECS": TRADE_LOOP_SECS,
                         "NEWS_POLL_SECS": NEWS_POLL_SECS,
                         "USE_FINBERT": USE_FINBERT,
@@ -1982,6 +2210,8 @@ class MergerArbBot:
             f"stop_loss={STOP_LOSS_BUFFER:.2f} time_stop={TIME_STOP_SECS:.1f}s "
             f"recycle={CAPACITY_RECYCLE_TRIGGER_UTIL:.2f}->{CAPACITY_RECYCLE_TARGET_UTIL:.2f} "
             f"per_deal_target_cap={PER_DEAL_TARGET_MAX} stale_cancel={STALE_ORDER_SECS:.2f}s "
+            f"ioc={ENABLE_IOC_EMULATION} ioc_t={IOC_CANCEL_SECS:.2f}s ping_touch={PING_AT_TOUCH} "
+            f"hedge_top_mult={HEDGE_TOP_BOOK_MULT:.2f} hedge_min_top={HEDGE_MIN_TOP_SIZE} "
             f"finbert={'ON' if self.finbert_enabled else 'OFF'}"
         )
 
@@ -2036,6 +2266,8 @@ class MergerArbBot:
                             "last_risk_reduce_ts": st.last_risk_reduce_ts,
                             "last_hedge_rebalance_ts": st.last_hedge_rebalance_ts,
                         }
+                with self.order_meta_lock:
+                    pending_deltas = dict(self.pending_pos_deltas)
                 summary = {
                     "final_case": final_case,
                     "last_news_id": self.last_news_id,
@@ -2043,6 +2275,8 @@ class MergerArbBot:
                     "final_positions": final_positions,
                     "open_order_count": len(final_open_orders),
                     "tracked_open_order_count": len(self.open_order_meta),
+                    "pending_delta_count": len(pending_deltas),
+                    "pending_pos_deltas": pending_deltas,
                     "finbert_enabled": self.finbert_enabled,
                     "finbert_model_path": self.finbert_model_path,
                     "finbert_tokenizer_path": self.finbert_tokenizer_path,
