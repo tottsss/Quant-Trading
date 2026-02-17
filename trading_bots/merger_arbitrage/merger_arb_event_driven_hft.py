@@ -21,8 +21,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import requests
 
 BASE_URL = os.environ.get("RIT_BASE_URL", "http://localhost:9999/v1").rstrip("/")
-API_KEY = os.environ.get("RIT_API_KEY", "YOUR_API_KEY")
-
+API_KEY = os.environ.get("RIT_API_KEY", "BNWI101Y")
 
 def env_bool(name: str, default: str) -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
@@ -239,6 +238,76 @@ CATEGORY_MULT = {"REG": 1.25, "FIN": 1.00, "SHR": 0.90, "ALT": 1.40, "PRC": 0.70
 # Explicit code parsing (works if RIT headline includes tags like "REG", "NEG", "L").
 CATEGORY_RE = re.compile(r"\b(REG|FIN|SHR|ALT|PRC)\b", re.IGNORECASE)
 DEAL_RE = re.compile(r"\bD([1-5])\b", re.IGNORECASE)
+
+# Rich entity resolver used when RIT does not provide deal IDs in metadata.
+ENTITY_TO_DEAL = {
+    # D1: Pharmaceuticals
+    "TARGENIX": "D1",
+    "TGX": "D1",
+    "PHARMACO": "D1",
+    "PHR": "D1",
+    "PHARMACEUTICAL": "D1",
+    "PHARMACEUTICALS": "D1",
+    "FDA": "D1",
+    # D2: Cloud Software
+    "BYTELAYER": "D2",
+    "BYL": "D2",
+    "CLOUDSYS": "D2",
+    "CLD": "D2",
+    "CLOUD INFRASTRUCTURE": "D2",
+    "SOFTWARE": "D2",
+    # D3: Energy / Infrastructure
+    "GREENGRID": "D3",
+    "GGD": "D3",
+    "PETRONORTH": "D3",
+    "PNR": "D3",
+    "FERC": "D3",
+    "PIPELINE": "D3",
+    # D4: Banking
+    "FINSURE": "D4",
+    "FSR": "D4",
+    "ATLAS BANK": "D4",
+    "ATB": "D4",
+    "FEDERAL RESERVE": "D4",
+    "FED": "D4",
+    "FDIC": "D4",
+    "BANK MERGER": "D4",
+    "BANK MERGERS": "D4",
+    # D5: Renewable Energy
+    "EASTENERGY": "D5",
+    "EEC": "D5",
+    "SOLARPEAK": "D5",
+    "SPK": "D5",
+    "SOLAR": "D5",
+    "RENEWABLE": "D5",
+}
+
+# Headlines matching these phrases are intentionally low-information and should not move probabilities.
+AMBIGUOUS_PHRASES = {
+    "ROUTINE LEGAL DILIGENCE",
+    "AGENDA HAS NOT BEEN DISCLOSED",
+    "MIXED CONCLUSIONS",
+    "DIVERGENT VALUATION",
+    "CAN ADDRESS A RANGE OF TOPICS",
+    "MAY REFLECT ROUTINE LEGAL DILIGENCE",
+    "MAY SIGNAL EVOLVING CONDITIONS",
+}
+
+# Flow dislocation events are mechanical, not fundamental deal-probability updates.
+FLOW_DISLOCATION_PHRASES = {
+    "PORTFOLIO REBALANCING",
+    "TEMPORARY DISLOCATIONS",
+    "MAY NOT REFLECT FUNDAMENTAL CHANGES",
+    "MAY NOT REFLECT FUNDAMENTAL",
+}
+
+
+def _phrase_pattern(term: str) -> re.Pattern:
+    escaped = re.escape(term).replace(r"\ ", r"\s+")
+    return re.compile(rf"(?<![A-Z0-9]){escaped}(?![A-Z0-9])")
+
+
+ENTITY_PATTERNS = {term: _phrase_pattern(term) for term in ENTITY_TO_DEAL}
 
 
 def now_ts() -> str:
@@ -504,18 +573,49 @@ def classify_category(text: str) -> Optional[str]:
     return None
 
 
-def extract_referenced_deals(text: str, deal_tickers: Dict[str, str]) -> List[str]:
+def phrase_hits(text: str, phrases: Iterable[str]) -> List[str]:
+    text_upper = text.upper()
+    hits: List[str] = []
+    for phrase in phrases:
+        if phrase in text_upper:
+            hits.append(phrase)
+    return sorted(set(hits))
+
+
+def extract_referenced_deals(text: str, deal_tickers: Dict[str, str]) -> Tuple[List[str], Dict[str, List[str]]]:
     text_upper = text.upper()
     refs = set()
+    matched: Dict[str, List[str]] = {"deal_ids": [], "tickers": [], "entities": []}
 
     for m in DEAL_RE.finditer(text_upper):
-        refs.add(f"D{m.group(1)}")
+        deal_id = f"D{m.group(1)}"
+        refs.add(deal_id)
+        matched["deal_ids"].append(deal_id)
 
     for ticker, deal_id in deal_tickers.items():
-        if ticker in text_upper:
+        if re.search(rf"(?<![A-Z0-9]){re.escape(ticker)}(?![A-Z0-9])", text_upper):
             refs.add(deal_id)
+            matched["tickers"].append(ticker)
 
-    return sorted(refs)
+    for term, deal_id in ENTITY_TO_DEAL.items():
+        if ENTITY_PATTERNS[term].search(text_upper):
+            refs.add(deal_id)
+            matched["entities"].append(term)
+
+    return sorted(refs), {k: sorted(set(v)) for k, v in matched.items()}
+
+
+def finbert_meta_summary(finbert_meta: Optional[dict]) -> str:
+    if not finbert_meta:
+        return ""
+    if "error" in finbert_meta:
+        return f" finbert_err={finbert_meta.get('error')}"
+    p_pos = finbert_meta.get("positive_probability")
+    p_neg = finbert_meta.get("negative_probability")
+    gap = finbert_meta.get("gap")
+    if p_pos is None or p_neg is None or gap is None:
+        return ""
+    return f" p+={p_pos:.3f} p-={p_neg:.3f} gap={gap:.3f}"
 
 
 def compute_gross_net(positions: Dict[str, int]) -> Tuple[int, int]:
@@ -1041,26 +1141,18 @@ class MergerArbBot:
                     headline = str(item.get("headline") or "")
                     body = str(item.get("body") or "")
                     text = (headline + " " + body).strip()
-                    refs = extract_referenced_deals(text, self.deal_ticker_to_id)
+                    refs, ref_matches = extract_referenced_deals(text, self.deal_ticker_to_id)
+                    ambiguous_hits = phrase_hits(text, AMBIGUOUS_PHRASES)
+                    flow_dislocation_hits = phrase_hits(text, FLOW_DISLOCATION_PHRASES)
 
-                    self.last_news_id = max(self.last_news_id, news_id)
-                    if not refs:
-                        if RUN_RECORDER is not None:
-                            RUN_RECORDER.add_news(
-                                item=item,
-                                refs=[],
-                                category=None,
-                                direction=None,
-                                severity=None,
-                                applied=[],
-                                skipped=True,
-                                skip_reason="NO_DEAL_REFERENCE",
-                            )
-                        continue
-
-                    cat = classify_category(text)
+                    cat_explicit = classify_category(text)
+                    cat = cat_explicit
+                    category_source = "explicit" if cat_explicit is not None else "none"
                     if cat is None and FINBERT_CATEGORY_FALLBACK in CATEGORY_MULT:
                         cat = FINBERT_CATEGORY_FALLBACK
+                        category_source = "fallback"
+
+                    self.last_news_id = max(self.last_news_id, news_id)
 
                     finbert_direction, finbert_severity, finbert_meta = self._finbert_infer_direction(text)
                     direction = finbert_direction
@@ -1074,13 +1166,79 @@ class MergerArbBot:
                             "severity": finbert_severity,
                             "meta": finbert_meta,
                         },
+                        "reference_matches": ref_matches,
+                        "category_source": category_source,
+                        "filters": {
+                            "ambiguous_phrase_hits": ambiguous_hits,
+                            "flow_dislocation_hits": flow_dislocation_hits,
+                        },
                     }
+                    finbert_audit = finbert_meta_summary(finbert_meta)
+
+                    if not refs:
+                        log(
+                            f"NEWS_SKIP id={news_id} reason=NO_DEAL_REFERENCE "
+                            f"cat={cat} dir={direction} sev={severity} head='{headline[:90]}'{finbert_audit}"
+                        )
+                        if RUN_RECORDER is not None:
+                            RUN_RECORDER.add_news(
+                                item=item,
+                                refs=[],
+                                category=cat,
+                                direction=direction,
+                                severity=severity,
+                                applied=[],
+                                skipped=True,
+                                skip_reason="NO_DEAL_REFERENCE",
+                                classifier_meta=classifier_meta,
+                            )
+                        continue
+
+                    if flow_dislocation_hits:
+                        log(
+                            f"NEWS_SKIP id={news_id} refs={','.join(refs)} reason=FLOW_DISLOCATION_FILTER "
+                            f"hits={';'.join(flow_dislocation_hits)} cat={cat} dir={direction} sev={severity} "
+                            f"head='{headline[:90]}'{finbert_audit}"
+                        )
+                        if RUN_RECORDER is not None:
+                            RUN_RECORDER.add_news(
+                                item=item,
+                                refs=refs,
+                                category=cat,
+                                direction=direction,
+                                severity=severity,
+                                applied=[],
+                                skipped=True,
+                                skip_reason="FLOW_DISLOCATION_FILTER",
+                                classifier_meta=classifier_meta,
+                            )
+                        continue
+
+                    if ambiguous_hits:
+                        log(
+                            f"NEWS_SKIP id={news_id} refs={','.join(refs)} reason=AMBIGUOUS_NEWS_FILTER "
+                            f"hits={';'.join(ambiguous_hits)} cat={cat} dir={direction} sev={severity} "
+                            f"head='{headline[:90]}'{finbert_audit}"
+                        )
+                        if RUN_RECORDER is not None:
+                            RUN_RECORDER.add_news(
+                                item=item,
+                                refs=refs,
+                                category=cat,
+                                direction=direction,
+                                severity=severity,
+                                applied=[],
+                                skipped=True,
+                                skip_reason="AMBIGUOUS_NEWS_FILTER",
+                                classifier_meta=classifier_meta,
+                            )
+                        continue
 
                     if cat is None or direction is None:
                         skip_reason = "CLASSIFICATION_INCOMPLETE" if cat is None else "NO_FINBERT_SIGNAL"
                         log(
                             f"NEWS_SKIP id={news_id} refs={','.join(refs)} "
-                            f"cat={cat} dir={direction} sev={severity} head='{headline[:90]}'"
+                            f"cat={cat} dir={direction} sev={severity} head='{headline[:90]}'{finbert_audit}"
                         )
                         if RUN_RECORDER is not None:
                             RUN_RECORDER.add_news(
@@ -1509,6 +1667,9 @@ class MergerArbBot:
                         "FINBERT_NEG_THRESHOLD": FINBERT_NEG_THRESHOLD,
                         "FINBERT_GAP_THRESHOLD": FINBERT_GAP_THRESHOLD,
                         "FINBERT_CATEGORY_FALLBACK": FINBERT_CATEGORY_FALLBACK,
+                        "ENTITY_TO_DEAL_TERMS": len(ENTITY_TO_DEAL),
+                        "AMBIGUOUS_PHRASES": sorted(AMBIGUOUS_PHRASES),
+                        "FLOW_DISLOCATION_PHRASES": sorted(FLOW_DISLOCATION_PHRASES),
                     },
                 }
             )

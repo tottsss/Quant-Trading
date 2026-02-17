@@ -185,6 +185,7 @@ def main() -> None:
     # reduce_range=True is important for AVX2 paths with U8S8 kernels because VPMADDUBSW can
     # saturate/overflow 16-bit accumulators on outlier-heavy transformer activations/weights.
     # This sacrifices a bit of quantization range (7-bit effective) for significantly safer math.
+    quantized_from = str(opt_onnx)
     try:
         quantize_dynamic(
             model_input=str(opt_onnx),
@@ -193,7 +194,35 @@ def main() -> None:
             reduce_range=True,
         )
     except Exception as exc:
-        _fail(f"Dynamic quantization failed: {exc}")
+        # Some ORT/ONNX combos fail type inference on optimized BERT graphs.
+        # Retry with explicit default tensor type, then fallback to raw ONNX.
+        print(f"[WARN] Quantization on optimized ONNX failed: {exc}")
+        try:
+            import onnx  # local import to avoid hard dependency until needed
+
+            quantize_dynamic(
+                model_input=str(opt_onnx),
+                model_output=str(int8_onnx),
+                weight_type=QuantType.QInt8,
+                reduce_range=True,
+                extra_options={"DefaultTensorType": onnx.TensorProto.FLOAT},
+            )
+        except Exception as exc_opt:
+            print(f"[WARN] Quantization retry with DefaultTensorType on optimized ONNX failed: {exc_opt}")
+            try:
+                quantize_dynamic(
+                    model_input=str(raw_onnx),
+                    model_output=str(int8_onnx),
+                    weight_type=QuantType.QInt8,
+                    reduce_range=True,
+                    extra_options={"DefaultTensorType": onnx.TensorProto.FLOAT},
+                )
+                quantized_from = str(raw_onnx)
+            except Exception as exc_raw:
+                _fail(
+                    "Dynamic quantization failed for both optimized and raw ONNX. "
+                    f"optimized_error={exc_opt}; raw_error={exc_raw}"
+                )
 
     if not int8_onnx.exists():
         _fail(f"INT8 ONNX file was not created: {int8_onnx}")
@@ -213,6 +242,7 @@ def main() -> None:
             "mode": "dynamic",
             "weight_type": "QInt8",
             "reduce_range": True,
+            "quantized_from": quantized_from,
             "note": "Enabled to reduce AVX2 VPMADDUBSW saturation risk.",
         },
     }
