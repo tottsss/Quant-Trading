@@ -188,6 +188,14 @@ IOC_CANCEL_SECS = float(os.environ.get("RIT_MA_IOC_CANCEL_SECS", "0.20"))
 PING_AT_TOUCH = env_bool("RIT_MA_PING_AT_TOUCH", "1")
 HEDGE_TOP_BOOK_MULT = float(os.environ.get("RIT_MA_HEDGE_TOP_BOOK_MULT", "1.10"))
 HEDGE_MIN_TOP_SIZE = int(os.environ.get("RIT_MA_HEDGE_MIN_TOP_SIZE", "600"))
+ROBUST_MODE = env_bool("RIT_MA_ROBUST_MODE", "1")
+ROBUST_EVENT_WINDOW_SECS = float(os.environ.get("RIT_MA_EVENT_WINDOW_SECS", "14.0"))
+ROBUST_MIN_NEWS_DELTA = float(os.environ.get("RIT_MA_MIN_NEWS_DELTA", "0.06"))
+ROBUST_MIN_ENTRY_EDGE = float(os.environ.get("RIT_MA_MIN_ENTRY_EDGE", "0.10"))
+ROBUST_STOP_REENTRY_COOLDOWN_SECS = float(os.environ.get("RIT_MA_STOP_REENTRY_COOLDOWN_SECS", "3.0"))
+ROBUST_REQUIRE_HEDGE_ON_ENTRY = env_bool("RIT_MA_REQUIRE_HEDGE_ON_ENTRY", "1")
+ROBUST_DISABLE_CAPACITY_RECYCLER = env_bool("RIT_MA_DISABLE_CAPACITY_RECYCLER", "1")
+ROBUST_DISABLE_HEDGE_REBALANCE = env_bool("RIT_MA_DISABLE_HEDGE_REBALANCE", "1")
 
 # Deal definitions requested by user
 DEALS = {
@@ -840,6 +848,11 @@ class DealState:
     hold_start_ts: float = 0.0
     last_risk_reduce_ts: float = 0.0
     last_hedge_rebalance_ts: float = 0.0
+    last_news_update_ts: float = 0.0
+    last_news_id: int = 0
+    last_news_delta_abs: float = 0.0
+    last_entry_news_id: int = 0
+    last_stop_ts: float = 0.0
 
 
 @dataclass
@@ -1453,6 +1466,7 @@ class MergerArbBot:
 
                     base = BASE_CHANGE[(direction, severity)]
                     applied_updates: List[dict] = []
+                    news_ts = time.time()
                     with self.lock:
                         for deal_id in refs:
                             deal = DEALS[deal_id]
@@ -1460,6 +1474,9 @@ class MergerArbBot:
                             old_p = st.probability
                             delta = base * CATEGORY_MULT[cat] * float(deal["deal_mult"])
                             st.probability = clamp(st.probability + delta, 0.0, 1.0)
+                            st.last_news_update_ts = news_ts
+                            st.last_news_id = news_id
+                            st.last_news_delta_abs = abs(delta)
                             applied_updates.append(
                                 {
                                     "deal_id": deal_id,
@@ -1525,8 +1542,12 @@ class MergerArbBot:
                     log("MANUAL_SKIP invalid probability. Use e.g. 'D2 P 0.67'.")
                     continue
                 with self.lock:
-                    old_p = self.deal_states[deal_id].probability
-                    self.deal_states[deal_id].probability = p_new
+                    st = self.deal_states[deal_id]
+                    old_p = st.probability
+                    st.probability = p_new
+                    st.last_news_update_ts = time.time()
+                    st.last_news_id = max(st.last_news_id, self.last_news_id)
+                    st.last_news_delta_abs = abs(p_new - old_p)
                 log(f"MANUAL_SET deal={deal_id} p:{old_p:.4f}->{p_new:.4f}")
                 continue
 
@@ -1551,9 +1572,13 @@ class MergerArbBot:
 
             delta = BASE_CHANGE[(direction, severity)] * CATEGORY_MULT[category] * float(DEALS[deal_id]["deal_mult"])
             with self.lock:
-                old_p = self.deal_states[deal_id].probability
+                st = self.deal_states[deal_id]
+                old_p = st.probability
                 new_p = clamp(old_p + delta, 0.0, 1.0)
-                self.deal_states[deal_id].probability = new_p
+                st.probability = new_p
+                st.last_news_update_ts = time.time()
+                st.last_news_id = max(st.last_news_id, self.last_news_id)
+                st.last_news_delta_abs = abs(delta)
             log(
                 f"MANUAL_DELTA deal={deal_id} dir={direction} sev={severity} cat={category} "
                 f"delta={delta:+.4f} p:{old_p:.4f}->{new_p:.4f}"
@@ -1734,19 +1759,25 @@ class MergerArbBot:
                             hold_start_ts=st.hold_start_ts,
                             last_risk_reduce_ts=st.last_risk_reduce_ts,
                             last_hedge_rebalance_ts=st.last_hedge_rebalance_ts,
+                            last_news_update_ts=st.last_news_update_ts,
+                            last_news_id=st.last_news_id,
+                            last_news_delta_abs=st.last_news_delta_abs,
+                            last_entry_news_id=st.last_entry_news_id,
+                            last_stop_ts=st.last_stop_ts,
                         )
                         for deal_id, st in self.deal_states.items()
                     }
 
                 gross_used, net_used = compute_gross_net(positions)
-                gross_used, net_used = self._capacity_recycler(
-                    now=now,
-                    books=books,
-                    positions=positions,
-                    states_copy=states_copy,
-                    gross_used=gross_used,
-                    net_used=net_used,
-                )
+                if not (ROBUST_MODE and ROBUST_DISABLE_CAPACITY_RECYCLER):
+                    gross_used, net_used = self._capacity_recycler(
+                        now=now,
+                        books=books,
+                        positions=positions,
+                        states_copy=states_copy,
+                        gross_used=gross_used,
+                        net_used=net_used,
+                    )
                 with self.lock:
                     states_copy = {
                         deal_id: DealState(
@@ -1756,6 +1787,11 @@ class MergerArbBot:
                             hold_start_ts=st.hold_start_ts,
                             last_risk_reduce_ts=st.last_risk_reduce_ts,
                             last_hedge_rebalance_ts=st.last_hedge_rebalance_ts,
+                            last_news_update_ts=st.last_news_update_ts,
+                            last_news_id=st.last_news_id,
+                            last_news_delta_abs=st.last_news_delta_abs,
+                            last_entry_news_id=st.last_entry_news_id,
+                            last_stop_ts=st.last_stop_ts,
                         )
                         for deal_id, st in self.deal_states.items()
                     }
@@ -1818,6 +1854,7 @@ class MergerArbBot:
                                 live.last_trade_ts = now
                                 live.last_risk_reduce_ts = now
                                 live.hold_start_ts = 0.0 if int(positions.get(target, 0)) == 0 else now
+                                live.last_stop_ts = now
                         continue
 
                     if target_pos < 0 and t_ask >= p_star_sell + commission_cost + STOP_LOSS_BUFFER:
@@ -1859,6 +1896,7 @@ class MergerArbBot:
                                 live.last_trade_ts = now
                                 live.last_risk_reduce_ts = now
                                 live.hold_start_ts = 0.0 if int(positions.get(target, 0)) == 0 else now
+                                live.last_stop_ts = now
                         continue
 
                     # Exit logic: flatten when price converges back to model.
@@ -2015,7 +2053,7 @@ class MergerArbBot:
                         continue
 
                     # Rebalance hedge drift when target leg exists but acquirer ratio has deviated.
-                    if ratio > 0 and target_pos != 0:
+                    if ratio > 0 and target_pos != 0 and not (ROBUST_MODE and ROBUST_DISABLE_HEDGE_REBALANCE):
                         desired_acq_pos = int(round(-ratio * target_pos))
                         hedge_gap = acq_pos - desired_acq_pos
                         can_rebalance = (now - st.last_hedge_rebalance_ts) >= HEDGE_REBALANCE_COOLDOWN_SECS
@@ -2065,6 +2103,17 @@ class MergerArbBot:
                     if action is None:
                         continue
 
+                    if ROBUST_MODE:
+                        news_age = (now - st.last_news_update_ts) if st.last_news_update_ts > 0 else 1e9
+                        if st.last_news_id <= 0 or news_age > ROBUST_EVENT_WINDOW_SECS:
+                            continue
+                        if st.last_news_delta_abs < ROBUST_MIN_NEWS_DELTA:
+                            continue
+                        if st.last_entry_news_id >= st.last_news_id:
+                            continue
+                        if (now - st.last_stop_ts) < ROBUST_STOP_REENTRY_COOLDOWN_SECS:
+                            continue
+
                     friction = compute_transaction_friction(ratio, t_bid, t_ask, a_bid, a_ask)
                     base_threshold = max(MISPRICING_THRESHOLD, friction + MIN_PROFIT_MARGIN)
                     dyn_threshold = inventory_adjusted_threshold(
@@ -2074,10 +2123,13 @@ class MergerArbBot:
                         gross_used=gross_used,
                         net_used=net_used,
                     )
-                    if edge <= dyn_threshold:
+                    required_edge = dyn_threshold
+                    if ROBUST_MODE:
+                        required_edge = max(required_edge, ROBUST_MIN_ENTRY_EDGE)
+                    if edge <= required_edge:
                         continue
 
-                    edge_mult = max(1.0, min(4.0, edge / max(0.01, dyn_threshold)))
+                    edge_mult = max(1.0, min(4.0, edge / max(0.01, required_edge)))
                     seed_qty = int(BASE_ORDER_QTY * edge_mult)
                     target_cap = PER_DEAL_TARGET_MAX
                     acq_cap = per_deal_acq_cap(ratio)
@@ -2111,6 +2163,9 @@ class MergerArbBot:
                     if target_qty < MIN_ORDER_QTY:
                         continue
 
+                    if ROBUST_MODE and ROBUST_REQUIRE_HEDGE_ON_ENTRY and ratio > 0 and hedge_qty < ORDER_STEP:
+                        continue
+
                     target_ok, hedge_ok = self._submit_pair(
                         deal_id=deal_id,
                         target=target,
@@ -2139,6 +2194,8 @@ class MergerArbBot:
                             live = self.deal_states[deal_id]
                             live.last_trade_ts = now
                             live.hold_start_ts = now if int(positions.get(target, 0)) != 0 else 0.0
+                            if target_ok and ROBUST_MODE:
+                                live.last_entry_news_id = max(live.last_entry_news_id, st.last_news_id)
 
                 loop_errors = 0
                 time.sleep(TRADE_LOOP_SECS)
@@ -2183,6 +2240,14 @@ class MergerArbBot:
                         "PING_AT_TOUCH": PING_AT_TOUCH,
                         "HEDGE_TOP_BOOK_MULT": HEDGE_TOP_BOOK_MULT,
                         "HEDGE_MIN_TOP_SIZE": HEDGE_MIN_TOP_SIZE,
+                        "ROBUST_MODE": ROBUST_MODE,
+                        "ROBUST_EVENT_WINDOW_SECS": ROBUST_EVENT_WINDOW_SECS,
+                        "ROBUST_MIN_NEWS_DELTA": ROBUST_MIN_NEWS_DELTA,
+                        "ROBUST_MIN_ENTRY_EDGE": ROBUST_MIN_ENTRY_EDGE,
+                        "ROBUST_STOP_REENTRY_COOLDOWN_SECS": ROBUST_STOP_REENTRY_COOLDOWN_SECS,
+                        "ROBUST_REQUIRE_HEDGE_ON_ENTRY": ROBUST_REQUIRE_HEDGE_ON_ENTRY,
+                        "ROBUST_DISABLE_CAPACITY_RECYCLER": ROBUST_DISABLE_CAPACITY_RECYCLER,
+                        "ROBUST_DISABLE_HEDGE_REBALANCE": ROBUST_DISABLE_HEDGE_REBALANCE,
                         "TRADE_LOOP_SECS": TRADE_LOOP_SECS,
                         "NEWS_POLL_SECS": NEWS_POLL_SECS,
                         "USE_FINBERT": USE_FINBERT,
@@ -2212,6 +2277,9 @@ class MergerArbBot:
             f"per_deal_target_cap={PER_DEAL_TARGET_MAX} stale_cancel={STALE_ORDER_SECS:.2f}s "
             f"ioc={ENABLE_IOC_EMULATION} ioc_t={IOC_CANCEL_SECS:.2f}s ping_touch={PING_AT_TOUCH} "
             f"hedge_top_mult={HEDGE_TOP_BOOK_MULT:.2f} hedge_min_top={HEDGE_MIN_TOP_SIZE} "
+            f"robust={ROBUST_MODE} evt_win={ROBUST_EVENT_WINDOW_SECS:.1f}s "
+            f"news_delta>={ROBUST_MIN_NEWS_DELTA:.3f} entry_edge>={ROBUST_MIN_ENTRY_EDGE:.3f} "
+            f"stop_cooldown={ROBUST_STOP_REENTRY_COOLDOWN_SECS:.1f}s "
             f"finbert={'ON' if self.finbert_enabled else 'OFF'}"
         )
 
@@ -2265,6 +2333,11 @@ class MergerArbBot:
                             "hold_start_ts": st.hold_start_ts,
                             "last_risk_reduce_ts": st.last_risk_reduce_ts,
                             "last_hedge_rebalance_ts": st.last_hedge_rebalance_ts,
+                            "last_news_update_ts": st.last_news_update_ts,
+                            "last_news_id": st.last_news_id,
+                            "last_news_delta_abs": st.last_news_delta_abs,
+                            "last_entry_news_id": st.last_entry_news_id,
+                            "last_stop_ts": st.last_stop_ts,
                         }
                 with self.order_meta_lock:
                     pending_deltas = dict(self.pending_pos_deltas)
