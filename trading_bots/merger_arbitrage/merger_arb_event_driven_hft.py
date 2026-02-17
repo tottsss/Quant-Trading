@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
 
@@ -161,11 +161,12 @@ FINBERT_GAP_THRESHOLD = float(os.environ.get("RIT_MA_FINBERT_GAP_THRESHOLD", "0.
 FINBERT_SEV_MEDIUM = float(os.environ.get("RIT_MA_FINBERT_SEV_MEDIUM", "0.65"))
 FINBERT_SEV_LARGE = float(os.environ.get("RIT_MA_FINBERT_SEV_LARGE", "0.80"))
 FINBERT_CATEGORY_FALLBACK = os.environ.get("RIT_MA_FINBERT_CATEGORY_FALLBACK", "FIN").strip().upper()
-
-if not USE_FINBERT:
-    raise RuntimeError(
-        "Keyword parser has been removed. This strategy is FinBERT-only; set RIT_MA_USE_FINBERT=1."
-    )
+FINBERT_STRICT = env_bool("RIT_MA_FINBERT_STRICT", "0")
+ENABLE_KEYWORD_FALLBACK = env_bool("RIT_MA_ENABLE_KEYWORD_FALLBACK", "1")
+ENABLE_FINBERT_CONTINUOUS_DELTA = env_bool("RIT_MA_FINBERT_CONTINUOUS_DELTA", "1")
+FINBERT_CONTINUOUS_SCALE = float(os.environ.get("RIT_MA_FINBERT_CONTINUOUS_SCALE", "0.18"))
+FINBERT_CONTINUOUS_MIN_GAP = float(os.environ.get("RIT_MA_FINBERT_CONTINUOUS_MIN_GAP", "0.04"))
+NEWS_DEDUPE_CACHE_SIZE = int(os.environ.get("RIT_MA_NEWS_DEDUPE_CACHE_SIZE", "5000"))
 
 # Risk limits from case package
 GROSS_LIMIT = 100_000
@@ -188,6 +189,8 @@ IOC_CANCEL_SECS = float(os.environ.get("RIT_MA_IOC_CANCEL_SECS", "0.20"))
 PING_AT_TOUCH = env_bool("RIT_MA_PING_AT_TOUCH", "1")
 HEDGE_TOP_BOOK_MULT = float(os.environ.get("RIT_MA_HEDGE_TOP_BOOK_MULT", "1.10"))
 HEDGE_MIN_TOP_SIZE = int(os.environ.get("RIT_MA_HEDGE_MIN_TOP_SIZE", "600"))
+HEDGE_RATIO_MODE = os.environ.get("RIT_MA_HEDGE_RATIO_MODE", "BLEND").strip().upper()
+HEDGE_BLEND_FULL_WEIGHT = float(os.environ.get("RIT_MA_HEDGE_BLEND_FULL_WEIGHT", "0.35"))
 ROBUST_MODE = env_bool("RIT_MA_ROBUST_MODE", "1")
 ROBUST_EVENT_WINDOW_SECS = float(os.environ.get("RIT_MA_EVENT_WINDOW_SECS", "14.0"))
 ROBUST_MIN_NEWS_DELTA = float(os.environ.get("RIT_MA_MIN_NEWS_DELTA", "0.06"))
@@ -196,6 +199,11 @@ ROBUST_STOP_REENTRY_COOLDOWN_SECS = float(os.environ.get("RIT_MA_STOP_REENTRY_CO
 ROBUST_REQUIRE_HEDGE_ON_ENTRY = env_bool("RIT_MA_REQUIRE_HEDGE_ON_ENTRY", "1")
 ROBUST_DISABLE_CAPACITY_RECYCLER = env_bool("RIT_MA_DISABLE_CAPACITY_RECYCLER", "1")
 ROBUST_DISABLE_HEDGE_REBALANCE = env_bool("RIT_MA_DISABLE_HEDGE_REBALANCE", "1")
+CANCEL_ON_MODEL_MOVE = env_bool("RIT_MA_CANCEL_ON_MODEL_MOVE", "1")
+ENABLE_PERIOD_RESET = env_bool("RIT_MA_HANDLE_PERIOD_RESET", "1")
+FLATTEN_ON_PERIOD_CHANGE = env_bool("RIT_MA_FLATTEN_ON_PERIOD_CHANGE", "1")
+PERIOD_RESET_WARMUP_SECS = float(os.environ.get("RIT_MA_PERIOD_RESET_WARMUP_SECS", "1.0"))
+PERIOD_FLATTEN_MAX_ROUNDS = int(os.environ.get("RIT_MA_PERIOD_FLATTEN_MAX_ROUNDS", "6"))
 
 # Deal definitions requested by user
 DEALS = {
@@ -300,7 +308,7 @@ ENTITY_TO_DEAL = {
     "EEC": "D5",
     "SOLARPEAK": "D5",
     "SPK": "D5",
-    "SOLAR": "D5",
+    "SOLAR": "D5",  
     "RENEWABLE": "D5",
 }
 
@@ -321,6 +329,130 @@ FLOW_DISLOCATION_PHRASES = {
     "TEMPORARY DISLOCATIONS",
     "MAY NOT REFLECT FUNDAMENTAL CHANGES",
     "MAY NOT REFLECT FUNDAMENTAL",
+}
+
+KEYWORD_CATEGORY_PHRASES: Dict[str, Set[str]] = {
+    "REG": {
+        "APPROVAL",
+        "APPROVES",
+        "APPROVED",
+        "CLEARANCE",
+        "CLEARS",
+        "ANTITRUST",
+        "DOJ",
+        "FTC",
+        "FEDERAL RESERVE",
+        "FDIC",
+        "FERC",
+        "SEC",
+        "REGULATOR",
+        "REGULATORY",
+        "HEARING",
+    },
+    "FIN": {
+        "FINANCING",
+        "FUNDING",
+        "DEBT",
+        "CREDIT",
+        "LIQUIDITY",
+        "COVENANT",
+        "SYNDICATE",
+        "BRIDGE LOAN",
+        "COMMITTED FACILITY",
+        "CASH BALANCE",
+    },
+    "SHR": {
+        "SHAREHOLDER",
+        "SHAREHOLDERS",
+        "VOTE",
+        "PROXY",
+        "BOARD",
+        "ACTIVIST",
+        "TENDER",
+        "CONSENT",
+        "SUPPORT AGREEMENT",
+    },
+    "ALT": {
+        "COMPETING BID",
+        "RIVAL BID",
+        "TOPPING BID",
+        "ALTERNATIVE BID",
+        "UNSOLICITED OFFER",
+        "AUCTION PROCESS",
+        "GO-SHOP",
+    },
+    "PRC": {
+        "REVISED TERMS",
+        "PRICE CUT",
+        "PRICE INCREASE",
+        "CONSIDERATION",
+        "EXCHANGE RATIO",
+        "SWEETENED OFFER",
+    },
+}
+
+KEYWORD_DIRECTION_POS_PHRASES: Set[str] = {
+    "APPROVES",
+    "APPROVED",
+    "CLEARS",
+    "CLEARED",
+    "SECURES FINANCING",
+    "FINANCING SECURED",
+    "SUPPORTS",
+    "ENDORSES",
+    "RAISES BID",
+    "SWEETENED OFFER",
+    "CONFIRMS GUIDANCE",
+    "AFFIRMS COMMITMENT",
+}
+
+KEYWORD_DIRECTION_NEG_PHRASES: Set[str] = {
+    "BLOCKS",
+    "BLOCKED",
+    "CHALLENGES",
+    "LAWSUIT",
+    "SUES",
+    "DELAY",
+    "DELAYED",
+    "TERMINATES",
+    "TERMINATED",
+    "WITHDRAWS",
+    "WITHDRAWN",
+    "FINANCING RISK",
+    "COVENANT BREACH",
+    "DEFAULT",
+    "REJECTS",
+    "DENIES",
+}
+
+KEYWORD_SEVERITY_LARGE_PHRASES: Set[str] = {
+    "TERMINATES",
+    "TERMINATED",
+    "BLOCKS",
+    "BLOCKED",
+    "LAWSUIT",
+    "SUES",
+    "DEFAULT",
+    "COVENANT BREACH",
+    "TOPPING BID",
+    "COMPETING BID",
+    "RIVAL BID",
+    "RAISES BID",
+}
+
+KEYWORD_SEVERITY_MEDIUM_PHRASES: Set[str] = {
+    "DELAY",
+    "DELAYED",
+    "HEARING",
+    "APPROVES",
+    "APPROVED",
+    "CLEARS",
+    "CLEARED",
+    "FINANCING",
+    "VOTE",
+    "PROXY",
+    "SUPPORTS",
+    "REVISED TERMS",
 }
 
 
@@ -621,6 +753,71 @@ def classify_category(text: str) -> Optional[str]:
     return None
 
 
+def classify_category_keywords(text: str) -> Tuple[Optional[str], Dict[str, List[str]]]:
+    hits_by_cat: Dict[str, List[str]] = {}
+    for cat, phrases in KEYWORD_CATEGORY_PHRASES.items():
+        hits = phrase_hits(text, phrases)
+        if hits:
+            hits_by_cat[cat] = hits
+    if not hits_by_cat:
+        return None, {}
+    # Prefer the category with the most direct keyword hits.
+    ranked = sorted(hits_by_cat.items(), key=lambda item: (-len(item[1]), item[0]))
+    return ranked[0][0], hits_by_cat
+
+
+def classify_direction_keywords(text: str) -> Tuple[Optional[str], Optional[str], Dict[str, List[str]]]:
+    pos_hits = phrase_hits(text, KEYWORD_DIRECTION_POS_PHRASES)
+    neg_hits = phrase_hits(text, KEYWORD_DIRECTION_NEG_PHRASES)
+    large_hits = phrase_hits(text, KEYWORD_SEVERITY_LARGE_PHRASES)
+    medium_hits = phrase_hits(text, KEYWORD_SEVERITY_MEDIUM_PHRASES)
+    meta = {
+        "pos_hits": pos_hits,
+        "neg_hits": neg_hits,
+        "large_hits": large_hits,
+        "medium_hits": medium_hits,
+    }
+    if not pos_hits and not neg_hits:
+        return None, None, meta
+    if len(pos_hits) == len(neg_hits):
+        # Keep ties neutral to avoid overfitting noisy headlines.
+        return None, None, meta
+
+    direction = "POS" if len(pos_hits) > len(neg_hits) else "NEG"
+    sev_score = 2 * len(large_hits) + len(medium_hits)
+    if sev_score >= 3:
+        severity = "L"
+    elif sev_score >= 1:
+        severity = "M"
+    else:
+        severity = "S"
+    return direction, severity, meta
+
+
+def finbert_continuous_base_delta(finbert_meta: Optional[dict]) -> Optional[float]:
+    if not ENABLE_FINBERT_CONTINUOUS_DELTA or not finbert_meta:
+        return None
+    if "error" in finbert_meta:
+        return None
+    p_pos = _safe_float(finbert_meta.get("positive_probability"))
+    p_neg = _safe_float(finbert_meta.get("negative_probability"))
+    if p_pos is None or p_neg is None:
+        return None
+    signed_gap = p_pos - p_neg
+    if abs(signed_gap) < FINBERT_CONTINUOUS_MIN_GAP:
+        return None
+    return FINBERT_CONTINUOUS_SCALE * signed_gap
+
+
+def severity_from_delta(delta_base: float) -> str:
+    mag = abs(delta_base)
+    if mag >= 0.12:
+        return "L"
+    if mag >= 0.06:
+        return "M"
+    return "S"
+
+
 def phrase_hits(text: str, phrases: Iterable[str]) -> List[str]:
     text_upper = text.upper()
     hits: List[str] = []
@@ -774,8 +971,21 @@ def max_qty_for_position_cap(position: int, action: str, cap_abs: int) -> int:
     return max(0, position + cap_abs)
 
 
+def effective_hedge_ratio(raw_ratio: float, probability: float) -> float:
+    if raw_ratio <= 0:
+        return 0.0
+    p = clamp(probability, 0.0, 1.0)
+    mode = HEDGE_RATIO_MODE
+    if mode == "FULL":
+        return raw_ratio
+    if mode == "PROB":
+        return raw_ratio * p
+    blend_full = clamp(HEDGE_BLEND_FULL_WEIGHT, 0.0, 1.0)
+    return raw_ratio * (blend_full + (1.0 - blend_full) * p)
+
+
 def scale_target_qty(
-    ratio: float,
+    hedge_ratio: float,
     seed_qty: int,
     action: str,
     target_ticker: str,
@@ -784,9 +994,10 @@ def scale_target_qty(
     max_target_qty: Optional[int] = None,
 ) -> Tuple[int, int]:
     """Return target_qty, hedge_qty that satisfy order size and risk limits."""
+    hedge_ratio = max(0.0, float(hedge_ratio))
     max_by_order = MAX_ORDER_SIZE
-    if ratio > 0:
-        max_by_order = min(max_by_order, int(MAX_ORDER_SIZE / ratio))
+    if hedge_ratio > 0:
+        max_by_order = min(max_by_order, int(MAX_ORDER_SIZE / hedge_ratio))
     if max_target_qty is not None:
         max_by_order = min(max_by_order, max_target_qty)
         if max_by_order <= 0:
@@ -795,7 +1006,7 @@ def scale_target_qty(
     qty = max(MIN_ORDER_QTY, qty - (qty % ORDER_STEP))
 
     while qty >= MIN_ORDER_QTY:
-        hedge_qty = int(round(ratio * qty))
+        hedge_qty = int(round(hedge_ratio * qty))
         target_delta = qty if action == "BUY" else -qty
         hedge_delta = 0
         if hedge_qty > 0:
@@ -873,6 +1084,10 @@ class MergerArbBot:
         self.lock = threading.Lock()
         self.running = True
         self.last_news_id = 0
+        self.last_news_id_by_period: Dict[int, int] = {}
+        self.current_period: Optional[int] = None
+        self.seen_news_keys: Set[Tuple[int, int]] = set()
+        self.seen_news_queue: List[Tuple[int, int]] = []
         self.last_snapshot_ts = 0.0
         self.deal_ticker_to_id: Dict[str, str] = {}
         self.trade_tickers: List[str] = []
@@ -892,7 +1107,7 @@ class MergerArbBot:
             self.deal_ticker_to_id[deal["acquirer"].upper()] = deal_id
         self.trade_tickers = sorted(self.deal_ticker_to_id.keys())
 
-    def initialize(self) -> None:
+    def initialize(self, warmup_secs: Optional[float] = None) -> None:
         case = self.client.get_case()
         if case.get("status") != "ACTIVE":
             log(f"Case status is {case.get('status')}. Waiting for ACTIVE...")
@@ -902,9 +1117,12 @@ class MergerArbBot:
                 if case.get("status") == "ACTIVE":
                     break
 
-        if INIT_WARMUP_SECS > 0:
-            log(f"INIT warmup for {INIT_WARMUP_SECS:.1f}s to stabilize opening spread.")
-            time.sleep(INIT_WARMUP_SECS)
+        if warmup_secs is None:
+            warmup_secs = INIT_WARMUP_SECS
+        warmup_secs = max(0.0, float(warmup_secs))
+        if warmup_secs > 0:
+            log(f"INIT warmup for {warmup_secs:.1f}s to stabilize opening spread.")
+            time.sleep(warmup_secs)
 
         mids = average_snapshot_mid(
             self.client,
@@ -912,7 +1130,14 @@ class MergerArbBot:
             samples=INIT_SNAPSHOTS,
             sleep_s=INIT_SAMPLE_INTERVAL_SECS,
         )
+        period_raw = case.get("period")
+        period = _safe_int(period_raw) if period_raw is not None else None
         with self.lock:
+            if period is not None:
+                self.current_period = period
+                if period not in self.last_news_id_by_period:
+                    self.last_news_id_by_period[period] = 0
+                self.last_news_id = self.last_news_id_by_period[period]
             for deal_id, deal in DEALS.items():
                 target = deal["target"].upper()
                 acquirer = deal["acquirer"].upper()
@@ -1009,13 +1234,28 @@ class MergerArbBot:
 
     def _initialize_finbert(self) -> None:
         if not USE_FINBERT:
-            raise RuntimeError("This strategy is FinBERT-only and requires RIT_MA_USE_FINBERT=1.")
+            self.finbert = None
+            self.finbert_enabled = False
+            log("FINBERT disabled by config; keyword/continuous fallback paths are active.", level="WARN")
+            return
         model_path, tokenizer_path, note = _detect_finbert_assets(FINBERT_ONNX_MODEL, FINBERT_TOKENIZER_DIR)
         if model_path is None or tokenizer_path is None:
-            raise RuntimeError(f"FinBERT assets missing: {note}")
+            msg = f"FinBERT assets missing: {note}"
+            if FINBERT_STRICT:
+                raise RuntimeError(msg)
+            self.finbert = None
+            self.finbert_enabled = False
+            log(f"{msg}. Continuing with fallback classifier.", level="WARN")
+            return
         trader_cls, err = _load_finbert_trader_class()
         if trader_cls is None:
-            raise RuntimeError(f"FinBERT module unavailable: {err}")
+            msg = f"FinBERT module unavailable: {err}"
+            if FINBERT_STRICT:
+                raise RuntimeError(msg)
+            self.finbert = None
+            self.finbert_enabled = False
+            log(f"{msg}. Continuing with fallback classifier.", level="WARN")
+            return
         try:
             self.finbert = trader_cls(
                 onnx_model_path=str(model_path),
@@ -1030,7 +1270,11 @@ class MergerArbBot:
                 f"pos_thr={FINBERT_POS_THRESHOLD:.2f} neg_thr={FINBERT_NEG_THRESHOLD:.2f}",
             )
         except Exception as exc:
-            raise RuntimeError(f"FinBERT init failed: {exc}") from exc
+            if FINBERT_STRICT:
+                raise RuntimeError(f"FinBERT init failed: {exc}") from exc
+            self.finbert = None
+            self.finbert_enabled = False
+            log(f"FinBERT init failed: {exc}. Continuing with fallback classifier.", level="WARN")
 
     def _finbert_infer_direction(self, text: str) -> Tuple[Optional[str], str, Optional[dict]]:
         if self.finbert is None:
@@ -1174,6 +1418,139 @@ class MergerArbBot:
             except Exception:
                 pass
 
+    def _remember_news_key(self, period: Optional[int], news_id: int) -> bool:
+        period_key = -1 if period is None else int(period)
+        key = (period_key, int(news_id))
+        with self.lock:
+            if key in self.seen_news_keys:
+                return False
+            self.seen_news_keys.add(key)
+            self.seen_news_queue.append(key)
+            max_cache = max(200, NEWS_DEDUPE_CACHE_SIZE)
+            if len(self.seen_news_queue) > max_cache:
+                old = self.seen_news_queue.pop(0)
+                self.seen_news_keys.discard(old)
+        return True
+
+    def _cancel_open_orders(self, reason: str, tickers: Optional[Iterable[str]] = None) -> int:
+        ticker_filter = {t.upper() for t in tickers} if tickers is not None else None
+        try:
+            open_orders = self.client.get_orders(status="OPEN")
+        except Exception as exc:
+            log(f"ORDERS_WARN unable to cancel for reason={reason}: {exc}")
+            return 0
+
+        cancelled = 0
+        for order in open_orders:
+            oid = order.get("order_id")
+            if oid is None:
+                continue
+            try:
+                order_id = int(oid)
+            except Exception:
+                continue
+            ticker = str(order.get("ticker") or "").upper()
+            if ticker_filter is not None and ticker not in ticker_filter:
+                continue
+            try:
+                self.client.cancel_order(order_id)
+                cancelled += 1
+                with self.order_meta_lock:
+                    meta = self.open_order_meta.pop(order_id, None)
+                    if meta is not None:
+                        self._apply_pending_delta_locked(meta.ticker, -meta.pending_delta)
+            except Exception:
+                continue
+
+        if cancelled > 0:
+            scope = "ALL" if ticker_filter is None else ",".join(sorted(ticker_filter))
+            log(f"CANCEL_BULK count={cancelled} reason={reason} scope={scope}")
+        return cancelled
+
+    def _cancel_orders_for_deals(self, deal_ids: Iterable[str], reason: str) -> None:
+        if not CANCEL_ON_MODEL_MOVE:
+            return
+        tickers: Set[str] = set()
+        for deal_id in set(deal_ids):
+            deal = DEALS.get(deal_id)
+            if deal is None:
+                continue
+            tickers.add(deal["target"].upper())
+            tickers.add(deal["acquirer"].upper())
+        if tickers:
+            self._cancel_open_orders(reason=reason, tickers=tickers)
+
+    def _flatten_positions(self, reason: str, max_rounds: int) -> None:
+        rounds = max(1, int(max_rounds))
+        for _ in range(rounds):
+            positions = self._safe_positions()
+            to_close = {
+                ticker.upper(): int(pos)
+                for ticker, pos in positions.items()
+                if ticker.upper() in self.trade_tickers and abs(int(pos)) >= ORDER_STEP
+            }
+            if not to_close:
+                return
+
+            books = self._fetch_books_parallel()
+            placed = False
+            for ticker, pos in sorted(to_close.items(), key=lambda item: -abs(item[1])):
+                if ticker in books:
+                    bid, ask, _, _, _ = books[ticker]
+                else:
+                    try:
+                        book = self.client.get_book(ticker)
+                        bid, ask, _, _ = top_of_book_from_book(book)
+                        if bid is None or ask is None:
+                            continue
+                    except Exception:
+                        continue
+
+                action = "SELL" if pos > 0 else "BUY"
+                qty = close_qty_for_position(abs(pos))
+                if qty < ORDER_STEP:
+                    continue
+                if self._submit_single(
+                    deal_id="SYS",
+                    ticker=ticker,
+                    action=action,
+                    qty=qty,
+                    bid=bid,
+                    ask=ask,
+                    reason=reason,
+                ):
+                    placed = True
+            if not placed:
+                break
+            time.sleep(max(0.05, TRADE_LOOP_SECS))
+
+    def _handle_period_transition(self, prev_period: Optional[int], new_period: int) -> None:
+        log(f"PERIOD_CHANGE old={prev_period} new={new_period}")
+        self._cancel_open_orders(reason="PERIOD_CHANGE_PRE")
+        if FLATTEN_ON_PERIOD_CHANGE:
+            self._flatten_positions(reason="PERIOD_CHANGE_FLATTEN", max_rounds=PERIOD_FLATTEN_MAX_ROUNDS)
+            self._cancel_open_orders(reason="PERIOD_CHANGE_POST_FLATTEN")
+        with self.order_meta_lock:
+            self.open_order_meta.clear()
+            self.pending_pos_deltas.clear()
+        with self.lock:
+            self.current_period = int(new_period)
+            self.last_news_id_by_period[int(new_period)] = 0
+            self.last_news_id = 0
+            for deal_id, st in self.deal_states.items():
+                p0 = float(DEALS[deal_id]["p0"])
+                st.probability = p0
+                st.last_trade_ts = 0.0
+                st.hold_start_ts = 0.0
+                st.last_risk_reduce_ts = 0.0
+                st.last_hedge_rebalance_ts = 0.0
+                st.last_news_update_ts = 0.0
+                st.last_news_id = 0
+                st.last_news_delta_abs = 0.0
+                st.last_entry_news_id = 0
+                st.last_stop_ts = 0.0
+        self.initialize(warmup_secs=PERIOD_RESET_WARMUP_SECS)
+
     def _submit_pair(
         self,
         deal_id: str,
@@ -1316,7 +1693,14 @@ class MergerArbBot:
         idle_errors = 0
         while self.running:
             try:
-                news = self.client.get_news(since=self.last_news_id, limit=40)
+                with self.lock:
+                    active_period = self.current_period
+                    if active_period is not None:
+                        since_id = int(self.last_news_id_by_period.get(active_period, 0))
+                    else:
+                        since_id = int(self.last_news_id)
+
+                news = self.client.get_news(since=since_id, limit=40)
                 if not news:
                     idle_errors = 0
                     time.sleep(NEWS_POLL_SECS)
@@ -1325,8 +1709,27 @@ class MergerArbBot:
                 news_sorted = sorted(news, key=lambda x: x.get("news_id", 0))
                 for item in news_sorted:
                     news_id = int(item.get("news_id", 0))
-                    if news_id <= self.last_news_id:
+                    if news_id <= since_id:
                         continue
+
+                    item_period_raw = item.get("period")
+                    item_period = _safe_int(item_period_raw) if item_period_raw is not None else None
+                    period_key = item_period if item_period is not None else active_period
+
+                    if not self._remember_news_key(period_key, news_id):
+                        continue
+                    if active_period is not None and item_period is not None and item_period != active_period:
+                        continue
+
+                    with self.lock:
+                        if active_period is not None:
+                            self.last_news_id_by_period[active_period] = max(
+                                int(self.last_news_id_by_period.get(active_period, 0)),
+                                news_id,
+                            )
+                            self.last_news_id = int(self.last_news_id_by_period[active_period])
+                        else:
+                            self.last_news_id = max(self.last_news_id, news_id)
 
                     headline = str(item.get("headline") or "")
                     body = str(item.get("body") or "")
@@ -1357,24 +1760,73 @@ class MergerArbBot:
                     cat_explicit = classify_category(text)
                     cat = cat_explicit
                     category_source = "explicit" if cat_explicit is not None else "none"
+                    cat_keyword = None
+                    cat_keyword_hits: Dict[str, List[str]] = {}
+                    if cat is None and ENABLE_KEYWORD_FALLBACK:
+                        cat_keyword, cat_keyword_hits = classify_category_keywords(text)
+                        if cat_keyword is not None:
+                            cat = cat_keyword
+                            category_source = "keyword"
                     if cat is None and FINBERT_CATEGORY_FALLBACK in CATEGORY_MULT:
                         cat = FINBERT_CATEGORY_FALLBACK
                         category_source = "fallback"
 
-                    self.last_news_id = max(self.last_news_id, news_id)
-
                     finbert_direction, finbert_severity, finbert_meta = self._finbert_infer_direction(text)
+                    keyword_direction = None
+                    keyword_severity = None
+                    keyword_meta: Dict[str, List[str]] = {
+                        "pos_hits": [],
+                        "neg_hits": [],
+                        "large_hits": [],
+                        "medium_hits": [],
+                    }
+                    if ENABLE_KEYWORD_FALLBACK:
+                        keyword_direction, keyword_severity, keyword_meta = classify_direction_keywords(text)
+
                     direction = finbert_direction
                     severity = finbert_severity
+                    signal_source = "finbert_threshold" if finbert_direction is not None else "none"
+                    base_delta_override = finbert_continuous_base_delta(finbert_meta)
+
+                    if direction is None and keyword_direction is not None:
+                        direction = keyword_direction
+                        severity = keyword_severity or "S"
+                        signal_source = "keyword_fallback"
+
+                    if direction is None and base_delta_override is not None:
+                        direction = "POS" if base_delta_override > 0 else "NEG"
+                        severity = severity_from_delta(base_delta_override)
+                        signal_source = "finbert_continuous"
+
+                    if severity not in {"S", "M", "L"}:
+                        severity = "S"
+
+                    base_delta = None
+                    if base_delta_override is not None and signal_source == "finbert_continuous":
+                        base_delta = base_delta_override
+                    elif direction is not None:
+                        base_delta = BASE_CHANGE.get((direction, severity))
 
                     classifier_meta = {
-                        "mode": "finbert_only",
+                        "mode": "hybrid_finbert_keyword",
+                        "signal_source": signal_source,
                         "finbert": {
                             "enabled": self.finbert_enabled,
                             "direction": finbert_direction,
                             "severity": finbert_severity,
                             "meta": finbert_meta,
                         },
+                        "keyword": {
+                            "enabled": ENABLE_KEYWORD_FALLBACK,
+                            "direction": keyword_direction,
+                            "severity": keyword_severity,
+                            "meta": keyword_meta,
+                            "category": cat_keyword,
+                            "category_hits": cat_keyword_hits,
+                        },
+                        "continuous_base_delta": (
+                            round(base_delta_override, 6) if base_delta_override is not None else None
+                        ),
                         "reference_matches": ref_matches,
                         "category_source": category_source,
                         "filters": {
@@ -1444,8 +1896,8 @@ class MergerArbBot:
                             )
                         continue
 
-                    if cat is None or direction is None:
-                        skip_reason = "CLASSIFICATION_INCOMPLETE" if cat is None else "NO_FINBERT_SIGNAL"
+                    if cat is None or base_delta is None:
+                        skip_reason = "CLASSIFICATION_INCOMPLETE" if cat is None else "NO_DIRECTIONAL_SIGNAL"
                         log(
                             f"NEWS_SKIP id={news_id} refs={','.join(refs)} "
                             f"cat={cat} dir={direction} sev={severity} head='{headline[:90]}'{finbert_audit}"
@@ -1464,19 +1916,20 @@ class MergerArbBot:
                             )
                         continue
 
-                    base = BASE_CHANGE[(direction, severity)]
                     applied_updates: List[dict] = []
                     news_ts = time.time()
+                    updated_deals: List[str] = []
                     with self.lock:
                         for deal_id in refs:
                             deal = DEALS[deal_id]
                             st = self.deal_states[deal_id]
                             old_p = st.probability
-                            delta = base * CATEGORY_MULT[cat] * float(deal["deal_mult"])
+                            delta = float(base_delta) * CATEGORY_MULT[cat] * float(deal["deal_mult"])
                             st.probability = clamp(st.probability + delta, 0.0, 1.0)
                             st.last_news_update_ts = news_ts
                             st.last_news_id = news_id
                             st.last_news_delta_abs = abs(delta)
+                            updated_deals.append(deal_id)
                             applied_updates.append(
                                 {
                                     "deal_id": deal_id,
@@ -1490,6 +1943,10 @@ class MergerArbBot:
                                 f"delta={delta:+.4f} p:{old_p:.4f}->{st.probability:.4f} "
                                 f"head='{headline[:100]}'"
                             )
+                    self._cancel_orders_for_deals(
+                        deal_ids=updated_deals,
+                        reason=f"MODEL_MOVE_NEWS_{news_id}",
+                    )
                     if RUN_RECORDER is not None:
                         RUN_RECORDER.add_news(
                             item=item,
@@ -1549,6 +2006,7 @@ class MergerArbBot:
                     st.last_news_id = max(st.last_news_id, self.last_news_id)
                     st.last_news_delta_abs = abs(p_new - old_p)
                 log(f"MANUAL_SET deal={deal_id} p:{old_p:.4f}->{p_new:.4f}")
+                self._cancel_orders_for_deals([deal_id], reason="MODEL_MOVE_MANUAL_SET")
                 continue
 
             if len(parts) not in {3, 4}:
@@ -1583,6 +2041,7 @@ class MergerArbBot:
                 f"MANUAL_DELTA deal={deal_id} dir={direction} sev={severity} cat={category} "
                 f"delta={delta:+.4f} p:{old_p:.4f}->{new_p:.4f}"
             )
+            self._cancel_orders_for_deals([deal_id], reason="MODEL_MOVE_MANUAL_DELTA")
 
     def _periodic_snapshot(
         self,
@@ -1728,6 +2187,24 @@ class MergerArbBot:
                     log(f"Case status={case.get('status')} - stopping.")
                     self.running = False
                     break
+                period_raw = case.get("period")
+                period = _safe_int(period_raw) if period_raw is not None else None
+                if ENABLE_PERIOD_RESET and period is not None:
+                    prev_period = None
+                    changed = False
+                    with self.lock:
+                        prev_period = self.current_period
+                        if self.current_period is None:
+                            self.current_period = period
+                            if period not in self.last_news_id_by_period:
+                                self.last_news_id_by_period[period] = self.last_news_id
+                        elif period != self.current_period:
+                            changed = True
+                    if changed:
+                        self._handle_period_transition(prev_period=prev_period, new_period=period)
+                        loop_errors = 0
+                        time.sleep(TRADE_LOOP_SECS)
+                        continue
 
                 live_positions = self._safe_positions()
                 books = self._fetch_books_parallel()
@@ -1809,6 +2286,7 @@ class MergerArbBot:
                     a_bid, a_ask, _, a_bid_qty, a_ask_qty = books[acquirer]
                     p_star_buy, p_star_sell, _, _ = self._directional_pstars(st, deal, a_bid, a_ask)
                     ratio = float(deal["ratio"]) if deal["structure"] in {"stock", "mixed"} else 0.0
+                    entry_hedge_ratio = effective_hedge_ratio(ratio, st.probability)
                     commission_cost = COMMISSION_PER_SHARE * (1.0 + ratio)
                     target_pos = int(positions.get(target, 0))
                     acq_pos = int(positions.get(acquirer, 0))
@@ -2054,7 +2532,8 @@ class MergerArbBot:
 
                     # Rebalance hedge drift when target leg exists but acquirer ratio has deviated.
                     if ratio > 0 and target_pos != 0 and not (ROBUST_MODE and ROBUST_DISABLE_HEDGE_REBALANCE):
-                        desired_acq_pos = int(round(-ratio * target_pos))
+                        rebalance_ratio = effective_hedge_ratio(ratio, st.probability)
+                        desired_acq_pos = int(round(-rebalance_ratio * target_pos))
                         hedge_gap = acq_pos - desired_acq_pos
                         can_rebalance = (now - st.last_hedge_rebalance_ts) >= HEDGE_REBALANCE_COOLDOWN_SECS
                         if abs(hedge_gap) >= max(ORDER_STEP, HEDGE_REBALANCE_TRIGGER) and can_rebalance:
@@ -2114,7 +2593,7 @@ class MergerArbBot:
                         if (now - st.last_stop_ts) < ROBUST_STOP_REENTRY_COOLDOWN_SECS:
                             continue
 
-                    friction = compute_transaction_friction(ratio, t_bid, t_ask, a_bid, a_ask)
+                    friction = compute_transaction_friction(entry_hedge_ratio, t_bid, t_ask, a_bid, a_ask)
                     base_threshold = max(MISPRICING_THRESHOLD, friction + MIN_PROFIT_MARGIN)
                     dyn_threshold = inventory_adjusted_threshold(
                         base_threshold=base_threshold,
@@ -2135,14 +2614,14 @@ class MergerArbBot:
                     acq_cap = per_deal_acq_cap(ratio)
                     max_target_by_target_cap = max_qty_for_position_cap(target_pos, action, target_cap)
                     max_target_qty = max_target_by_target_cap
-                    if ratio > 0:
+                    if entry_hedge_ratio > 0:
                         hedge_side = "SELL" if action == "BUY" else "BUY"
                         max_hedge_by_cap = max_qty_for_position_cap(acq_pos, hedge_side, acq_cap)
-                        max_target_by_acq_cap = int(max_hedge_by_cap / max(1e-9, ratio))
+                        max_target_by_acq_cap = int(max_hedge_by_cap / max(1e-9, entry_hedge_ratio))
                         max_target_qty = min(max_target_qty, max_target_by_acq_cap)
 
                     target_qty, hedge_qty = scale_target_qty(
-                        ratio=ratio,
+                        hedge_ratio=entry_hedge_ratio,
                         seed_qty=seed_qty,
                         action=action,
                         target_ticker=target,
@@ -2154,7 +2633,7 @@ class MergerArbBot:
                         continue
                     target_qty, hedge_qty = self._cap_target_qty_by_hedge_liquidity(
                         action=action,
-                        ratio=ratio,
+                        ratio=entry_hedge_ratio,
                         target_qty=target_qty,
                         hedge_qty=hedge_qty,
                         a_bid_qty=a_bid_qty,
@@ -2163,7 +2642,8 @@ class MergerArbBot:
                     if target_qty < MIN_ORDER_QTY:
                         continue
 
-                    if ROBUST_MODE and ROBUST_REQUIRE_HEDGE_ON_ENTRY and ratio > 0 and hedge_qty < ORDER_STEP:
+                    requires_hedge = entry_hedge_ratio > 0 and int(round(entry_hedge_ratio * target_qty)) >= ORDER_STEP
+                    if ROBUST_MODE and ROBUST_REQUIRE_HEDGE_ON_ENTRY and requires_hedge and hedge_qty < ORDER_STEP:
                         continue
 
                     target_ok, hedge_ok = self._submit_pair(
@@ -2240,6 +2720,8 @@ class MergerArbBot:
                         "PING_AT_TOUCH": PING_AT_TOUCH,
                         "HEDGE_TOP_BOOK_MULT": HEDGE_TOP_BOOK_MULT,
                         "HEDGE_MIN_TOP_SIZE": HEDGE_MIN_TOP_SIZE,
+                        "HEDGE_RATIO_MODE": HEDGE_RATIO_MODE,
+                        "HEDGE_BLEND_FULL_WEIGHT": HEDGE_BLEND_FULL_WEIGHT,
                         "ROBUST_MODE": ROBUST_MODE,
                         "ROBUST_EVENT_WINDOW_SECS": ROBUST_EVENT_WINDOW_SECS,
                         "ROBUST_MIN_NEWS_DELTA": ROBUST_MIN_NEWS_DELTA,
@@ -2258,6 +2740,17 @@ class MergerArbBot:
                         "FINBERT_NEG_THRESHOLD": FINBERT_NEG_THRESHOLD,
                         "FINBERT_GAP_THRESHOLD": FINBERT_GAP_THRESHOLD,
                         "FINBERT_CATEGORY_FALLBACK": FINBERT_CATEGORY_FALLBACK,
+                        "FINBERT_STRICT": FINBERT_STRICT,
+                        "ENABLE_KEYWORD_FALLBACK": ENABLE_KEYWORD_FALLBACK,
+                        "ENABLE_FINBERT_CONTINUOUS_DELTA": ENABLE_FINBERT_CONTINUOUS_DELTA,
+                        "FINBERT_CONTINUOUS_SCALE": FINBERT_CONTINUOUS_SCALE,
+                        "FINBERT_CONTINUOUS_MIN_GAP": FINBERT_CONTINUOUS_MIN_GAP,
+                        "NEWS_DEDUPE_CACHE_SIZE": NEWS_DEDUPE_CACHE_SIZE,
+                        "CANCEL_ON_MODEL_MOVE": CANCEL_ON_MODEL_MOVE,
+                        "ENABLE_PERIOD_RESET": ENABLE_PERIOD_RESET,
+                        "FLATTEN_ON_PERIOD_CHANGE": FLATTEN_ON_PERIOD_CHANGE,
+                        "PERIOD_RESET_WARMUP_SECS": PERIOD_RESET_WARMUP_SECS,
+                        "PERIOD_FLATTEN_MAX_ROUNDS": PERIOD_FLATTEN_MAX_ROUNDS,
                         "ENTITY_TO_DEAL_TERMS": len(ENTITY_TO_DEAL),
                         "AMBIGUOUS_PHRASES": sorted(AMBIGUOUS_PHRASES),
                         "FLOW_DISLOCATION_PHRASES": sorted(FLOW_DISLOCATION_PHRASES),
@@ -2277,10 +2770,12 @@ class MergerArbBot:
             f"per_deal_target_cap={PER_DEAL_TARGET_MAX} stale_cancel={STALE_ORDER_SECS:.2f}s "
             f"ioc={ENABLE_IOC_EMULATION} ioc_t={IOC_CANCEL_SECS:.2f}s ping_touch={PING_AT_TOUCH} "
             f"hedge_top_mult={HEDGE_TOP_BOOK_MULT:.2f} hedge_min_top={HEDGE_MIN_TOP_SIZE} "
+            f"hedge_mode={HEDGE_RATIO_MODE} blend_full={HEDGE_BLEND_FULL_WEIGHT:.2f} "
             f"robust={ROBUST_MODE} evt_win={ROBUST_EVENT_WINDOW_SECS:.1f}s "
             f"news_delta>={ROBUST_MIN_NEWS_DELTA:.3f} entry_edge>={ROBUST_MIN_ENTRY_EDGE:.3f} "
             f"stop_cooldown={ROBUST_STOP_REENTRY_COOLDOWN_SECS:.1f}s "
-            f"finbert={'ON' if self.finbert_enabled else 'OFF'}"
+            f"cancel_on_move={CANCEL_ON_MODEL_MOVE} period_reset={ENABLE_PERIOD_RESET} "
+            f"finbert={'ON' if self.finbert_enabled else 'OFF'} strict={FINBERT_STRICT}"
         )
 
         news_thread = threading.Thread(target=self.news_worker, name="news-worker", daemon=True)
@@ -2325,6 +2820,8 @@ class MergerArbBot:
 
                 deal_state_summary = {}
                 with self.lock:
+                    period_cursors = dict(self.last_news_id_by_period)
+                    current_period = self.current_period
                     for deal_id, st in self.deal_states.items():
                         deal_state_summary[deal_id] = {
                             "probability": round(st.probability, 6),
@@ -2344,6 +2841,8 @@ class MergerArbBot:
                 summary = {
                     "final_case": final_case,
                     "last_news_id": self.last_news_id,
+                    "current_period": current_period,
+                    "last_news_id_by_period": period_cursors,
                     "deal_states": deal_state_summary,
                     "final_positions": final_positions,
                     "open_order_count": len(final_open_orders),
