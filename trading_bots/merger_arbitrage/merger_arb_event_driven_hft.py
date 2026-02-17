@@ -110,7 +110,7 @@ def _detect_finbert_assets(onnx_hint: str, tokenizer_hint: str) -> Tuple[Optiona
 
 
 WRITE_RUN_JSON = env_bool("RIT_MA_WRITE_RUN_JSON", "1")
-RUN_LOG_DIR = os.environ.get("RIT_MA_LOG_DIR", "logs")
+RUN_LOG_DIR = os.environ.get("RIT_MA_LOG_DIR", str(BOT_ROOT / "logs"))
 RUN_LOG_JSON_PATH = os.environ.get("RIT_MA_LOG_JSON_PATH", "").strip()
 RUN_RECORDER: Optional["RunRecorder"] = None
 
@@ -369,6 +369,9 @@ class RunRecorder:
                 {
                     "ts_utc": utc_iso_now(),
                     "news_id": item.get("news_id"),
+                    "api_ticker": item.get("ticker"),
+                    "api_period": item.get("period"),
+                    "api_tick": item.get("tick"),
                     "headline": item.get("headline"),
                     "body": item.get("body"),
                     "refs": refs,
@@ -582,7 +585,11 @@ def phrase_hits(text: str, phrases: Iterable[str]) -> List[str]:
     return sorted(set(hits))
 
 
-def extract_referenced_deals(text: str, deal_tickers: Dict[str, str]) -> Tuple[List[str], Dict[str, List[str]]]:
+def extract_referenced_deals(
+    text: str,
+    deal_tickers: Dict[str, str],
+    include_entities: bool = True,
+) -> Tuple[List[str], Dict[str, List[str]]]:
     text_upper = text.upper()
     refs = set()
     matched: Dict[str, List[str]] = {"deal_ids": [], "tickers": [], "entities": []}
@@ -597,10 +604,11 @@ def extract_referenced_deals(text: str, deal_tickers: Dict[str, str]) -> Tuple[L
             refs.add(deal_id)
             matched["tickers"].append(ticker)
 
-    for term, deal_id in ENTITY_TO_DEAL.items():
-        if ENTITY_PATTERNS[term].search(text_upper):
-            refs.add(deal_id)
-            matched["entities"].append(term)
+    if include_entities:
+        for term, deal_id in ENTITY_TO_DEAL.items():
+            if ENTITY_PATTERNS[term].search(text_upper):
+                refs.add(deal_id)
+                matched["entities"].append(term)
 
     return sorted(refs), {k: sorted(set(v)) for k, v in matched.items()}
 
@@ -1141,7 +1149,26 @@ class MergerArbBot:
                     headline = str(item.get("headline") or "")
                     body = str(item.get("body") or "")
                     text = (headline + " " + body).strip()
-                    refs, ref_matches = extract_referenced_deals(text, self.deal_ticker_to_id)
+                    api_ticker = str(item.get("ticker") or "").strip()
+                    refs_text, ref_matches_text = extract_referenced_deals(
+                        text,
+                        self.deal_ticker_to_id,
+                        include_entities=True,
+                    )
+                    refs_api, ref_matches_api = extract_referenced_deals(
+                        api_ticker,
+                        self.deal_ticker_to_id,
+                        include_entities=False,
+                    )
+                    refs = sorted(set(refs_text) | set(refs_api))
+                    ref_matches = {
+                        "from_text": ref_matches_text,
+                        "from_api_ticker": {
+                            "raw": api_ticker,
+                            **ref_matches_api,
+                        },
+                        "combined_refs": refs,
+                    }
                     ambiguous_hits = phrase_hits(text, AMBIGUOUS_PHRASES)
                     flow_dislocation_hits = phrase_hits(text, FLOW_DISLOCATION_PHRASES)
 
@@ -1178,7 +1205,8 @@ class MergerArbBot:
                     if not refs:
                         log(
                             f"NEWS_SKIP id={news_id} reason=NO_DEAL_REFERENCE "
-                            f"cat={cat} dir={direction} sev={severity} head='{headline[:90]}'{finbert_audit}"
+                            f"api_ticker='{api_ticker}' cat={cat} dir={direction} sev={severity} "
+                            f"head='{headline[:90]}'{finbert_audit}"
                         )
                         if RUN_RECORDER is not None:
                             RUN_RECORDER.add_news(
