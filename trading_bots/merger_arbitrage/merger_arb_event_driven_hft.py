@@ -139,6 +139,10 @@ INIT_SAMPLE_INTERVAL_SECS = float(os.environ.get("RIT_MA_INIT_SAMPLE_INTERVAL_SE
 
 # Exit / inventory behavior
 TAKE_PROFIT_BUFFER = float(os.environ.get("RIT_MA_TAKE_PROFIT_BUFFER", "0.01"))
+STOP_LOSS_BUFFER = float(os.environ.get("RIT_MA_STOP_LOSS_BUFFER", "0.35"))
+TIME_STOP_SECS = float(os.environ.get("RIT_MA_TIME_STOP_SECS", "55.0"))
+TIME_STOP_REDUCE_FRACTION = float(os.environ.get("RIT_MA_TIME_STOP_REDUCE_FRACTION", "0.50"))
+RISK_REDUCE_COOLDOWN_SECS = float(os.environ.get("RIT_MA_RISK_REDUCE_COOLDOWN_SECS", "2.50"))
 ADD_INVENTORY_SLOPE = float(os.environ.get("RIT_MA_ADD_INVENTORY_SLOPE", "1.80"))
 ADD_GLOBAL_SLOPE = float(os.environ.get("RIT_MA_ADD_GLOBAL_SLOPE", "1.25"))
 REDUCE_THRESHOLD_MULT = float(os.environ.get("RIT_MA_REDUCE_THRESHOLD_MULT", "0.40"))
@@ -172,8 +176,13 @@ RISK_BUFFER = float(os.environ.get("RIT_MA_RISK_BUFFER", "0.98"))
 PER_DEAL_TARGET_MAX = int(os.environ.get("RIT_MA_PER_DEAL_TARGET_MAX", "25000"))
 PER_DEAL_ACQ_CAP_MULT = float(os.environ.get("RIT_MA_PER_DEAL_ACQ_CAP_MULT", "1.30"))
 HEDGE_REBALANCE_TRIGGER = int(os.environ.get("RIT_MA_HEDGE_REBALANCE_TRIGGER", "1200"))
+HEDGE_REBALANCE_COOLDOWN_SECS = float(os.environ.get("RIT_MA_HEDGE_REBALANCE_COOLDOWN_SECS", "1.20"))
+HEDGE_REBALANCE_FRACTION = float(os.environ.get("RIT_MA_HEDGE_REBALANCE_FRACTION", "0.50"))
 STALE_ORDER_SECS = float(os.environ.get("RIT_MA_STALE_ORDER_SECS", "0.90"))
 STALE_CANCEL_CHECK_SECS = float(os.environ.get("RIT_MA_STALE_CANCEL_CHECK_SECS", "0.20"))
+CAPACITY_RECYCLE_TRIGGER_UTIL = float(os.environ.get("RIT_MA_CAPACITY_RECYCLE_TRIGGER_UTIL", "0.94"))
+CAPACITY_RECYCLE_TARGET_UTIL = float(os.environ.get("RIT_MA_CAPACITY_RECYCLE_TARGET_UTIL", "0.88"))
+CAPACITY_RECYCLE_REDUCE_FRACTION = float(os.environ.get("RIT_MA_CAPACITY_RECYCLE_REDUCE_FRACTION", "0.50"))
 
 # Deal definitions requested by user
 DEALS = {
@@ -688,6 +697,14 @@ def close_qty_for_position(position_abs: int) -> int:
     return min(position_abs, qty)
 
 
+def scaled_close_qty(position_abs: int, fraction: float) -> int:
+    base = close_qty_for_position(position_abs)
+    fraction = max(0.05, min(1.0, fraction))
+    qty = int(base * fraction)
+    qty = max(ORDER_STEP, qty - (qty % ORDER_STEP))
+    return min(position_abs, qty)
+
+
 def compute_hedge_close_qty(
     target_close_action: str,
     ratio: float,
@@ -792,6 +809,9 @@ class DealState:
     probability: float
     standalone_value: float
     last_trade_ts: float = 0.0
+    hold_start_ts: float = 0.0
+    last_risk_reduce_ts: float = 0.0
+    last_hedge_rebalance_ts: float = 0.0
 
 
 class MergerArbBot:
@@ -1419,6 +1439,98 @@ class MergerArbBot:
                     f"K={k:.2f} P*={p_star:.2f} tgt_bid/ask={t_bid:.2f}/{t_ask:.2f}"
                 )
 
+    def _capacity_recycler(
+        self,
+        now: float,
+        books: Dict[str, Tuple[float, float, float]],
+        positions: Dict[str, int],
+        states_copy: Dict[str, DealState],
+        gross_used: int,
+        net_used: int,
+    ) -> Tuple[int, int]:
+        trigger_util = max(0.50, min(0.995, CAPACITY_RECYCLE_TRIGGER_UTIL))
+        target_util = max(0.40, min(trigger_util - 0.01, CAPACITY_RECYCLE_TARGET_UTIL))
+        trigger_gross = int(GROSS_LIMIT * trigger_util)
+        target_gross = int(GROSS_LIMIT * target_util)
+        if gross_used < trigger_gross:
+            return gross_used, net_used
+
+        candidates: List[Tuple[float, str]] = []
+        for deal_id, deal in DEALS.items():
+            target = deal["target"].upper()
+            acquirer = deal["acquirer"].upper()
+            if target not in books or acquirer not in books:
+                continue
+            target_pos = int(positions.get(target, 0))
+            if abs(target_pos) < ORDER_STEP:
+                continue
+            st = states_copy[deal_id]
+            t_bid, t_ask, t_mid = books[target]
+            _, _, a_mid = books[acquirer]
+            k = deal_value(deal, a_mid)
+            p_star = st.probability * k + (1.0 - st.probability) * st.standalone_value
+            candidates.append((abs(t_mid - p_star), deal_id))
+
+        if not candidates:
+            return gross_used, net_used
+
+        for _, deal_id in sorted(candidates, key=lambda x: x[0]):
+            if gross_used <= target_gross:
+                break
+            deal = DEALS[deal_id]
+            target = deal["target"].upper()
+            acquirer = deal["acquirer"].upper()
+            if target not in books or acquirer not in books:
+                continue
+            target_pos = int(positions.get(target, 0))
+            acq_pos = int(positions.get(acquirer, 0))
+            if abs(target_pos) < ORDER_STEP:
+                continue
+
+            t_bid, t_ask, _ = books[target]
+            a_bid, a_ask, a_mid = books[acquirer]
+            st = states_copy[deal_id]
+            k = deal_value(deal, a_mid)
+            p_star = st.probability * k + (1.0 - st.probability) * st.standalone_value
+            ratio = float(deal["ratio"]) if deal["structure"] in {"stock", "mixed"} else 0.0
+            signal_action = "SELL" if target_pos > 0 else "BUY"
+            close_qty = scaled_close_qty(abs(target_pos), CAPACITY_RECYCLE_REDUCE_FRACTION)
+            if close_qty < ORDER_STEP:
+                continue
+            hedge_close_qty = compute_hedge_close_qty(signal_action, ratio, close_qty, acq_pos)
+
+            target_ok, hedge_ok = self._submit_pair(
+                deal_id=deal_id,
+                target=target,
+                acquirer=acquirer,
+                signal_action=signal_action,
+                target_qty=close_qty,
+                hedge_qty=hedge_close_qty,
+                edge=abs(((t_bid + t_ask) / 2.0) - p_star),
+                p_star=p_star,
+                t_bid=t_bid,
+                t_ask=t_ask,
+                a_bid=a_bid,
+                a_ask=a_ask,
+                reason="CAPACITY_RECYCLE",
+            )
+            if target_ok:
+                positions[target] = target_pos - close_qty if target_pos > 0 else target_pos + close_qty
+            if hedge_close_qty > 0 and hedge_ok:
+                positions[acquirer] = acq_pos + hedge_close_qty if signal_action == "SELL" else acq_pos - hedge_close_qty
+            if target_ok or hedge_ok:
+                gross_used, net_used = compute_gross_net(positions)
+                with self.lock:
+                    live = self.deal_states[deal_id]
+                    live.last_trade_ts = now
+                    live.last_risk_reduce_ts = now
+                    if int(positions.get(target, 0)) == 0:
+                        live.hold_start_ts = 0.0
+                    else:
+                        live.hold_start_ts = now
+
+        return gross_used, net_used
+
     def trade_loop(self) -> None:
         loop_errors = 0
         # Per-loop aliases for fast tuning and readability.
@@ -1444,16 +1556,49 @@ class MergerArbBot:
                 now = time.time()
                 self._cancel_stale_orders(now)
                 with self.lock:
+                    for deal_id, deal in DEALS.items():
+                        target = deal["target"].upper()
+                        target_pos = int(positions.get(target, 0))
+                        st_live = self.deal_states[deal_id]
+                        if target_pos != 0 and st_live.hold_start_ts <= 0:
+                            st_live.hold_start_ts = now
+                        elif target_pos == 0 and st_live.hold_start_ts != 0:
+                            st_live.hold_start_ts = 0.0
+                            st_live.last_risk_reduce_ts = 0.0
+                            st_live.last_hedge_rebalance_ts = 0.0
                     states_copy = {
                         deal_id: DealState(
                             probability=st.probability,
                             standalone_value=st.standalone_value,
                             last_trade_ts=st.last_trade_ts,
+                            hold_start_ts=st.hold_start_ts,
+                            last_risk_reduce_ts=st.last_risk_reduce_ts,
+                            last_hedge_rebalance_ts=st.last_hedge_rebalance_ts,
                         )
                         for deal_id, st in self.deal_states.items()
                     }
 
                 gross_used, net_used = compute_gross_net(positions)
+                gross_used, net_used = self._capacity_recycler(
+                    now=now,
+                    books=books,
+                    positions=positions,
+                    states_copy=states_copy,
+                    gross_used=gross_used,
+                    net_used=net_used,
+                )
+                with self.lock:
+                    states_copy = {
+                        deal_id: DealState(
+                            probability=st.probability,
+                            standalone_value=st.standalone_value,
+                            last_trade_ts=st.last_trade_ts,
+                            hold_start_ts=st.hold_start_ts,
+                            last_risk_reduce_ts=st.last_risk_reduce_ts,
+                            last_hedge_rebalance_ts=st.last_hedge_rebalance_ts,
+                        )
+                        for deal_id, st in self.deal_states.items()
+                    }
 
                 for deal_id, deal in DEALS.items():
                     target = deal["target"].upper()
@@ -1472,6 +1617,70 @@ class MergerArbBot:
                     commission_cost = COMMISSION_PER_SHARE * (1.0 + ratio)
                     target_pos = int(positions.get(target, 0))
                     acq_pos = int(positions.get(acquirer, 0))
+                    held_secs = (now - st.hold_start_ts) if st.hold_start_ts > 0 else 0.0
+
+                    # Hard stop: adverse move far enough from model to protect risk budget.
+                    if target_pos > 0 and t_bid <= p_star - commission_cost - STOP_LOSS_BUFFER:
+                        close_qty = close_qty_for_position(abs(target_pos))
+                        hedge_close_qty = compute_hedge_close_qty("SELL", ratio, close_qty, acq_pos)
+                        target_ok, hedge_ok = self._submit_pair(
+                            deal_id=deal_id,
+                            target=target,
+                            acquirer=acquirer,
+                            signal_action="SELL",
+                            target_qty=close_qty,
+                            hedge_qty=hedge_close_qty,
+                            edge=p_star - t_bid,
+                            p_star=p_star,
+                            t_bid=t_bid,
+                            t_ask=t_ask,
+                            a_bid=a_bid,
+                            a_ask=a_ask,
+                            reason="STOP_LOSS_LONG",
+                        )
+                        if target_ok:
+                            positions[target] = target_pos - close_qty
+                        if hedge_close_qty > 0 and hedge_ok:
+                            positions[acquirer] = acq_pos + hedge_close_qty
+                        if target_ok or hedge_ok:
+                            gross_used, net_used = compute_gross_net(positions)
+                            with self.lock:
+                                live = self.deal_states[deal_id]
+                                live.last_trade_ts = now
+                                live.last_risk_reduce_ts = now
+                                live.hold_start_ts = 0.0 if int(positions.get(target, 0)) == 0 else now
+                        continue
+
+                    if target_pos < 0 and t_ask >= p_star + commission_cost + STOP_LOSS_BUFFER:
+                        close_qty = close_qty_for_position(abs(target_pos))
+                        hedge_close_qty = compute_hedge_close_qty("BUY", ratio, close_qty, acq_pos)
+                        target_ok, hedge_ok = self._submit_pair(
+                            deal_id=deal_id,
+                            target=target,
+                            acquirer=acquirer,
+                            signal_action="BUY",
+                            target_qty=close_qty,
+                            hedge_qty=hedge_close_qty,
+                            edge=t_ask - p_star,
+                            p_star=p_star,
+                            t_bid=t_bid,
+                            t_ask=t_ask,
+                            a_bid=a_bid,
+                            a_ask=a_ask,
+                            reason="STOP_LOSS_SHORT",
+                        )
+                        if target_ok:
+                            positions[target] = target_pos + close_qty
+                        if hedge_close_qty > 0 and hedge_ok:
+                            positions[acquirer] = acq_pos - hedge_close_qty
+                        if target_ok or hedge_ok:
+                            gross_used, net_used = compute_gross_net(positions)
+                            with self.lock:
+                                live = self.deal_states[deal_id]
+                                live.last_trade_ts = now
+                                live.last_risk_reduce_ts = now
+                                live.hold_start_ts = 0.0 if int(positions.get(target, 0)) == 0 else now
+                        continue
 
                     # Exit logic: flatten when price converges back to model.
                     if target_pos > 0 and t_bid >= p_star - commission_cost - EXIT_BUFFER:
@@ -1499,7 +1708,9 @@ class MergerArbBot:
                         if target_ok or hedge_ok:
                             gross_used, net_used = compute_gross_net(positions)
                             with self.lock:
-                                self.deal_states[deal_id].last_trade_ts = now
+                                live = self.deal_states[deal_id]
+                                live.last_trade_ts = now
+                                live.hold_start_ts = 0.0 if int(positions.get(target, 0)) == 0 else live.hold_start_ts
                         continue
 
                     if target_pos < 0 and t_ask <= p_star + commission_cost + EXIT_BUFFER:
@@ -1527,7 +1738,48 @@ class MergerArbBot:
                         if target_ok or hedge_ok:
                             gross_used, net_used = compute_gross_net(positions)
                             with self.lock:
-                                self.deal_states[deal_id].last_trade_ts = now
+                                live = self.deal_states[deal_id]
+                                live.last_trade_ts = now
+                                live.hold_start_ts = 0.0 if int(positions.get(target, 0)) == 0 else live.hold_start_ts
+                        continue
+
+                    # Time stop: stale position gets reduced to free risk budget.
+                    can_risk_reduce = (now - st.last_risk_reduce_ts) >= RISK_REDUCE_COOLDOWN_SECS
+                    if (
+                        TIME_STOP_SECS > 0
+                        and abs(target_pos) >= ORDER_STEP
+                        and held_secs >= TIME_STOP_SECS
+                        and can_risk_reduce
+                    ):
+                        close_qty = scaled_close_qty(abs(target_pos), TIME_STOP_REDUCE_FRACTION)
+                        close_action = "SELL" if target_pos > 0 else "BUY"
+                        hedge_close_qty = compute_hedge_close_qty(close_action, ratio, close_qty, acq_pos)
+                        target_ok, hedge_ok = self._submit_pair(
+                            deal_id=deal_id,
+                            target=target,
+                            acquirer=acquirer,
+                            signal_action=close_action,
+                            target_qty=close_qty,
+                            hedge_qty=hedge_close_qty,
+                            edge=abs(((t_bid + t_ask) / 2.0) - p_star),
+                            p_star=p_star,
+                            t_bid=t_bid,
+                            t_ask=t_ask,
+                            a_bid=a_bid,
+                            a_ask=a_ask,
+                            reason="TIME_STOP",
+                        )
+                        if target_ok:
+                            positions[target] = target_pos - close_qty if target_pos > 0 else target_pos + close_qty
+                        if hedge_close_qty > 0 and hedge_ok:
+                            positions[acquirer] = acq_pos + hedge_close_qty if close_action == "SELL" else acq_pos - hedge_close_qty
+                        if target_ok or hedge_ok:
+                            gross_used, net_used = compute_gross_net(positions)
+                            with self.lock:
+                                live = self.deal_states[deal_id]
+                                live.last_trade_ts = now
+                                live.last_risk_reduce_ts = now
+                                live.hold_start_ts = 0.0 if int(positions.get(target, 0)) == 0 else now
                         continue
 
                     # If target is flat but a leftover hedge remains, unwind hedge leg.
@@ -1547,16 +1799,21 @@ class MergerArbBot:
                             positions[acquirer] = acq_pos - hedge_unwind_qty if acq_pos > 0 else acq_pos + hedge_unwind_qty
                             gross_used, net_used = compute_gross_net(positions)
                             with self.lock:
-                                self.deal_states[deal_id].last_trade_ts = now
+                                live = self.deal_states[deal_id]
+                                live.last_trade_ts = now
+                                live.hold_start_ts = 0.0
                         continue
 
                     # Rebalance hedge drift when target leg exists but acquirer ratio has deviated.
                     if ratio > 0 and target_pos != 0:
                         desired_acq_pos = int(round(-ratio * target_pos))
                         hedge_gap = acq_pos - desired_acq_pos
-                        if abs(hedge_gap) >= HEDGE_REBALANCE_TRIGGER:
+                        can_rebalance = (now - st.last_hedge_rebalance_ts) >= HEDGE_REBALANCE_COOLDOWN_SECS
+                        if abs(hedge_gap) >= max(ORDER_STEP, HEDGE_REBALANCE_TRIGGER) and can_rebalance:
                             rebalance_action = "SELL" if hedge_gap > 0 else "BUY"
-                            rebalance_qty = min(MAX_ORDER_SIZE, abs(hedge_gap))
+                            rebalance_fraction = max(0.20, min(1.0, HEDGE_REBALANCE_FRACTION))
+                            rebalance_qty = int(abs(hedge_gap) * rebalance_fraction)
+                            rebalance_qty = min(MAX_ORDER_SIZE, max(ORDER_STEP, rebalance_qty))
                             rebalance_qty = max(ORDER_STEP, rebalance_qty - (rebalance_qty % ORDER_STEP))
                             rebalance_qty = min(abs(hedge_gap), rebalance_qty)
                             if rebalance_qty > 0:
@@ -1575,7 +1832,9 @@ class MergerArbBot:
                                         positions[acquirer] = acq_pos + acq_delta
                                         gross_used, net_used = compute_gross_net(positions)
                                         with self.lock:
-                                            self.deal_states[deal_id].last_trade_ts = now
+                                            live = self.deal_states[deal_id]
+                                            live.last_trade_ts = now
+                                            live.last_hedge_rebalance_ts = now
                                     continue
 
                     if not can_enter:
@@ -1654,7 +1913,9 @@ class MergerArbBot:
                     if target_ok or hedge_ok:
                         gross_used, net_used = compute_gross_net(positions)
                         with self.lock:
-                            self.deal_states[deal_id].last_trade_ts = now
+                            live = self.deal_states[deal_id]
+                            live.last_trade_ts = now
+                            live.hold_start_ts = now if int(positions.get(target, 0)) != 0 else 0.0
 
                 loop_errors = 0
                 time.sleep(TRADE_LOOP_SECS)
@@ -1682,8 +1943,17 @@ class MergerArbBot:
                         "MAX_ORDER_SIZE": MAX_ORDER_SIZE,
                         "GROSS_LIMIT": GROSS_LIMIT,
                         "NET_LIMIT": NET_LIMIT,
+                        "STOP_LOSS_BUFFER": STOP_LOSS_BUFFER,
+                        "TIME_STOP_SECS": TIME_STOP_SECS,
+                        "TIME_STOP_REDUCE_FRACTION": TIME_STOP_REDUCE_FRACTION,
+                        "RISK_REDUCE_COOLDOWN_SECS": RISK_REDUCE_COOLDOWN_SECS,
                         "PER_DEAL_TARGET_MAX": PER_DEAL_TARGET_MAX,
                         "HEDGE_REBALANCE_TRIGGER": HEDGE_REBALANCE_TRIGGER,
+                        "HEDGE_REBALANCE_COOLDOWN_SECS": HEDGE_REBALANCE_COOLDOWN_SECS,
+                        "HEDGE_REBALANCE_FRACTION": HEDGE_REBALANCE_FRACTION,
+                        "CAPACITY_RECYCLE_TRIGGER_UTIL": CAPACITY_RECYCLE_TRIGGER_UTIL,
+                        "CAPACITY_RECYCLE_TARGET_UTIL": CAPACITY_RECYCLE_TARGET_UTIL,
+                        "CAPACITY_RECYCLE_REDUCE_FRACTION": CAPACITY_RECYCLE_REDUCE_FRACTION,
                         "STALE_ORDER_SECS": STALE_ORDER_SECS,
                         "TRADE_LOOP_SECS": TRADE_LOOP_SECS,
                         "NEWS_POLL_SECS": NEWS_POLL_SECS,
@@ -1709,6 +1979,8 @@ class MergerArbBot:
             f"threshold={MISPRICING_THRESHOLD:.3f} margin={DESIRED_PROFIT_MARGIN:.3f} "
             f"base_qty={BASE_ORDER_QTY} max_order={MAX_ORDER_SIZE} "
             f"gross/net={GROSS_LIMIT}/{NET_LIMIT} limit_offset={MARKETABLE_LIMIT_OFFSET:.2f} "
+            f"stop_loss={STOP_LOSS_BUFFER:.2f} time_stop={TIME_STOP_SECS:.1f}s "
+            f"recycle={CAPACITY_RECYCLE_TRIGGER_UTIL:.2f}->{CAPACITY_RECYCLE_TARGET_UTIL:.2f} "
             f"per_deal_target_cap={PER_DEAL_TARGET_MAX} stale_cancel={STALE_ORDER_SECS:.2f}s "
             f"finbert={'ON' if self.finbert_enabled else 'OFF'}"
         )
@@ -1760,6 +2032,9 @@ class MergerArbBot:
                             "probability": round(st.probability, 6),
                             "standalone_value": round(st.standalone_value, 6),
                             "last_trade_ts": st.last_trade_ts,
+                            "hold_start_ts": st.hold_start_ts,
+                            "last_risk_reduce_ts": st.last_risk_reduce_ts,
+                            "last_hedge_rebalance_ts": st.last_hedge_rebalance_ts,
                         }
                 summary = {
                     "final_case": final_case,
