@@ -1,32 +1,34 @@
 #!/usr/bin/env python3
-"""Alpha FinBERT-driven merger arbitrage bot for RIT REST API.
+"""Async FinBERT-driven merger arbitrage bot for RIT REST API.
 
-This is a new strategy implementation (separate from merger_arb_event_driven_hft.py):
-- FinBERT-only event sentiment.
-- Event probability jump model + market-implied probability blending.
-- Dynamic edge thresholds with microstructure friction.
-- Hedged paired execution with stale-order cleanup and robust exits.
+Key differences vs sync version:
+- Uses aiohttp + asyncio for non-blocking API I/O.
+- Persistent connection pooling.
+- Concurrent market-data and paired-order flows.
 """
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import math
 import os
 import re
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import requests
+import aiohttp
+import base64
 
-BASE_URL = os.environ.get("RIT_BASE_URL", "http://localhost:9999/v1").rstrip("/")
-API_KEY = os.environ.get("RIT_API_KEY", "YOUR_API_KEY")
+BASE_URL = os.environ.get("RIT_BASE_URL", "http://flserver.rotman.utoronto.ca:16550/v1").rstrip("/")
+API_KEY = os.environ.get("RIT_API_KEY", "932VC8JQ")
+USE_DMA_AUTH = os.environ.get("RIT_USE_DMA_AUTH", "1").strip().lower() in {"1", "true", "yes", "on"}
+DMA_USER = os.environ.get("RIT_DMA_USER", "ZUAI-5").strip()
+DMA_PASS = os.environ.get("RIT_DMA_PASS", "omega").strip()
 
 
 def env_bool(name: str, default: str) -> bool:
@@ -113,42 +115,40 @@ RUN_LOG_JSON_PATH = os.environ.get("RIT_MA_LOG_JSON_PATH", "").strip()
 RUN_RECORDER: Optional["RunRecorder"] = None
 
 # Timing
-NEWS_POLL_SECS = float(os.environ.get("RIT_MA_NEWS_POLL_SECS", "0.12"))
-TRADE_LOOP_SECS = float(os.environ.get("RIT_MA_TRADE_LOOP_SECS", "0.10"))
+NEWS_POLL_SECS = float(os.environ.get("RIT_MA_NEWS_POLL_SECS", "0.10"))
+TRADE_LOOP_SECS = float(os.environ.get("RIT_MA_TRADE_LOOP_SECS", "0.08"))
 CASE_POLL_SECS = float(os.environ.get("RIT_MA_CASE_POLL_SECS", "0.25"))
-TRADE_COOLDOWN_SECS = float(os.environ.get("RIT_MA_TRADE_COOLDOWN_SECS", "0.18"))
+TRADE_COOLDOWN_SECS = float(os.environ.get("RIT_MA_TRADE_COOLDOWN_SECS", "0.15"))
 SNAPSHOT_SECS = float(os.environ.get("RIT_MA_SNAPSHOT_SECS", "2.0"))
-BOOK_WORKERS = int(os.environ.get("RIT_MA_BOOK_WORKERS", "10"))
-
-INIT_WARMUP_SECS = float(os.environ.get("RIT_MA_INIT_WARMUP_SECS", "4.0"))
+INIT_WARMUP_SECS = float(os.environ.get("RIT_MA_INIT_WARMUP_SECS", "3.5"))
 INIT_SNAPSHOTS = int(os.environ.get("RIT_MA_INIT_SNAPSHOTS", "8"))
-INIT_SAMPLE_INTERVAL_SECS = float(os.environ.get("RIT_MA_INIT_SAMPLE_INTERVAL_SECS", "0.30"))
+INIT_SAMPLE_INTERVAL_SECS = float(os.environ.get("RIT_MA_INIT_SAMPLE_INTERVAL_SECS", "0.25"))
 
 # Execution
+MAX_ORDER_SIZE = 5000
 BASE_ORDER_QTY = int(os.environ.get("RIT_MA_BASE_ORDER_QTY", "1800"))
 MIN_ORDER_QTY = int(os.environ.get("RIT_MA_MIN_ORDER_QTY", "400"))
 ORDER_STEP = int(os.environ.get("RIT_MA_ORDER_STEP", "100"))
-MAX_ORDER_SIZE = 5000
 MARKETABLE_LIMIT_OFFSET = float(os.environ.get("RIT_MA_LIMIT_OFFSET", "0.02"))
 PING_AT_TOUCH = env_bool("RIT_MA_PING_AT_TOUCH", "1")
 SIMULTANEOUS_LEGS = env_bool("RIT_MA_SIMULTANEOUS_LEGS", "1")
-
 ENABLE_IOC_EMULATION = env_bool("RIT_MA_ENABLE_IOC_EMULATION", "1")
 IOC_CANCEL_SECS = float(os.environ.get("RIT_MA_IOC_CANCEL_SECS", "0.20"))
-STALE_ORDER_SECS = float(os.environ.get("RIT_MA_STALE_ORDER_SECS", "0.90"))
-STALE_CANCEL_CHECK_SECS = float(os.environ.get("RIT_MA_STALE_CANCEL_CHECK_SECS", "0.20"))
+STALE_ORDER_SECS = float(os.environ.get("RIT_MA_STALE_ORDER_SECS", "0.80"))
+STALE_CANCEL_CHECK_SECS = float(os.environ.get("RIT_MA_STALE_CANCEL_CHECK_SECS", "0.15"))
 
-# Trading thresholds
+# Thresholds
 COMMISSION_PER_SHARE = float(os.environ.get("RIT_MA_COMMISSION_PER_SHARE", "0.02"))
 MIN_ENTRY_THRESHOLD = float(os.environ.get("RIT_MA_MIN_ENTRY_THRESHOLD", "0.08"))
 ENTRY_MARGIN_PER_SHARE = float(os.environ.get("RIT_MA_ENTRY_MARGIN", "0.02"))
 EXIT_BUFFER = float(os.environ.get("RIT_MA_EXIT_BUFFER", "0.01"))
 STOP_BUFFER = float(os.environ.get("RIT_MA_STOP_BUFFER", "0.30"))
-
 MAX_HOLD_SECS = float(os.environ.get("RIT_MA_MAX_HOLD_SECS", "60.0"))
 TIME_REDUCE_FRACTION = float(os.environ.get("RIT_MA_TIME_REDUCE_FRACTION", "0.55"))
 RISK_REDUCE_COOLDOWN_SECS = float(os.environ.get("RIT_MA_RISK_REDUCE_COOLDOWN_SECS", "2.00"))
 STOP_REENTRY_COOLDOWN_SECS = float(os.environ.get("RIT_MA_STOP_REENTRY_COOLDOWN_SECS", "2.50"))
+ADD_INVENTORY_SLOPE = float(os.environ.get("RIT_MA_ADD_INVENTORY_SLOPE", "1.20"))
+ADD_GLOBAL_SLOPE = float(os.environ.get("RIT_MA_ADD_GLOBAL_SLOPE", "0.90"))
 
 # Probability blending
 NEWS_HALF_LIFE_SECS = float(os.environ.get("RIT_MA_NEWS_HALF_LIFE_SECS", "45.0"))
@@ -160,13 +160,15 @@ P_NEWS_EVENT_WEIGHT = float(os.environ.get("RIT_MA_P_NEWS_EVENT_WEIGHT", "0.35")
 P_NEWS_RECENCY_WEIGHT = float(os.environ.get("RIT_MA_P_NEWS_RECENCY_WEIGHT", "0.35"))
 EVENT_MIN_STRENGTH = float(os.environ.get("RIT_MA_EVENT_MIN_STRENGTH", "0.10"))
 DISLOCATION_GATE = float(os.environ.get("RIT_MA_DISLOCATION_GATE", "0.05"))
+EVENT_WINDOW_SECS = float(os.environ.get("RIT_MA_EVENT_WINDOW_SECS", "18.0"))
+MIN_NEWS_DELTA = float(os.environ.get("RIT_MA_MIN_NEWS_DELTA", "0.04"))
 
 # News jump model
 NEWS_BASE_MAG = float(os.environ.get("RIT_MA_NEWS_BASE_MAG", "0.03"))
 NEWS_MAX_EXTRA_MAG = float(os.environ.get("RIT_MA_NEWS_MAX_EXTRA_MAG", "0.18"))
 NEWS_STRENGTH_POWER = float(os.environ.get("RIT_MA_NEWS_STRENGTH_POWER", "1.35"))
 
-# Risk controls
+# Risk limits
 GROSS_LIMIT = 100_000
 NET_LIMIT = 50_000
 RISK_BUFFER = float(os.environ.get("RIT_MA_RISK_BUFFER", "0.98"))
@@ -174,13 +176,12 @@ PER_DEAL_TARGET_MAX = int(os.environ.get("RIT_MA_PER_DEAL_TARGET_MAX", "25000"))
 PER_DEAL_ACQ_CAP_MULT = float(os.environ.get("RIT_MA_PER_DEAL_ACQ_CAP_MULT", "1.30"))
 HEDGE_MIN_TOP_SIZE = int(os.environ.get("RIT_MA_HEDGE_MIN_TOP_SIZE", "600"))
 HEDGE_TOP_BOOK_MULT = float(os.environ.get("RIT_MA_HEDGE_TOP_BOOK_MULT", "1.15"))
-
 CAPACITY_RECYCLE_TRIGGER_UTIL = float(os.environ.get("RIT_MA_CAPACITY_RECYCLE_TRIGGER_UTIL", "0.95"))
 CAPACITY_RECYCLE_TARGET_UTIL = float(os.environ.get("RIT_MA_CAPACITY_RECYCLE_TARGET_UTIL", "0.88"))
 CAPACITY_RECYCLE_REDUCE_FRACTION = float(os.environ.get("RIT_MA_CAPACITY_RECYCLE_REDUCE_FRACTION", "0.50"))
 
 # FinBERT
-ENABLE_MANUAL_OVERRIDE = env_bool("RIT_MA_ENABLE_MANUAL_OVERRIDE", "1")
+ENABLE_MANUAL_OVERRIDE = env_bool("RIT_MA_ENABLE_MANUAL_OVERRIDE", "0")
 USE_FINBERT = env_bool("RIT_MA_USE_FINBERT", "1")
 FINBERT_ONNX_MODEL = os.environ.get("RIT_MA_FINBERT_ONNX_MODEL", str(DEFAULT_FINBERT_ONNX_MODEL)).strip()
 FINBERT_TOKENIZER_DIR = os.environ.get("RIT_MA_FINBERT_TOKENIZER_DIR", str(DEFAULT_FINBERT_TOKENIZER_DIR)).strip()
@@ -193,7 +194,7 @@ FINBERT_SEV_LARGE = float(os.environ.get("RIT_MA_FINBERT_SEV_LARGE", "0.79"))
 FINBERT_CATEGORY_FALLBACK = os.environ.get("RIT_MA_FINBERT_CATEGORY_FALLBACK", "FIN").strip().upper()
 
 if not USE_FINBERT:
-    raise RuntimeError("This alpha strategy is FinBERT-only. Set RIT_MA_USE_FINBERT=1.")
+    raise RuntimeError("This async alpha strategy is FinBERT-only. Set RIT_MA_USE_FINBERT=1.")
 
 
 DEALS = {
@@ -261,7 +262,7 @@ class RunRecorder:
         self.base_url = base_url
         self.started_at_utc = utc_iso_now()
         self.started_epoch = time.time()
-        self.lock = threading.Lock()
+        self.lock = asyncio.Lock()
         self.events: List[dict] = []
         self.news: List[dict] = []
         self.context: Dict[str, object] = {}
@@ -272,14 +273,14 @@ class RunRecorder:
         if RUN_LOG_JSON_PATH:
             return Path(RUN_LOG_JSON_PATH).expanduser()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return Path(RUN_LOG_DIR).expanduser() / f"merger_arb_alpha_heat_{stamp}.json"
+        return Path(RUN_LOG_DIR).expanduser() / f"merger_arb_alpha_async_heat_{stamp}.json"
 
-    def set_context(self, context: Dict[str, object]) -> None:
-        with self.lock:
+    async def set_context(self, context: Dict[str, object]) -> None:
+        async with self.lock:
             self.context = context
 
-    def add_event(self, level: str, message: str, extra: Optional[dict] = None) -> None:
-        with self.lock:
+    async def add_event(self, level: str, message: str, extra: Optional[dict] = None) -> None:
+        async with self.lock:
             self.events.append(
                 {
                     "ts_utc": utc_iso_now(),
@@ -290,7 +291,7 @@ class RunRecorder:
                 }
             )
 
-    def add_news(
+    async def add_news(
         self,
         item: dict,
         refs: List[str],
@@ -302,7 +303,7 @@ class RunRecorder:
         skip_reason: Optional[str] = None,
         classifier_meta: Optional[dict] = None,
     ) -> None:
-        with self.lock:
+        async with self.lock:
             self.news.append(
                 {
                     "ts_utc": utc_iso_now(),
@@ -323,8 +324,8 @@ class RunRecorder:
                 }
             )
 
-    def flush(self, summary: Dict[str, object]) -> str:
-        with self.lock:
+    async def flush(self, summary: Dict[str, object]) -> str:
+        async with self.lock:
             if self.finalized:
                 return str(self.output_path)
             payload = {
@@ -354,10 +355,10 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return x
 
 
-def log(msg: str, level: str = "INFO", extra: Optional[dict] = None) -> None:
+async def log(msg: str, level: str = "INFO", extra: Optional[dict] = None) -> None:
     print(f"{now_ts()} | {msg}", flush=True)
     if RUN_RECORDER is not None:
-        RUN_RECORDER.add_event(level=level, message=msg, extra=extra)
+        await RUN_RECORDER.add_event(level=level, message=msg, extra=extra)
 
 
 def _resolve_finbert_module_path() -> Optional[Path]:
@@ -377,7 +378,7 @@ def _load_finbert_trader_class():
     if mod_path is None:
         return None, "Could not find finbert_hft/fast_inference.py"
     try:
-        spec = importlib.util.spec_from_file_location("finbert_hft_fast_inference_alpha", str(mod_path))
+        spec = importlib.util.spec_from_file_location("finbert_hft_fast_inference_async", str(mod_path))
         if spec is None or spec.loader is None:
             return None, f"Failed to create import spec for {mod_path}"
         module = importlib.util.module_from_spec(spec)
@@ -390,67 +391,102 @@ def _load_finbert_trader_class():
         return None, f"FinBERT module import failed: {exc}"
 
 
-class RITClient:
-    def __init__(self, api_key: str, base_url: str, timeout: float = 1.5) -> None:
+class AsyncRITClient:
+    def __init__(self, api_key: str, base_url: str, timeout_s: float = 1.5, pool_limit: int = 64,
+                 use_dma_auth: bool = False, dma_user: str = "", dma_pass: str = "") -> None:
+        self.api_key = api_key
         self.base_url = base_url
-        self.timeout = timeout
-        self.session = requests.Session()
-        self.session.headers.update({"X-API-key": api_key})
+        self.timeout_s = timeout_s
+        self.pool_limit = pool_limit
+        self.use_dma_auth = use_dma_auth
+        self.dma_user = dma_user
+        self.dma_pass = dma_pass
+        self.session: Optional[aiohttp.ClientSession] = None
 
-    def _request(self, method: str, path: str, params: Optional[dict] = None, retries: int = 4):
-        backoff = 0.05
+    async def __aenter__(self) -> "AsyncRITClient":
+        connector = aiohttp.TCPConnector(limit=self.pool_limit, ttl_dns_cache=300, enable_cleanup_closed=True)
+        timeout = aiohttp.ClientTimeout(total=self.timeout_s)
+        if self.use_dma_auth:
+            creds = f"{self.dma_user}:{self.dma_pass}"
+            b64_creds = base64.b64encode(creds.encode()).decode()
+            headers = {"Authorization": f"Basic {b64_creds}"}
+        else:
+            headers = {"X-API-key": self.api_key}
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers=headers,
+            raise_for_status=False,
+        )
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self.session is not None:
+            await self.session.close()
+            self.session = None
+
+    async def _request(self, method: str, path: str, params: Optional[dict] = None, retries: int = 4):
+        if self.session is None:
+            raise RuntimeError("Client session is not initialized. Use 'async with AsyncRITClient(...)'.")
+
+        backoff = 0.03
+        url = self.base_url + path
         for attempt in range(retries):
             try:
-                r = self.session.request(
-                    method=method,
-                    url=self.base_url + path,
-                    params=params,
-                    timeout=self.timeout,
-                )
-                if r.status_code == 429:
-                    retry_after = r.headers.get("Retry-After")
-                    sleep_s = float(retry_after) if retry_after else backoff
-                    time.sleep(max(0.02, sleep_s))
-                    backoff = min(0.6, backoff * 2.0)
-                    continue
-                if 500 <= r.status_code < 600:
-                    time.sleep(backoff)
-                    backoff = min(0.6, backoff * 1.8)
-                    continue
-                r.raise_for_status()
-                return r.json()
-            except requests.RequestException:
+                async with self.session.request(method=method, url=url, params=params) as resp:
+                    if resp.status == 429:
+                        retry_after = resp.headers.get("Retry-After")
+                        sleep_s = float(retry_after) if retry_after else backoff
+                        await asyncio.sleep(max(0.01, sleep_s))
+                        backoff = min(0.5, backoff * 2.0)
+                        continue
+                    if 500 <= resp.status < 600:
+                        await asyncio.sleep(backoff)
+                        backoff = min(0.6, backoff * 1.8)
+                        continue
+                    if resp.status >= 400:
+                        text = await resp.text()
+                        raise aiohttp.ClientResponseError(
+                            request_info=resp.request_info,
+                            history=resp.history,
+                            status=resp.status,
+                            message=text,
+                            headers=resp.headers,
+                        )
+                    return await resp.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError):
                 if attempt == retries - 1:
                     raise
-                time.sleep(backoff)
+                await asyncio.sleep(backoff)
                 backoff = min(0.6, backoff * 1.8)
+
         raise RuntimeError("Unreachable request flow")
 
-    def get_case(self) -> dict:
-        return self._request("GET", "/case")
+    async def get_case(self) -> dict:
+        return await self._request("GET", "/case")
 
-    def get_news(self, since: Optional[int] = None, limit: Optional[int] = None) -> List[dict]:
+    async def get_news(self, since: Optional[int] = None, limit: Optional[int] = None) -> List[dict]:
         params = {}
         if since is not None:
             params["since"] = since
         if limit is not None:
             params["limit"] = limit
-        return self._request("GET", "/news", params=params)
+        return await self._request("GET", "/news", params=params)
 
-    def get_securities(self) -> List[dict]:
-        return self._request("GET", "/securities")
+    async def get_securities(self) -> List[dict]:
+        return await self._request("GET", "/securities")
 
-    def get_book(self, ticker: str) -> dict:
-        return self._request("GET", "/securities/book", params={"ticker": ticker, "limit": 1})
+    async def get_book(self, ticker: str) -> dict:
+        return await self._request("GET", "/securities/book", params={"ticker": ticker, "limit": 1})
 
-    def get_orders(self, status: Optional[str] = None) -> List[dict]:
+    async def get_orders(self, status: Optional[str] = None) -> List[dict]:
         params = {"status": status} if status else None
-        return self._request("GET", "/orders", params=params)
+        return await self._request("GET", "/orders", params=params)
 
-    def cancel_order(self, order_id: int) -> dict:
-        return self._request("DELETE", f"/orders/{order_id}")
+    async def cancel_order(self, order_id: int) -> dict:
+        return await self._request("DELETE", f"/orders/{order_id}")
 
-    def place_order(
+    async def place_order(
         self,
         ticker: str,
         action: str,
@@ -466,7 +502,7 @@ class RITClient:
         }
         if price is not None:
             params["price"] = price
-        return self._request("POST", "/orders", params=params, retries=3)
+        return await self._request("POST", "/orders", params=params, retries=3)
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -602,7 +638,7 @@ def inventory_adjusted_threshold(base: float, target_pos: int, action: str, gros
     gross_util = min(1.0, gross_used / max(1.0, GROSS_LIMIT))
     net_util = min(1.0, net_used / max(1.0, NET_LIMIT))
     util = max(gross_util, net_util)
-    return base * (1.0 + 1.2 * inv_util + 0.9 * util)
+    return base * (1.0 + ADD_INVENTORY_SLOPE * inv_util + ADD_GLOBAL_SLOPE * util)
 
 
 def close_qty_for_position(position_abs: int) -> int:
@@ -672,30 +708,6 @@ def scale_target_qty(
     return 0, 0
 
 
-def snapshot_mid(client: RITClient, tickers: Iterable[str]) -> Dict[str, float]:
-    mids: Dict[str, float] = {}
-    for ticker in tickers:
-        book = client.get_book(ticker)
-        bid, ask, _, _ = top_of_book_from_book(book)
-        if bid is None or ask is None:
-            raise RuntimeError(f"Missing bid/ask for {ticker} during initialization")
-        mids[ticker] = (bid + ask) / 2.0
-    return mids
-
-
-def average_snapshot_mid(client: RITClient, tickers: Iterable[str], samples: int, sleep_s: float) -> Dict[str, float]:
-    sums: Dict[str, float] = {t: 0.0 for t in tickers}
-    count = 0
-    for _ in range(max(1, samples)):
-        mids = snapshot_mid(client, tickers)
-        for ticker, mid in mids.items():
-            sums[ticker] += mid
-        count += 1
-        if sleep_s > 0:
-            time.sleep(sleep_s)
-    return {ticker: sums[ticker] / max(1, count) for ticker in sums}
-
-
 @dataclass
 class DealState:
     prob_news: float
@@ -723,25 +735,16 @@ class TrackedOrder:
     cancel_after_ts: float = 0.0
 
 
-class MergerArbAlphaBot:
-    def __init__(self, client: RITClient):
+class MergerArbAlphaAsyncBot:
+    def __init__(self, client: AsyncRITClient):
         self.client = client
-        self.deal_states: Dict[str, DealState] = {}
-        self.lock = threading.Lock()
         self.running = True
         self.last_news_id = 0
         self.last_snapshot_ts = 0.0
 
-        self.deal_ticker_to_id: Dict[str, str] = {}
-        for did, deal in DEALS.items():
-            self.deal_ticker_to_id[deal["target"].upper()] = did
-            self.deal_ticker_to_id[deal["acquirer"].upper()] = did
-        self.trade_tickers = sorted(self.deal_ticker_to_id.keys())
-
-        self.book_executor: Optional[ThreadPoolExecutor] = None
-        self.order_executor: Optional[ThreadPoolExecutor] = None
-
-        self.order_meta_lock = threading.Lock()
+        self.state_lock = asyncio.Lock()
+        self.order_lock = asyncio.Lock()
+        self.deal_states: Dict[str, DealState] = {}
         self.open_order_meta: Dict[int, TrackedOrder] = {}
         self.pending_pos_deltas: Dict[str, int] = {}
         self.last_stale_check_ts = 0.0
@@ -751,28 +754,28 @@ class MergerArbAlphaBot:
         self.finbert_model_path: Optional[str] = None
         self.finbert_tokenizer_path: Optional[str] = None
 
-    def initialize(self) -> None:
-        case = self.client.get_case()
+        self.deal_ticker_to_id: Dict[str, str] = {}
+        for did, deal in DEALS.items():
+            self.deal_ticker_to_id[deal["target"].upper()] = did
+            self.deal_ticker_to_id[deal["acquirer"].upper()] = did
+        self.trade_tickers = sorted(self.deal_ticker_to_id.keys())
+
+    async def initialize(self) -> None:
+        case = await self.client.get_case()
         if case.get("status") != "ACTIVE":
-            log(f"Case status={case.get('status')} waiting ACTIVE")
+            await log(f"Case status={case.get('status')} waiting ACTIVE")
             while self.running:
-                time.sleep(CASE_POLL_SECS)
-                case = self.client.get_case()
+                await asyncio.sleep(CASE_POLL_SECS)
+                case = await self.client.get_case()
                 if case.get("status") == "ACTIVE":
                     break
 
         if INIT_WARMUP_SECS > 0:
-            log(f"INIT warmup {INIT_WARMUP_SECS:.1f}s")
-            time.sleep(INIT_WARMUP_SECS)
+            await log(f"INIT warmup {INIT_WARMUP_SECS:.1f}s")
+            await asyncio.sleep(INIT_WARMUP_SECS)
 
-        mids = average_snapshot_mid(
-            self.client,
-            self.trade_tickers,
-            samples=INIT_SNAPSHOTS,
-            sleep_s=INIT_SAMPLE_INTERVAL_SECS,
-        )
-
-        with self.lock:
+        mids = await self._average_snapshot_mid(self.trade_tickers, INIT_SNAPSHOTS, INIT_SAMPLE_INTERVAL_SECS)
+        async with self.state_lock:
             for did, deal in DEALS.items():
                 target = deal["target"].upper()
                 acq = deal["acquirer"].upper()
@@ -780,58 +783,56 @@ class MergerArbAlphaBot:
                 k0 = deal_value(deal, mids[acq])
                 v0 = infer_standalone_value(mids[target], p0, k0)
                 self.deal_states[did] = DealState(prob_news=p0, prob_live=p0, standalone_value=v0)
-                log(
+                await log(
                     f"INIT {did} target={target} mid0={mids[target]:.2f} acq={acq} mid0={mids[acq]:.2f} "
                     f"K0={k0:.2f} V0={v0:.2f} p0={p0:.3f}"
                 )
 
-    def _fetch_books_parallel(self) -> Dict[str, Tuple[float, float, float, int, int]]:
-        out: Dict[str, Tuple[float, float, float, int, int]] = {}
-
-        def one(ticker: str) -> Tuple[str, Optional[Tuple[float, float, float, int, int]]]:
-            try:
-                b = self.client.get_book(ticker)
-                bid, ask, bid_qty, ask_qty = top_of_book_from_book(b)
-                if bid is None or ask is None:
-                    return ticker, None
-                return ticker, (bid, ask, (bid + ask) / 2.0, bid_qty, ask_qty)
-            except Exception:
+    async def _fetch_book_one(self, ticker: str) -> Tuple[str, Optional[Tuple[float, float, float, int, int]]]:
+        try:
+            b = await self.client.get_book(ticker)
+            bid, ask, bid_qty, ask_qty = top_of_book_from_book(b)
+            if bid is None or ask is None:
                 return ticker, None
+            return ticker, (bid, ask, (bid + ask) / 2.0, bid_qty, ask_qty)
+        except Exception:
+            return ticker, None
 
-        if self.book_executor is None:
-            workers = max(2, min(BOOK_WORKERS, len(self.trade_tickers)))
-            self.book_executor = ThreadPoolExecutor(max_workers=workers)
-
-        for ticker, res in self.book_executor.map(one, self.trade_tickers):
+    async def _fetch_books_parallel(self) -> Dict[str, Tuple[float, float, float, int, int]]:
+        out: Dict[str, Tuple[float, float, float, int, int]] = {}
+        results = await asyncio.gather(*[self._fetch_book_one(t) for t in self.trade_tickers], return_exceptions=False)
+        for ticker, res in results:
             if res is not None:
                 out[ticker] = res
         return out
 
-    def _safe_positions(self) -> Dict[str, int]:
-        sec = self.client.get_securities()
+    async def _snapshot_mid(self, tickers: Iterable[str]) -> Dict[str, float]:
+        books = await asyncio.gather(*[self.client.get_book(t) for t in tickers])
+        out: Dict[str, float] = {}
+        for ticker, book in zip(tickers, books):
+            bid, ask, _, _ = top_of_book_from_book(book)
+            if bid is None or ask is None:
+                raise RuntimeError(f"Missing bid/ask for {ticker} during initialization")
+            out[ticker] = (bid + ask) / 2.0
+        return out
+
+    async def _average_snapshot_mid(self, tickers: Iterable[str], samples: int, sleep_s: float) -> Dict[str, float]:
+        sums: Dict[str, float] = {t: 0.0 for t in tickers}
+        count = 0
+        for _ in range(max(1, samples)):
+            mids = await self._snapshot_mid(tickers)
+            for t, mid in mids.items():
+                sums[t] += mid
+            count += 1
+            if sleep_s > 0:
+                await asyncio.sleep(sleep_s)
+        return {t: sums[t] / max(1, count) for t in sums}
+
+    async def _safe_positions(self) -> Dict[str, int]:
+        sec = await self.client.get_securities()
         return {s["ticker"].upper(): int(s.get("position", 0)) for s in sec}
 
-    def _signed_qty(self, action: str, quantity: int) -> int:
-        return quantity if action == "BUY" else -quantity
-
-    def _apply_pending_delta_locked(self, ticker: str, delta: int) -> None:
-        if delta == 0:
-            return
-        cur = int(self.pending_pos_deltas.get(ticker, 0))
-        nxt = cur + int(delta)
-        if nxt == 0:
-            self.pending_pos_deltas.pop(ticker, None)
-        else:
-            self.pending_pos_deltas[ticker] = nxt
-
-    def _effective_positions(self, live_positions: Dict[str, int]) -> Dict[str, int]:
-        merged = {k.upper(): int(v) for k, v in live_positions.items()}
-        with self.order_meta_lock:
-            for ticker, delta in self.pending_pos_deltas.items():
-                merged[ticker] = int(merged.get(ticker, 0) + delta)
-        return merged
-
-    def _initialize_finbert(self) -> None:
+    async def _initialize_finbert(self) -> None:
         model_path, tokenizer_path, note = _detect_finbert_assets(FINBERT_ONNX_MODEL, FINBERT_TOKENIZER_DIR)
         if model_path is None or tokenizer_path is None:
             raise RuntimeError(f"FinBERT assets missing: {note}")
@@ -849,20 +850,19 @@ class MergerArbAlphaBot:
             self.finbert_enabled = True
             self.finbert_model_path = str(model_path)
             self.finbert_tokenizer_path = str(tokenizer_path)
-            log(
+            await log(
                 f"FINBERT enabled model={model_path} tokenizer={tokenizer_path} "
                 f"pos_thr={FINBERT_POS_THRESHOLD:.2f} neg_thr={FINBERT_NEG_THRESHOLD:.2f}"
             )
         except Exception as exc:
             raise RuntimeError(f"FinBERT init failed: {exc}") from exc
 
-    def _finbert_infer(self, text: str) -> Tuple[Optional[str], str, float, Optional[dict]]:
+    def _finbert_infer_sync(self, text: str) -> Tuple[Optional[str], str, float, Optional[dict]]:
         if self.finbert is None:
             return None, "S", 0.0, None
         try:
             probs = self.finbert.predict(text)
         except Exception as exc:
-            log(f"FINBERT inference error: {exc}", level="WARN")
             return None, "S", 0.0, {"error": str(exc)}
 
         p_pos = float(probs.get("positive_probability", 0.0))
@@ -884,7 +884,6 @@ class MergerArbAlphaBot:
             severity = "S"
 
         strength = clamp((conf - 0.5) * 1.4 + gap * 0.9, 0.0, 1.0)
-
         meta = {
             "positive_probability": round(p_pos, 6),
             "negative_probability": round(p_neg, 6),
@@ -894,6 +893,9 @@ class MergerArbAlphaBot:
         }
         return direction, severity, strength, meta
 
+    async def _finbert_infer(self, text: str) -> Tuple[Optional[str], str, float, Optional[dict]]:
+        return await asyncio.to_thread(self._finbert_infer_sync, text)
+
     def _news_delta(self, direction: str, severity: str, strength: float, category: str, deal_mult: float, current_p: float) -> float:
         sign = 1.0 if direction == "POS" else -1.0
         sev_mult = SEVERITY_MULT.get(severity, 1.0)
@@ -901,7 +903,6 @@ class MergerArbAlphaBot:
         mag = NEWS_BASE_MAG + NEWS_MAX_EXTRA_MAG * (max(0.0, strength) ** NEWS_STRENGTH_POWER)
         raw = sign * mag * sev_mult * cat_mult * float(deal_mult)
 
-        # Headroom damping prevents sticky saturation near 0/1.
         headroom = (1.0 - current_p) if sign > 0 else current_p
         damp = 0.35 + 0.65 * clamp(headroom, 0.0, 1.0)
         return raw * damp
@@ -913,7 +914,17 @@ class MergerArbAlphaBot:
             return round(ask + MARKETABLE_LIMIT_OFFSET, 2)
         return round(max(0.01, bid - MARKETABLE_LIMIT_OFFSET), 2)
 
-    def _track_order(self, response: Optional[dict], ticker: str, reason: str, action: str, quantity: int) -> None:
+    async def _apply_pending_delta_locked(self, ticker: str, delta: int) -> None:
+        if delta == 0:
+            return
+        cur = int(self.pending_pos_deltas.get(ticker, 0))
+        nxt = cur + int(delta)
+        if nxt == 0:
+            self.pending_pos_deltas.pop(ticker, None)
+        else:
+            self.pending_pos_deltas[ticker] = nxt
+
+    async def _track_order(self, response: Optional[dict], ticker: str, reason: str, action: str, quantity: int) -> None:
         if not response:
             return
         order_id = response.get("order_id")
@@ -929,7 +940,7 @@ class MergerArbAlphaBot:
         if tracked_qty <= 0:
             tracked_qty = int(quantity)
 
-        pending_delta = self._signed_qty(action, tracked_qty)
+        pending_delta = tracked_qty if action == "BUY" else -tracked_qty
         cancel_after_ts = time.time() + max(0.05, IOC_CANCEL_SECS) if ENABLE_IOC_EMULATION else 0.0
 
         meta = TrackedOrder(
@@ -942,19 +953,26 @@ class MergerArbAlphaBot:
             cancel_after_ts=cancel_after_ts,
         )
 
-        with self.order_meta_lock:
+        async with self.order_lock:
             self.open_order_meta[oid] = meta
-            self._apply_pending_delta_locked(ticker, pending_delta)
+            await self._apply_pending_delta_locked(ticker, pending_delta)
 
-    def _cancel_stale_orders(self, now: float) -> None:
+    async def _effective_positions(self, live_positions: Dict[str, int]) -> Dict[str, int]:
+        merged = {k.upper(): int(v) for k, v in live_positions.items()}
+        async with self.order_lock:
+            for ticker, delta in self.pending_pos_deltas.items():
+                merged[ticker] = int(merged.get(ticker, 0) + delta)
+        return merged
+
+    async def _cancel_stale_orders(self, now: float) -> None:
         if now - self.last_stale_check_ts < STALE_CANCEL_CHECK_SECS:
             return
         self.last_stale_check_ts = now
 
         try:
-            open_orders = self.client.get_orders(status="OPEN")
+            open_orders = await self.client.get_orders(status="OPEN")
         except Exception as exc:
-            log(f"ORDERS_WARN open order poll failed: {exc}")
+            await log(f"ORDERS_WARN open order poll failed: {exc}", level="WARN")
             return
 
         open_by_id: Dict[int, dict] = {}
@@ -968,12 +986,12 @@ class MergerArbAlphaBot:
                 continue
 
         stale: List[Tuple[int, TrackedOrder, str]] = []
-        with self.order_meta_lock:
+        async with self.order_lock:
             tracked = set(self.open_order_meta.keys())
             for oid in tracked - set(open_by_id.keys()):
                 meta = self.open_order_meta.pop(oid, None)
                 if meta is not None:
-                    self._apply_pending_delta_locked(meta.ticker, -meta.pending_delta)
+                    await self._apply_pending_delta_locked(meta.ticker, -meta.pending_delta)
 
             for oid, meta in list(self.open_order_meta.items()):
                 open_order = open_by_id.get(oid)
@@ -985,35 +1003,34 @@ class MergerArbAlphaBot:
                     open_qty = meta.quantity
                 filled = _safe_int(open_order.get("quantity_filled"))
                 remaining = max(0, open_qty - filled)
-                expected_pending = self._signed_qty(meta.action, remaining)
+                expected_pending = remaining if meta.action == "BUY" else -remaining
 
                 if expected_pending != meta.pending_delta:
-                    self._apply_pending_delta_locked(meta.ticker, expected_pending - meta.pending_delta)
+                    await self._apply_pending_delta_locked(meta.ticker, expected_pending - meta.pending_delta)
                     meta.pending_delta = expected_pending
                     self.open_order_meta[oid] = meta
 
                 is_stale = now - meta.ts >= STALE_ORDER_SECS
-                is_ioc_timeout = ENABLE_IOC_EMULATION and meta.cancel_after_ts > 0 and now >= meta.cancel_after_ts
-                if is_stale or is_ioc_timeout:
-                    reason = "IOC_TIMEOUT" if is_ioc_timeout else "STALE"
-                    stale.append((oid, meta, reason))
+                is_ioc = ENABLE_IOC_EMULATION and meta.cancel_after_ts > 0 and now >= meta.cancel_after_ts
+                if is_stale or is_ioc:
+                    stale.append((oid, meta, "IOC_TIMEOUT" if is_ioc else "STALE"))
 
         for oid, meta, cancel_reason in stale:
             try:
-                self.client.cancel_order(oid)
-                log(
+                await self.client.cancel_order(oid)
+                await log(
                     f"CANCEL order_id={oid} ticker={meta.ticker} reason={meta.reason} "
                     f"cancel_reason={cancel_reason} age={now - meta.ts:.2f}s"
                 )
             except Exception:
                 pass
             finally:
-                with self.order_meta_lock:
+                async with self.order_lock:
                     active = self.open_order_meta.pop(oid, None)
                     if active is not None:
-                        self._apply_pending_delta_locked(active.ticker, -active.pending_delta)
+                        await self._apply_pending_delta_locked(active.ticker, -active.pending_delta)
 
-    def _submit_pair(
+    async def _submit_pair(
         self,
         deal_id: str,
         target: str,
@@ -1033,91 +1050,96 @@ class MergerArbAlphaBot:
         hedge_side = "SELL" if signal_action == "BUY" else "BUY"
         hedge_px = self._marketable_limit_price(hedge_side, a_bid, a_ask) if hedge_qty > 0 else None
 
-        if self.order_executor is None:
-            self.order_executor = ThreadPoolExecutor(max_workers=4)
-
         start = time.perf_counter()
-        tgt_resp = None
-        hedge_resp = None
+        tgt_resp: Optional[dict] = None
+        hedge_resp: Optional[dict] = None
 
         if hedge_qty > 0 and SIMULTANEOUS_LEGS:
-            f_target = self.order_executor.submit(
-                self.client.place_order,
-                ticker=target,
-                action=signal_action,
-                quantity=target_qty,
-                order_type="LIMIT",
-                price=target_px,
-            )
-            f_hedge = self.order_executor.submit(
-                self.client.place_order,
-                ticker=acquirer,
-                action=hedge_side,
-                quantity=hedge_qty,
-                order_type="LIMIT",
-                price=hedge_px,
-            )
-            try:
-                tgt_resp = f_target.result()
-                self._track_order(tgt_resp, target, reason, signal_action, target_qty)
-            except Exception as exc:
-                log(
-                    f"ORDER_FAIL {deal_id} reason={reason} target={target} side={signal_action} "
-                    f"qty={target_qty} px={target_px:.2f} err={exc}"
-                )
-            try:
-                hedge_resp = f_hedge.result()
-                self._track_order(hedge_resp, acquirer, reason, hedge_side, hedge_qty)
-            except Exception as exc:
-                log(
-                    f"HEDGE_FAIL {deal_id} reason={reason} acq={acquirer} side={hedge_side} "
-                    f"qty={hedge_qty} px={hedge_px:.2f} err={exc}"
-                )
-        else:
-            try:
-                tgt_resp = self.client.place_order(
+            tgt_task = asyncio.create_task(
+                self.client.place_order(
                     ticker=target,
                     action=signal_action,
                     quantity=target_qty,
                     order_type="LIMIT",
                     price=target_px,
                 )
-                self._track_order(tgt_resp, target, reason, signal_action, target_qty)
-            except Exception as exc:
-                log(
+            )
+            hedge_task = asyncio.create_task(
+                self.client.place_order(
+                    ticker=acquirer,
+                    action=hedge_side,
+                    quantity=hedge_qty,
+                    order_type="LIMIT",
+                    price=hedge_px,
+                )
+            )
+            tgt_res, hedge_res = await asyncio.gather(tgt_task, hedge_task, return_exceptions=True)
+
+            if isinstance(tgt_res, Exception):
+                await log(
                     f"ORDER_FAIL {deal_id} reason={reason} target={target} side={signal_action} "
-                    f"qty={target_qty} px={target_px:.2f} err={exc}"
+                    f"qty={target_qty} px={target_px:.2f} err={tgt_res}",
+                    level="WARN",
+                )
+            else:
+                tgt_resp = tgt_res
+                await self._track_order(tgt_resp, target, reason, signal_action, target_qty)
+
+            if isinstance(hedge_res, Exception):
+                await log(
+                    f"HEDGE_FAIL {deal_id} reason={reason} acq={acquirer} side={hedge_side} "
+                    f"qty={hedge_qty} px={hedge_px:.2f} err={hedge_res}",
+                    level="WARN",
+                )
+            else:
+                hedge_resp = hedge_res
+                await self._track_order(hedge_resp, acquirer, reason, hedge_side, hedge_qty)
+        else:
+            try:
+                tgt_resp = await self.client.place_order(
+                    ticker=target,
+                    action=signal_action,
+                    quantity=target_qty,
+                    order_type="LIMIT",
+                    price=target_px,
+                )
+                await self._track_order(tgt_resp, target, reason, signal_action, target_qty)
+            except Exception as exc:
+                await log(
+                    f"ORDER_FAIL {deal_id} reason={reason} target={target} side={signal_action} "
+                    f"qty={target_qty} px={target_px:.2f} err={exc}",
+                    level="WARN",
                 )
                 return False, False
 
             if hedge_qty > 0:
                 try:
-                    hedge_resp = self.client.place_order(
+                    hedge_resp = await self.client.place_order(
                         ticker=acquirer,
                         action=hedge_side,
                         quantity=hedge_qty,
                         order_type="LIMIT",
                         price=hedge_px,
                     )
-                    self._track_order(hedge_resp, acquirer, reason, hedge_side, hedge_qty)
+                    await self._track_order(hedge_resp, acquirer, reason, hedge_side, hedge_qty)
                 except Exception as exc:
-                    log(
+                    await log(
                         f"HEDGE_FAIL {deal_id} reason={reason} acq={acquirer} side={hedge_side} "
-                        f"qty={hedge_qty} px={hedge_px:.2f} err={exc}"
+                        f"qty={hedge_qty} px={hedge_px:.2f} err={exc}",
+                        level="WARN",
                     )
 
         elapsed_ms = (time.perf_counter() - start) * 1000.0
-        log(
+        await log(
             f"TRADE {deal_id} reason={reason} side={signal_action} tgt={target} qty={target_qty}@{target_px:.2f} "
             f"hedge={acquirer}:{hedge_side if hedge_qty > 0 else 'NONE'}:{hedge_qty}"
             f"{f'@{hedge_px:.2f}' if hedge_qty > 0 and hedge_px is not None else ''} "
-            f"edge={edge:.3f} p*={p_star:.3f} bid/ask={t_bid:.2f}/{t_ask:.2f} "
-            f"lat={elapsed_ms:.1f}ms tgt_id={(tgt_resp or {}).get('order_id')} "
-            f"hedge_id={(hedge_resp or {}).get('order_id')}"
+            f"edge={edge:.3f} p*={p_star:.3f} bid/ask={t_bid:.2f}/{t_ask:.2f} lat={elapsed_ms:.1f}ms "
+            f"tgt_id={(tgt_resp or {}).get('order_id')} hedge_id={(hedge_resp or {}).get('order_id')}"
         )
         return tgt_resp is not None, (hedge_resp is not None if hedge_qty > 0 else False)
 
-    def _submit_single(
+    async def _submit_single(
         self,
         deal_id: str,
         ticker: str,
@@ -1131,18 +1153,21 @@ class MergerArbAlphaBot:
             return False
         px = self._marketable_limit_price(action, bid, ask)
         try:
-            resp = self.client.place_order(
+            resp = await self.client.place_order(
                 ticker=ticker,
                 action=action,
                 quantity=qty,
                 order_type="LIMIT",
                 price=px,
             )
-            self._track_order(resp, ticker, reason, action, qty)
-            log(f"TRADE {deal_id} reason={reason} side={action} single={ticker} qty={qty}@{px:.2f} order_id={resp.get('order_id')}")
+            await self._track_order(resp, ticker, reason, action, qty)
+            await log(f"TRADE {deal_id} reason={reason} side={action} single={ticker} qty={qty}@{px:.2f} id={resp.get('order_id')}")
             return True
         except Exception as exc:
-            log(f"ORDER_FAIL {deal_id} reason={reason} single={ticker} side={action} qty={qty} px={px:.2f} err={exc}")
+            await log(
+                f"ORDER_FAIL {deal_id} reason={reason} single={ticker} side={action} qty={qty} px={px:.2f} err={exc}",
+                level="WARN",
+            )
             return False
 
     def _cap_target_qty_by_hedge_liquidity(
@@ -1174,17 +1199,39 @@ class MergerArbAlphaBot:
         if capped_target < MIN_ORDER_QTY:
             return 0, 0
 
-        capped_hedge = int(round(ratio * capped_target))
-        return capped_target, capped_hedge
+        return capped_target, int(round(ratio * capped_target))
 
-    def news_worker(self) -> None:
+    def _update_prob_live(self, st: DealState, deal: dict, t_mid: float, a_mid: float, now: float) -> Tuple[float, float]:
+        k_mid = deal_value(deal, a_mid)
+        denom = k_mid - st.standalone_value
+        if abs(denom) < 1e-9:
+            p_impl = st.prob_news
+        else:
+            p_impl = clamp((t_mid - st.standalone_value) / denom, 0.0, 1.0)
+
+        if st.last_news_update_ts > 0:
+            age = max(0.0, now - st.last_news_update_ts)
+            recency = math.exp(-age / max(1e-6, NEWS_HALF_LIFE_SECS))
+        else:
+            recency = 0.0
+
+        w_news = clamp(
+            P_NEWS_BASE + P_NEWS_EVENT_WEIGHT * st.last_event_strength + P_NEWS_RECENCY_WEIGHT * recency,
+            P_NEWS_MIN,
+            P_NEWS_MAX,
+        )
+        p_target = clamp(w_news * st.prob_news + (1.0 - w_news) * p_impl, 0.0, 1.0)
+        p_live = clamp((1.0 - PROB_SMOOTH_ALPHA) * st.prob_live + PROB_SMOOTH_ALPHA * p_target, 0.0, 1.0)
+        return p_live, p_impl
+
+    async def news_worker(self) -> None:
         err_count = 0
         while self.running:
             try:
-                news = self.client.get_news(since=self.last_news_id, limit=40)
+                news = await self.client.get_news(since=self.last_news_id, limit=40)
                 if not news:
                     err_count = 0
-                    time.sleep(NEWS_POLL_SECS)
+                    await asyncio.sleep(NEWS_POLL_SECS)
                     continue
 
                 for item in sorted(news, key=lambda x: x.get("news_id", 0)):
@@ -1201,17 +1248,18 @@ class MergerArbAlphaBot:
                     refs_api, ref_api_meta = extract_referenced_deals(api_ticker, self.deal_ticker_to_id, include_entities=False)
                     refs = sorted(set(refs_text) | set(refs_api))
 
-                    cat_explicit = classify_category(text)
-                    category = cat_explicit
-                    category_source = "explicit_or_keyword" if cat_explicit else "none"
+                    category = classify_category(text)
+                    category_source = "explicit_or_keyword" if category else "none"
                     if category is None and FINBERT_CATEGORY_FALLBACK in CATEGORY_MULT:
                         category = FINBERT_CATEGORY_FALLBACK
                         category_source = "fallback"
 
-                    direction, severity, strength, finbert_meta = self._finbert_infer(text)
+                    direction, severity, strength, finbert_meta = await self._finbert_infer(text)
+                    if finbert_meta is not None and "error" in finbert_meta:
+                        await log(f"FINBERT inference error: {finbert_meta['error']}", level="WARN")
 
                     classifier_meta = {
-                        "mode": "finbert_jump_blend",
+                        "mode": "finbert_jump_blend_async",
                         "finbert": {
                             "enabled": self.finbert_enabled,
                             "direction": direction,
@@ -1231,144 +1279,80 @@ class MergerArbAlphaBot:
 
                     if not refs:
                         if RUN_RECORDER is not None:
-                            RUN_RECORDER.add_news(
-                                item=item,
-                                refs=[],
-                                category=category,
-                                direction=direction,
-                                severity=severity,
-                                applied=[],
-                                skipped=True,
-                                skip_reason="NO_DEAL_REFERENCE",
-                                classifier_meta=classifier_meta,
-                            )
+                            await RUN_RECORDER.add_news(item, [], category, direction, severity, [], True, "NO_DEAL_REFERENCE", classifier_meta)
                         continue
 
                     if phrase_hits(text, FLOW_DISLOCATION_PHRASES):
                         if RUN_RECORDER is not None:
-                            RUN_RECORDER.add_news(
-                                item=item,
-                                refs=refs,
-                                category=category,
-                                direction=direction,
-                                severity=severity,
-                                applied=[],
-                                skipped=True,
-                                skip_reason="FLOW_DISLOCATION_FILTER",
-                                classifier_meta=classifier_meta,
-                            )
+                            await RUN_RECORDER.add_news(item, refs, category, direction, severity, [], True, "FLOW_DISLOCATION_FILTER", classifier_meta)
                         continue
 
                     if phrase_hits(text, AMBIGUOUS_PHRASES):
                         if RUN_RECORDER is not None:
-                            RUN_RECORDER.add_news(
-                                item=item,
-                                refs=refs,
-                                category=category,
-                                direction=direction,
-                                severity=severity,
-                                applied=[],
-                                skipped=True,
-                                skip_reason="AMBIGUOUS_FILTER",
-                                classifier_meta=classifier_meta,
-                            )
+                            await RUN_RECORDER.add_news(item, refs, category, direction, severity, [], True, "AMBIGUOUS_FILTER", classifier_meta)
                         continue
 
                     if category is None or direction is None:
                         if RUN_RECORDER is not None:
-                            RUN_RECORDER.add_news(
-                                item=item,
-                                refs=refs,
-                                category=category,
-                                direction=direction,
-                                severity=severity,
-                                applied=[],
-                                skipped=True,
-                                skip_reason="CLASSIFICATION_INCOMPLETE",
-                                classifier_meta=classifier_meta,
-                            )
+                            await RUN_RECORDER.add_news(item, refs, category, direction, severity, [], True, "CLASSIFICATION_INCOMPLETE", classifier_meta)
                         continue
 
                     now = time.time()
                     applied: List[dict] = []
-                    with self.lock:
+                    async with self.state_lock:
                         for did in refs:
                             deal = DEALS[did]
                             st = self.deal_states[did]
                             old_p = st.prob_news
-                            delta = self._news_delta(
-                                direction=direction,
-                                severity=severity,
-                                strength=strength,
-                                category=category,
-                                deal_mult=float(deal["deal_mult"]),
-                                current_p=old_p,
-                            )
+                            delta = self._news_delta(direction, severity, strength, category, float(deal["deal_mult"]), old_p)
                             st.prob_news = clamp(old_p + delta, 0.0, 1.0)
                             st.last_news_update_ts = now
                             st.last_news_id = news_id
                             st.last_news_delta_abs = abs(delta)
                             st.last_event_strength = max(st.last_event_strength * 0.55, strength)
-                            applied.append(
-                                {
-                                    "deal_id": did,
-                                    "old_p": round(old_p, 6),
-                                    "delta": round(delta, 6),
-                                    "new_p": round(st.prob_news, 6),
-                                }
-                            )
-                            log(
-                                f"NEWS id={news_id} deal={did} cat={category} dir={direction} sev={severity} "
-                                f"strength={strength:.3f} delta={delta:+.4f} p:{old_p:.4f}->{st.prob_news:.4f}"
-                            )
+                            applied.append({"deal_id": did, "old_p": round(old_p, 6), "delta": round(delta, 6), "new_p": round(st.prob_news, 6)})
 
-                    if RUN_RECORDER is not None:
-                        RUN_RECORDER.add_news(
-                            item=item,
-                            refs=refs,
-                            category=category,
-                            direction=direction,
-                            severity=severity,
-                            applied=applied,
-                            skipped=False,
-                            classifier_meta=classifier_meta,
+                    for row in applied:
+                        await log(
+                            f"NEWS id={news_id} deal={row['deal_id']} cat={category} dir={direction} sev={severity} "
+                            f"strength={strength:.3f} delta={row['delta']:+.4f} p:{row['old_p']:.4f}->{row['new_p']:.4f}"
                         )
 
+                    if RUN_RECORDER is not None:
+                        await RUN_RECORDER.add_news(item, refs, category, direction, severity, applied, False, None, classifier_meta)
+
                 err_count = 0
-                time.sleep(NEWS_POLL_SECS)
+                await asyncio.sleep(NEWS_POLL_SECS)
             except Exception as exc:
                 err_count += 1
                 sleep_s = min(1.0, 0.05 * (2 ** min(err_count, 4)))
-                log(f"NEWS_ERR count={err_count} sleep={sleep_s:.2f}s err={exc}", level="WARN")
-                time.sleep(sleep_s)
+                await log(f"NEWS_ERR count={err_count} sleep={sleep_s:.2f}s err={exc}", level="WARN")
+                await asyncio.sleep(sleep_s)
 
-    def manual_override_worker(self) -> None:
-        log("Manual override ready: 'D1 P 0.72' or 'D2 POS L REG'")
+    async def manual_override_worker(self) -> None:
+        await log("Manual override ready: 'D1 P 0.72' or 'D2 POS L REG'")
         while self.running:
             try:
-                line = input().strip()
-            except EOFError:
-                return
-            except Exception as exc:
-                log(f"MANUAL_ERR {exc}", level="WARN")
-                time.sleep(0.1)
+                line = await asyncio.to_thread(input)
+                line = line.strip()
+            except Exception:
+                await asyncio.sleep(0.1)
                 continue
 
             if not line:
                 continue
             parts = line.upper().split()
-
             if len(parts) == 3 and parts[1] == "P":
                 did = parts[0]
                 if did not in DEALS:
-                    log(f"MANUAL_SKIP invalid deal {did}")
+                    await log(f"MANUAL_SKIP invalid deal {did}")
                     continue
                 try:
                     p_new = clamp(float(parts[2]), 0.0, 1.0)
                 except ValueError:
-                    log("MANUAL_SKIP invalid p")
+                    await log("MANUAL_SKIP invalid p")
                     continue
-                with self.lock:
+                async with self.state_lock:
                     st = self.deal_states[did]
                     old = st.prob_news
                     st.prob_news = p_new
@@ -1376,68 +1360,58 @@ class MergerArbAlphaBot:
                     st.last_news_id = max(st.last_news_id, self.last_news_id)
                     st.last_news_delta_abs = abs(p_new - old)
                     st.last_event_strength = max(0.2, st.last_event_strength)
-                log(f"MANUAL_SET deal={did} p:{old:.4f}->{p_new:.4f}")
+                await log(f"MANUAL_SET deal={did} p:{old:.4f}->{p_new:.4f}")
                 continue
 
             if len(parts) not in {3, 4}:
-                log("MANUAL_SKIP format")
+                await log("MANUAL_SKIP format")
                 continue
 
             did, direction, severity = parts[0], parts[1], parts[2]
             category = parts[3] if len(parts) == 4 else "FIN"
             if did not in DEALS or direction not in {"POS", "NEG"} or severity not in {"S", "M", "L"} or category not in CATEGORY_MULT:
-                log("MANUAL_SKIP invalid args")
+                await log("MANUAL_SKIP invalid args")
                 continue
 
-            with self.lock:
+            async with self.state_lock:
                 st = self.deal_states[did]
                 old = st.prob_news
-                delta = self._news_delta(
-                    direction=direction,
-                    severity=severity,
-                    strength=0.75,
-                    category=category,
-                    deal_mult=float(DEALS[did]["deal_mult"]),
-                    current_p=old,
-                )
+                delta = self._news_delta(direction, severity, 0.75, category, float(DEALS[did]["deal_mult"]), old)
                 st.prob_news = clamp(old + delta, 0.0, 1.0)
                 st.last_news_update_ts = time.time()
                 st.last_news_id = max(st.last_news_id, self.last_news_id)
                 st.last_news_delta_abs = abs(delta)
                 st.last_event_strength = max(st.last_event_strength, 0.65)
-            log(f"MANUAL_DELTA deal={did} delta={delta:+.4f} p:{old:.4f}->{st.prob_news:.4f}")
+            await log(f"MANUAL_DELTA deal={did} delta={delta:+.4f} p:{old:.4f}->{st.prob_news:.4f}")
 
-    def _periodic_snapshot(self, books: Dict[str, Tuple[float, float, float, int, int]], positions: Dict[str, int]) -> None:
+    async def _periodic_snapshot(self, books: Dict[str, Tuple[float, float, float, int, int]], positions: Dict[str, int]) -> None:
         now = time.time()
         if now - self.last_snapshot_ts < SNAPSHOT_SECS:
             return
         self.last_snapshot_ts = now
 
         gross, net = compute_gross_net(positions)
-        log(f"RISK gross={gross}/{GROSS_LIMIT} net={net}/{NET_LIMIT}")
+        await log(f"RISK gross={gross}/{GROSS_LIMIT} net={net}/{NET_LIMIT}")
 
-        with self.lock:
+        async with self.state_lock:
             for did, deal in DEALS.items():
                 target = deal["target"].upper()
                 acq = deal["acquirer"].upper()
                 if target not in books or acq not in books:
                     continue
                 t_bid, t_ask, t_mid, _, _ = books[target]
-                a_bid, a_ask, a_mid, _, _ = books[acq]
+                _, _, a_mid, _, _ = books[acq]
                 st = self.deal_states[did]
                 k_mid = deal_value(deal, a_mid)
                 denom = k_mid - st.standalone_value
-                if abs(denom) < 1e-9:
-                    p_impl = st.prob_news
-                else:
-                    p_impl = clamp((t_mid - st.standalone_value) / denom, 0.0, 1.0)
+                p_impl = st.prob_news if abs(denom) < 1e-9 else clamp((t_mid - st.standalone_value) / denom, 0.0, 1.0)
                 p_star = st.prob_live * k_mid + (1.0 - st.prob_live) * st.standalone_value
-                log(
+                await log(
                     f"MODEL {did} p_news={st.prob_news:.4f} p_live={st.prob_live:.4f} p_impl={p_impl:.4f} "
                     f"V={st.standalone_value:.2f} Kmid={k_mid:.2f} P*={p_star:.2f} bid/ask={t_bid:.2f}/{t_ask:.2f}"
                 )
 
-    def _capacity_recycler(
+    async def _capacity_recycler(
         self,
         now: float,
         books: Dict[str, Tuple[float, float, float, int, int]],
@@ -1449,7 +1423,6 @@ class MergerArbAlphaBot:
         target_util = max(0.40, min(trigger_util - 0.01, CAPACITY_RECYCLE_TARGET_UTIL))
         trigger_gross = int(GROSS_LIMIT * trigger_util)
         target_gross = int(GROSS_LIMIT * target_util)
-
         if gross_used < trigger_gross:
             return gross_used
 
@@ -1472,6 +1445,7 @@ class MergerArbAlphaBot:
         for _, did in sorted(candidates, key=lambda x: x[0]):
             if gross_used <= target_gross:
                 break
+
             deal = DEALS[did]
             target = deal["target"].upper()
             acq = deal["acquirer"].upper()
@@ -1486,49 +1460,41 @@ class MergerArbAlphaBot:
             t_bid, t_ask, _, _, _ = books[target]
             a_bid, a_ask, _, a_bid_qty, a_ask_qty = books[acq]
             ratio = float(deal["ratio"]) if deal["structure"] in {"stock", "mixed"} else 0.0
-
             action = "SELL" if t_pos > 0 else "BUY"
+
             close_qty = scaled_close_qty(abs(t_pos), CAPACITY_RECYCLE_REDUCE_FRACTION)
             hedge_close_qty = compute_hedge_close_qty(action, ratio, close_qty, a_pos)
             close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity(
-                action=action,
-                ratio=ratio,
-                target_qty=close_qty,
-                hedge_qty=hedge_close_qty,
-                a_bid_qty=a_bid_qty,
-                a_ask_qty=a_ask_qty,
+                action, ratio, close_qty, hedge_close_qty, a_bid_qty, a_ask_qty
             )
             if close_qty < ORDER_STEP:
                 continue
 
-            k_ref = deal_value(deal, a_ask if action == "SELL" else a_bid)
             st = states_copy[did]
-            p_star = st.prob_live * k_ref + (1.0 - st.prob_live) * st.standalone_value
+            p_star = st.prob_live * deal_value(deal, a_ask if action == "SELL" else a_bid) + (1.0 - st.prob_live) * st.standalone_value
             edge = abs(((t_bid + t_ask) / 2.0) - p_star)
-
-            target_ok, hedge_ok = self._submit_pair(
-                deal_id=did,
-                target=target,
-                acquirer=acq,
-                signal_action=action,
-                target_qty=close_qty,
-                hedge_qty=hedge_close_qty,
-                edge=edge,
-                p_star=p_star,
-                t_bid=t_bid,
-                t_ask=t_ask,
-                a_bid=a_bid,
-                a_ask=a_ask,
-                reason="CAPACITY_RECYCLE",
+            target_ok, hedge_ok = await self._submit_pair(
+                did,
+                target,
+                acq,
+                action,
+                close_qty,
+                hedge_close_qty,
+                edge,
+                p_star,
+                t_bid,
+                t_ask,
+                a_bid,
+                a_ask,
+                "CAPACITY_RECYCLE",
             )
-
             if target_ok:
                 positions[target] = t_pos - close_qty if t_pos > 0 else t_pos + close_qty
             if hedge_close_qty > 0 and hedge_ok:
                 positions[acq] = a_pos + hedge_close_qty if action == "SELL" else a_pos - hedge_close_qty
             if target_ok or hedge_ok:
                 gross_used, _ = compute_gross_net(positions)
-                with self.lock:
+                async with self.state_lock:
                     live = self.deal_states[did]
                     live.last_trade_ts = now
                     live.last_risk_reduce_ts = now
@@ -1536,83 +1502,66 @@ class MergerArbAlphaBot:
 
         return gross_used
 
-    def _update_prob_live(self, st: DealState, deal: dict, t_mid: float, a_mid: float, now: float) -> Tuple[float, float, float]:
-        k_mid = deal_value(deal, a_mid)
-        denom = k_mid - st.standalone_value
-        if abs(denom) < 1e-9:
-            p_impl = st.prob_news
-        else:
-            p_impl = clamp((t_mid - st.standalone_value) / denom, 0.0, 1.0)
+    async def _state_snapshot(self) -> Dict[str, DealState]:
+        async with self.state_lock:
+            return {
+                did: DealState(
+                    prob_news=st.prob_news,
+                    prob_live=st.prob_live,
+                    standalone_value=st.standalone_value,
+                    last_news_update_ts=st.last_news_update_ts,
+                    last_news_id=st.last_news_id,
+                    last_news_delta_abs=st.last_news_delta_abs,
+                    last_event_strength=st.last_event_strength,
+                    last_trade_ts=st.last_trade_ts,
+                    hold_start_ts=st.hold_start_ts,
+                    last_risk_reduce_ts=st.last_risk_reduce_ts,
+                    last_stop_ts=st.last_stop_ts,
+                    last_entry_news_id=st.last_entry_news_id,
+                )
+                for did, st in self.deal_states.items()
+            }
 
-        if st.last_news_update_ts > 0:
-            age = max(0.0, now - st.last_news_update_ts)
-            recency = math.exp(-age / max(1e-6, NEWS_HALF_LIFE_SECS))
-        else:
-            recency = 0.0
+    async def _sync_hold_starts(self, now: float, positions: Dict[str, int]) -> None:
+        async with self.state_lock:
+            for did, deal in DEALS.items():
+                target = deal["target"].upper()
+                t_pos = int(positions.get(target, 0))
+                st = self.deal_states[did]
+                if t_pos != 0 and st.hold_start_ts <= 0:
+                    st.hold_start_ts = now
+                elif t_pos == 0 and st.hold_start_ts != 0:
+                    st.hold_start_ts = 0.0
+                    st.last_risk_reduce_ts = 0.0
 
-        w_news = clamp(
-            P_NEWS_BASE + P_NEWS_EVENT_WEIGHT * st.last_event_strength + P_NEWS_RECENCY_WEIGHT * recency,
-            P_NEWS_MIN,
-            P_NEWS_MAX,
-        )
-        p_target = clamp(w_news * st.prob_news + (1.0 - w_news) * p_impl, 0.0, 1.0)
-        p_live = clamp((1.0 - PROB_SMOOTH_ALPHA) * st.prob_live + PROB_SMOOTH_ALPHA * p_target, 0.0, 1.0)
-        return p_live, p_impl, recency
-
-    def trade_loop(self) -> None:
+    async def trade_loop(self) -> None:
         loop_errors = 0
         while self.running:
             try:
-                case = self.client.get_case()
+                case = await self.client.get_case()
                 if case.get("status") != "ACTIVE":
-                    log(f"Case status={case.get('status')} stopping")
+                    await log(f"Case status={case.get('status')} stopping")
                     self.running = False
                     break
 
-                live_positions = self._safe_positions()
-                books = self._fetch_books_parallel()
+                live_positions = await self._safe_positions()
+                books = await self._fetch_books_parallel()
                 if len(books) < len(self.trade_tickers):
                     missing = sorted(set(self.trade_tickers) - set(books.keys()))
                     if missing:
-                        log(f"BOOK_WARN missing={','.join(missing)}")
+                        await log(f"BOOK_WARN missing={','.join(missing)}", level="WARN")
 
                 now = time.time()
-                self._cancel_stale_orders(now)
-                positions = self._effective_positions(live_positions)
-                self._periodic_snapshot(books, positions)
+                await self._cancel_stale_orders(now)
+                positions = await self._effective_positions(live_positions)
+                await self._sync_hold_starts(now, positions)
+                await self._periodic_snapshot(books, positions)
 
-                with self.lock:
-                    for did, deal in DEALS.items():
-                        target = deal["target"].upper()
-                        st_live = self.deal_states[did]
-                        t_pos = int(positions.get(target, 0))
-                        if t_pos != 0 and st_live.hold_start_ts <= 0:
-                            st_live.hold_start_ts = now
-                        elif t_pos == 0 and st_live.hold_start_ts != 0:
-                            st_live.hold_start_ts = 0.0
-                            st_live.last_risk_reduce_ts = 0.0
-
-                    states_copy = {
-                        did: DealState(
-                            prob_news=st.prob_news,
-                            prob_live=st.prob_live,
-                            standalone_value=st.standalone_value,
-                            last_news_update_ts=st.last_news_update_ts,
-                            last_news_id=st.last_news_id,
-                            last_news_delta_abs=st.last_news_delta_abs,
-                            last_event_strength=st.last_event_strength,
-                            last_trade_ts=st.last_trade_ts,
-                            hold_start_ts=st.hold_start_ts,
-                            last_risk_reduce_ts=st.last_risk_reduce_ts,
-                            last_stop_ts=st.last_stop_ts,
-                            last_entry_news_id=st.last_entry_news_id,
-                        )
-                        for did, st in self.deal_states.items()
-                    }
-
+                states_copy = await self._state_snapshot()
                 gross_used, net_used = compute_gross_net(positions)
-                gross_used = self._capacity_recycler(now, books, positions, states_copy, gross_used)
+                gross_used = await self._capacity_recycler(now, books, positions, states_copy, gross_used)
                 gross_used, net_used = compute_gross_net(positions)
+                states_copy = await self._state_snapshot()
 
                 for did, deal in DEALS.items():
                     target = deal["target"].upper()
@@ -1627,8 +1576,8 @@ class MergerArbAlphaBot:
                     a_bid, a_ask, a_mid, a_bid_qty, a_ask_qty = books[acq]
                     ratio = float(deal["ratio"]) if deal["structure"] in {"stock", "mixed"} else 0.0
 
-                    p_live, p_impl, _recency = self._update_prob_live(st, deal, t_mid, a_mid, now)
-                    with self.lock:
+                    p_live, p_impl = self._update_prob_live(st, deal, t_mid, a_mid, now)
+                    async with self.state_lock:
                         self.deal_states[did].prob_live = p_live
 
                     k_buy = deal_value(deal, a_bid)
@@ -1641,40 +1590,19 @@ class MergerArbAlphaBot:
                     held_secs = (now - st.hold_start_ts) if st.hold_start_ts > 0 else 0.0
                     commission_cost = COMMISSION_PER_SHARE * (1.0 + ratio)
 
-                    # 1) Hard stop.
+                    # Stop loss exits
                     if target_pos > 0 and t_bid <= p_star_buy - commission_cost - STOP_BUFFER:
                         close_qty = close_qty_for_position(abs(target_pos))
                         hedge_close_qty = compute_hedge_close_qty("SELL", ratio, close_qty, acq_pos)
-                        close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity(
-                            action="SELL",
-                            ratio=ratio,
-                            target_qty=close_qty,
-                            hedge_qty=hedge_close_qty,
-                            a_bid_qty=a_bid_qty,
-                            a_ask_qty=a_ask_qty,
-                        )
+                        close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity("SELL", ratio, close_qty, hedge_close_qty, a_bid_qty, a_ask_qty)
                         if close_qty >= ORDER_STEP:
-                            target_ok, hedge_ok = self._submit_pair(
-                                deal_id=did,
-                                target=target,
-                                acquirer=acq,
-                                signal_action="SELL",
-                                target_qty=close_qty,
-                                hedge_qty=hedge_close_qty,
-                                edge=p_star_buy - t_bid,
-                                p_star=p_star_buy,
-                                t_bid=t_bid,
-                                t_ask=t_ask,
-                                a_bid=a_bid,
-                                a_ask=a_ask,
-                                reason="STOP_LOSS_LONG",
-                            )
+                            target_ok, hedge_ok = await self._submit_pair(did, target, acq, "SELL", close_qty, hedge_close_qty, p_star_buy - t_bid, p_star_buy, t_bid, t_ask, a_bid, a_ask, "STOP_LOSS_LONG")
                             if target_ok:
                                 positions[target] = target_pos - close_qty
                             if hedge_close_qty > 0 and hedge_ok:
                                 positions[acq] = acq_pos + hedge_close_qty
                             if target_ok or hedge_ok:
-                                with self.lock:
+                                async with self.state_lock:
                                     live = self.deal_states[did]
                                     live.last_trade_ts = now
                                     live.last_stop_ts = now
@@ -1684,76 +1612,34 @@ class MergerArbAlphaBot:
                     if target_pos < 0 and t_ask >= p_star_sell + commission_cost + STOP_BUFFER:
                         close_qty = close_qty_for_position(abs(target_pos))
                         hedge_close_qty = compute_hedge_close_qty("BUY", ratio, close_qty, acq_pos)
-                        close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity(
-                            action="BUY",
-                            ratio=ratio,
-                            target_qty=close_qty,
-                            hedge_qty=hedge_close_qty,
-                            a_bid_qty=a_bid_qty,
-                            a_ask_qty=a_ask_qty,
-                        )
+                        close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity("BUY", ratio, close_qty, hedge_close_qty, a_bid_qty, a_ask_qty)
                         if close_qty >= ORDER_STEP:
-                            target_ok, hedge_ok = self._submit_pair(
-                                deal_id=did,
-                                target=target,
-                                acquirer=acq,
-                                signal_action="BUY",
-                                target_qty=close_qty,
-                                hedge_qty=hedge_close_qty,
-                                edge=t_ask - p_star_sell,
-                                p_star=p_star_sell,
-                                t_bid=t_bid,
-                                t_ask=t_ask,
-                                a_bid=a_bid,
-                                a_ask=a_ask,
-                                reason="STOP_LOSS_SHORT",
-                            )
+                            target_ok, hedge_ok = await self._submit_pair(did, target, acq, "BUY", close_qty, hedge_close_qty, t_ask - p_star_sell, p_star_sell, t_bid, t_ask, a_bid, a_ask, "STOP_LOSS_SHORT")
                             if target_ok:
                                 positions[target] = target_pos + close_qty
                             if hedge_close_qty > 0 and hedge_ok:
                                 positions[acq] = acq_pos - hedge_close_qty
                             if target_ok or hedge_ok:
-                                with self.lock:
+                                async with self.state_lock:
                                     live = self.deal_states[did]
                                     live.last_trade_ts = now
                                     live.last_stop_ts = now
                                     live.hold_start_ts = 0.0 if int(positions.get(target, 0)) == 0 else now
                         continue
 
-                    # 2) Take-profit exit.
+                    # Take profit exits
                     if target_pos > 0 and t_bid >= p_star_buy - commission_cost - EXIT_BUFFER:
                         close_qty = close_qty_for_position(abs(target_pos))
                         hedge_close_qty = compute_hedge_close_qty("SELL", ratio, close_qty, acq_pos)
-                        close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity(
-                            action="SELL",
-                            ratio=ratio,
-                            target_qty=close_qty,
-                            hedge_qty=hedge_close_qty,
-                            a_bid_qty=a_bid_qty,
-                            a_ask_qty=a_ask_qty,
-                        )
+                        close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity("SELL", ratio, close_qty, hedge_close_qty, a_bid_qty, a_ask_qty)
                         if close_qty >= ORDER_STEP:
-                            target_ok, hedge_ok = self._submit_pair(
-                                deal_id=did,
-                                target=target,
-                                acquirer=acq,
-                                signal_action="SELL",
-                                target_qty=close_qty,
-                                hedge_qty=hedge_close_qty,
-                                edge=t_bid - p_star_buy,
-                                p_star=p_star_buy,
-                                t_bid=t_bid,
-                                t_ask=t_ask,
-                                a_bid=a_bid,
-                                a_ask=a_ask,
-                                reason="TAKE_PROFIT_LONG",
-                            )
+                            target_ok, hedge_ok = await self._submit_pair(did, target, acq, "SELL", close_qty, hedge_close_qty, t_bid - p_star_buy, p_star_buy, t_bid, t_ask, a_bid, a_ask, "TAKE_PROFIT_LONG")
                             if target_ok:
                                 positions[target] = target_pos - close_qty
                             if hedge_close_qty > 0 and hedge_ok:
                                 positions[acq] = acq_pos + hedge_close_qty
                             if target_ok or hedge_ok:
-                                with self.lock:
+                                async with self.state_lock:
                                     live = self.deal_states[did]
                                     live.last_trade_ts = now
                                     live.hold_start_ts = 0.0 if int(positions.get(target, 0)) == 0 else live.hold_start_ts
@@ -1762,100 +1648,50 @@ class MergerArbAlphaBot:
                     if target_pos < 0 and t_ask <= p_star_sell + commission_cost + EXIT_BUFFER:
                         close_qty = close_qty_for_position(abs(target_pos))
                         hedge_close_qty = compute_hedge_close_qty("BUY", ratio, close_qty, acq_pos)
-                        close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity(
-                            action="BUY",
-                            ratio=ratio,
-                            target_qty=close_qty,
-                            hedge_qty=hedge_close_qty,
-                            a_bid_qty=a_bid_qty,
-                            a_ask_qty=a_ask_qty,
-                        )
+                        close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity("BUY", ratio, close_qty, hedge_close_qty, a_bid_qty, a_ask_qty)
                         if close_qty >= ORDER_STEP:
-                            target_ok, hedge_ok = self._submit_pair(
-                                deal_id=did,
-                                target=target,
-                                acquirer=acq,
-                                signal_action="BUY",
-                                target_qty=close_qty,
-                                hedge_qty=hedge_close_qty,
-                                edge=p_star_sell - t_ask,
-                                p_star=p_star_sell,
-                                t_bid=t_bid,
-                                t_ask=t_ask,
-                                a_bid=a_bid,
-                                a_ask=a_ask,
-                                reason="TAKE_PROFIT_SHORT",
-                            )
+                            target_ok, hedge_ok = await self._submit_pair(did, target, acq, "BUY", close_qty, hedge_close_qty, p_star_sell - t_ask, p_star_sell, t_bid, t_ask, a_bid, a_ask, "TAKE_PROFIT_SHORT")
                             if target_ok:
                                 positions[target] = target_pos + close_qty
                             if hedge_close_qty > 0 and hedge_ok:
                                 positions[acq] = acq_pos - hedge_close_qty
                             if target_ok or hedge_ok:
-                                with self.lock:
+                                async with self.state_lock:
                                     live = self.deal_states[did]
                                     live.last_trade_ts = now
                                     live.hold_start_ts = 0.0 if int(positions.get(target, 0)) == 0 else live.hold_start_ts
                         continue
 
-                    # 3) Time-based risk reduction.
+                    # Time stop reduction
                     can_risk_reduce = (now - st.last_risk_reduce_ts) >= RISK_REDUCE_COOLDOWN_SECS
                     if abs(target_pos) >= ORDER_STEP and held_secs >= MAX_HOLD_SECS and can_risk_reduce:
                         close_qty = scaled_close_qty(abs(target_pos), TIME_REDUCE_FRACTION)
                         close_action = "SELL" if target_pos > 0 else "BUY"
                         hedge_close_qty = compute_hedge_close_qty(close_action, ratio, close_qty, acq_pos)
-                        close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity(
-                            action=close_action,
-                            ratio=ratio,
-                            target_qty=close_qty,
-                            hedge_qty=hedge_close_qty,
-                            a_bid_qty=a_bid_qty,
-                            a_ask_qty=a_ask_qty,
-                        )
+                        close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity(close_action, ratio, close_qty, hedge_close_qty, a_bid_qty, a_ask_qty)
                         if close_qty >= ORDER_STEP:
                             p_star_close = p_star_sell if close_action == "SELL" else p_star_buy
-                            target_ok, hedge_ok = self._submit_pair(
-                                deal_id=did,
-                                target=target,
-                                acquirer=acq,
-                                signal_action=close_action,
-                                target_qty=close_qty,
-                                hedge_qty=hedge_close_qty,
-                                edge=abs(((t_bid + t_ask) / 2.0) - p_star_close),
-                                p_star=p_star_close,
-                                t_bid=t_bid,
-                                t_ask=t_ask,
-                                a_bid=a_bid,
-                                a_ask=a_ask,
-                                reason="TIME_STOP",
-                            )
+                            target_ok, hedge_ok = await self._submit_pair(did, target, acq, close_action, close_qty, hedge_close_qty, abs(((t_bid + t_ask) / 2.0) - p_star_close), p_star_close, t_bid, t_ask, a_bid, a_ask, "TIME_STOP")
                             if target_ok:
                                 positions[target] = target_pos - close_qty if target_pos > 0 else target_pos + close_qty
                             if hedge_close_qty > 0 and hedge_ok:
                                 positions[acq] = acq_pos + hedge_close_qty if close_action == "SELL" else acq_pos - hedge_close_qty
                             if target_ok or hedge_ok:
-                                with self.lock:
+                                async with self.state_lock:
                                     live = self.deal_states[did]
                                     live.last_trade_ts = now
                                     live.last_risk_reduce_ts = now
                                     live.hold_start_ts = 0.0 if int(positions.get(target, 0)) == 0 else now
                         continue
 
-                    # 4) Orphan hedge flatten.
+                    # Orphan hedge unwind
                     if target_pos == 0 and ratio > 0 and abs(acq_pos) >= ORDER_STEP:
                         unwind_qty = close_qty_for_position(abs(acq_pos))
                         unwind_action = "SELL" if acq_pos > 0 else "BUY"
-                        ok = self._submit_single(
-                            deal_id=did,
-                            ticker=acq,
-                            action=unwind_action,
-                            qty=unwind_qty,
-                            bid=a_bid,
-                            ask=a_ask,
-                            reason="ORPHAN_HEDGE_UNWIND",
-                        )
+                        ok = await self._submit_single(did, acq, unwind_action, unwind_qty, a_bid, a_ask, "ORPHAN_HEDGE_UNWIND")
                         if ok:
                             positions[acq] = acq_pos - unwind_qty if acq_pos > 0 else acq_pos + unwind_qty
-                            with self.lock:
+                            async with self.state_lock:
                                 live = self.deal_states[did]
                                 live.last_trade_ts = now
                                 live.hold_start_ts = 0.0
@@ -1864,15 +1700,20 @@ class MergerArbAlphaBot:
                     if not can_enter:
                         continue
 
-                    # Entry gating.
+                    # Entry gating
+                    if st.last_news_id <= 0:
+                        continue
+                    if (now - st.last_news_update_ts) > EVENT_WINDOW_SECS:
+                        continue
+                    if st.last_news_delta_abs < MIN_NEWS_DELTA:
+                        continue
                     if (now - st.last_stop_ts) < STOP_REENTRY_COOLDOWN_SECS:
+                        continue
+                    if st.last_entry_news_id >= st.last_news_id:
                         continue
 
                     dislocation = abs(st.prob_news - p_impl)
                     if st.last_event_strength < EVENT_MIN_STRENGTH and dislocation < DISLOCATION_GATE:
-                        continue
-
-                    if st.last_news_id <= 0:
                         continue
 
                     long_edge = p_star_buy - t_ask
@@ -1911,43 +1752,31 @@ class MergerArbAlphaBot:
                         max_target_by_acq_cap = int(max_hedge_by_cap / max(1e-9, ratio))
                         max_target_qty = min(max_target_qty, max_target_by_acq_cap)
 
-                    target_qty, hedge_qty = scale_target_qty(
-                        ratio=ratio,
-                        seed_qty=seed_qty,
-                        action=action,
-                        target_ticker=target,
-                        acquirer_ticker=acq,
-                        positions=positions,
-                        max_target_qty=max_target_qty,
-                    )
+                    target_qty, hedge_qty = scale_target_qty(ratio, seed_qty, action, target, acq, positions, max_target_qty)
                     if target_qty < MIN_ORDER_QTY:
                         continue
 
-                    target_qty, hedge_qty = self._cap_target_qty_by_hedge_liquidity(
-                        action=action,
-                        ratio=ratio,
-                        target_qty=target_qty,
-                        hedge_qty=hedge_qty,
-                        a_bid_qty=a_bid_qty,
-                        a_ask_qty=a_ask_qty,
-                    )
+                    target_qty, hedge_qty = self._cap_target_qty_by_hedge_liquidity(action, ratio, target_qty, hedge_qty, a_bid_qty, a_ask_qty)
                     if target_qty < MIN_ORDER_QTY:
                         continue
 
-                    target_ok, hedge_ok = self._submit_pair(
-                        deal_id=did,
-                        target=target,
-                        acquirer=acq,
-                        signal_action=action,
-                        target_qty=target_qty,
-                        hedge_qty=hedge_qty,
-                        edge=edge,
-                        p_star=p_star_action,
-                        t_bid=t_bid,
-                        t_ask=t_ask,
-                        a_bid=a_bid,
-                        a_ask=a_ask,
-                        reason="ENTRY",
+                    if ratio > 0 and hedge_qty < ORDER_STEP:
+                        continue
+
+                    target_ok, hedge_ok = await self._submit_pair(
+                        did,
+                        target,
+                        acq,
+                        action,
+                        target_qty,
+                        hedge_qty,
+                        edge,
+                        p_star_action,
+                        t_bid,
+                        t_ask,
+                        a_bid,
+                        a_ask,
+                        "ENTRY",
                     )
 
                     if target_ok:
@@ -1957,26 +1786,26 @@ class MergerArbAlphaBot:
                         positions[acq] = int(positions.get(acq, 0) + hedge_delta)
                     if target_ok or hedge_ok:
                         gross_used, net_used = compute_gross_net(positions)
-                        with self.lock:
+                        async with self.state_lock:
                             live = self.deal_states[did]
                             live.last_trade_ts = now
                             live.hold_start_ts = now if int(positions.get(target, 0)) != 0 else 0.0
                             live.last_entry_news_id = max(live.last_entry_news_id, st.last_news_id)
 
                 loop_errors = 0
-                time.sleep(TRADE_LOOP_SECS)
+                await asyncio.sleep(TRADE_LOOP_SECS)
             except Exception as exc:
                 loop_errors += 1
                 sleep_s = min(1.0, 0.05 * (2 ** min(loop_errors, 4)))
-                log(f"TRADE_ERR count={loop_errors} sleep={sleep_s:.2f}s err={exc}", level="WARN")
-                time.sleep(sleep_s)
+                await log(f"TRADE_ERR count={loop_errors} sleep={sleep_s:.2f}s err={exc}", level="WARN")
+                await asyncio.sleep(sleep_s)
 
-    def run(self) -> None:
-        if API_KEY == "YOUR_API_KEY":
+    async def run(self) -> None:
+        if not API_KEY:
             raise RuntimeError("Set RIT_API_KEY before running")
 
         if RUN_RECORDER is not None:
-            RUN_RECORDER.set_context(
+            await RUN_RECORDER.set_context(
                 {
                     "deals": DEALS,
                     "config": {
@@ -1993,13 +1822,6 @@ class MergerArbAlphaBot:
                         "EXIT_BUFFER": EXIT_BUFFER,
                         "STOP_BUFFER": STOP_BUFFER,
                         "MAX_HOLD_SECS": MAX_HOLD_SECS,
-                        "P_NEWS_BASE": P_NEWS_BASE,
-                        "P_NEWS_EVENT_WEIGHT": P_NEWS_EVENT_WEIGHT,
-                        "P_NEWS_RECENCY_WEIGHT": P_NEWS_RECENCY_WEIGHT,
-                        "NEWS_HALF_LIFE_SECS": NEWS_HALF_LIFE_SECS,
-                        "PROB_SMOOTH_ALPHA": PROB_SMOOTH_ALPHA,
-                        "EVENT_MIN_STRENGTH": EVENT_MIN_STRENGTH,
-                        "DISLOCATION_GATE": DISLOCATION_GATE,
                         "USE_FINBERT": USE_FINBERT,
                         "FINBERT_ONNX_MODEL": FINBERT_ONNX_MODEL,
                         "FINBERT_TOKENIZER_DIR": FINBERT_TOKENIZER_DIR,
@@ -2007,53 +1829,48 @@ class MergerArbAlphaBot:
                 }
             )
 
-        self._initialize_finbert()
-        self.initialize()
-        log(
-            "Alpha bot started "
-            f"base_qty={BASE_ORDER_QTY} min_edge={MIN_ENTRY_THRESHOLD:.3f} margin={ENTRY_MARGIN_PER_SHARE:.3f} "
+        await self._initialize_finbert()
+        await self.initialize()
+        await log(
+            "Async alpha started "
+            f"loop={TRADE_LOOP_SECS:.3f}s news={NEWS_POLL_SECS:.3f}s "
+            f"min_edge={MIN_ENTRY_THRESHOLD:.3f} margin={ENTRY_MARGIN_PER_SHARE:.3f} "
             f"stop={STOP_BUFFER:.3f} hold={MAX_HOLD_SECS:.1f}s finbert={'ON' if self.finbert_enabled else 'OFF'}"
         )
 
-        news_thread = threading.Thread(target=self.news_worker, name="news-worker", daemon=True)
-        news_thread.start()
-
-        manual_thread = None
+        news_task = asyncio.create_task(self.news_worker(), name="news-worker")
+        manual_task = None
         if ENABLE_MANUAL_OVERRIDE:
-            manual_thread = threading.Thread(target=self.manual_override_worker, name="manual-override-worker", daemon=True)
-            manual_thread.start()
+            manual_task = asyncio.create_task(self.manual_override_worker(), name="manual-override-worker")
 
         try:
-            self.trade_loop()
+            await self.trade_loop()
         finally:
             self.running = False
-            news_thread.join(timeout=1.0)
-            if manual_thread is not None:
-                manual_thread.join(timeout=0.2)
-            if self.book_executor is not None:
-                self.book_executor.shutdown(wait=False, cancel_futures=True)
-            if self.order_executor is not None:
-                self.order_executor.shutdown(wait=False, cancel_futures=True)
-            log("Stopped")
+            for task in [news_task, manual_task]:
+                if task is not None:
+                    task.cancel()
+            await asyncio.gather(*[t for t in [news_task, manual_task] if t is not None], return_exceptions=True)
+            await log("Stopped")
 
             if RUN_RECORDER is not None:
                 final_case = {}
                 final_positions = {}
                 final_open_orders: List[dict] = []
                 try:
-                    final_case = self.client.get_case()
+                    final_case = await self.client.get_case()
                 except Exception:
                     pass
                 try:
-                    final_positions = self._safe_positions()
+                    final_positions = await self._safe_positions()
                 except Exception:
                     pass
                 try:
-                    final_open_orders = self.client.get_orders(status="OPEN")
+                    final_open_orders = await self.client.get_orders(status="OPEN")
                 except Exception:
                     pass
 
-                with self.lock:
+                async with self.state_lock:
                     deal_state_summary = {
                         did: {
                             "prob_news": round(st.prob_news, 6),
@@ -2071,8 +1888,9 @@ class MergerArbAlphaBot:
                         }
                         for did, st in self.deal_states.items()
                     }
-                with self.order_meta_lock:
-                    pending_deltas = dict(self.pending_pos_deltas)
+                async with self.order_lock:
+                    pending = dict(self.pending_pos_deltas)
+                    tracked_open = len(self.open_order_meta)
 
                 summary = {
                     "final_case": final_case,
@@ -2080,28 +1898,34 @@ class MergerArbAlphaBot:
                     "deal_states": deal_state_summary,
                     "final_positions": final_positions,
                     "open_order_count": len(final_open_orders),
-                    "tracked_open_order_count": len(self.open_order_meta),
-                    "pending_delta_count": len(pending_deltas),
-                    "pending_pos_deltas": pending_deltas,
+                    "tracked_open_order_count": tracked_open,
+                    "pending_delta_count": len(pending),
+                    "pending_pos_deltas": pending,
                     "finbert_enabled": self.finbert_enabled,
                     "finbert_model_path": self.finbert_model_path,
                     "finbert_tokenizer_path": self.finbert_tokenizer_path,
                 }
 
                 try:
-                    out_path = RUN_RECORDER.flush(summary=summary)
+                    out_path = await RUN_RECORDER.flush(summary)
                     print(f"{now_ts()} | RUN_LOG_JSON saved to {out_path}", flush=True)
                 except Exception as exc:
                     print(f"{now_ts()} | RUN_LOG_JSON write failed: {exc}", flush=True)
 
 
-def main() -> None:
+async def _async_main() -> None:
     global RUN_RECORDER
     if WRITE_RUN_JSON:
         RUN_RECORDER = RunRecorder(base_url=BASE_URL)
-    client = RITClient(api_key=API_KEY, base_url=BASE_URL)
-    bot = MergerArbAlphaBot(client)
-    bot.run()
+
+    async with AsyncRITClient(api_key=API_KEY, base_url=BASE_URL, timeout_s=1.2, pool_limit=64,
+                               use_dma_auth=USE_DMA_AUTH, dma_user=DMA_USER, dma_pass=DMA_PASS) as client:
+        bot = MergerArbAlphaAsyncBot(client)
+        await bot.run()
+
+
+def main() -> None:
+    asyncio.run(_async_main())
 
 
 if __name__ == "__main__":
