@@ -115,8 +115,8 @@ RUN_LOG_JSON_PATH = os.environ.get("RIT_MA_LOG_JSON_PATH", "").strip()
 RUN_RECORDER: Optional["RunRecorder"] = None
 
 # Timing
-NEWS_POLL_SECS = float(os.environ.get("RIT_MA_NEWS_POLL_SECS", "0.10"))
-TRADE_LOOP_SECS = float(os.environ.get("RIT_MA_TRADE_LOOP_SECS", "0.08"))
+NEWS_POLL_SECS = float(os.environ.get("RIT_MA_NEWS_POLL_SECS", "0.15"))
+TRADE_LOOP_SECS = float(os.environ.get("RIT_MA_TRADE_LOOP_SECS", "0.12"))
 CASE_POLL_SECS = float(os.environ.get("RIT_MA_CASE_POLL_SECS", "0.25"))
 TRADE_COOLDOWN_SECS = float(os.environ.get("RIT_MA_TRADE_COOLDOWN_SECS", "0.15"))
 SNAPSHOT_SECS = float(os.environ.get("RIT_MA_SNAPSHOT_SECS", "2.0"))
@@ -162,6 +162,7 @@ EVENT_MIN_STRENGTH = float(os.environ.get("RIT_MA_EVENT_MIN_STRENGTH", "0.10"))
 DISLOCATION_GATE = float(os.environ.get("RIT_MA_DISLOCATION_GATE", "0.05"))
 EVENT_WINDOW_SECS = float(os.environ.get("RIT_MA_EVENT_WINDOW_SECS", "18.0"))
 MIN_NEWS_DELTA = float(os.environ.get("RIT_MA_MIN_NEWS_DELTA", "0.04"))
+ALT_POS_SHORT_LOCKOUT_SECS = float(os.environ.get("RIT_MA_ALT_POS_SHORT_LOCKOUT_SECS", "45.0"))
 
 # News jump model
 NEWS_BASE_MAG = float(os.environ.get("RIT_MA_NEWS_BASE_MAG", "0.03"))
@@ -722,6 +723,7 @@ class DealState:
     last_risk_reduce_ts: float = 0.0
     last_stop_ts: float = 0.0
     last_entry_news_id: int = 0
+    alt_short_lock_until_ts: float = 0.0
 
 
 @dataclass
@@ -1310,12 +1312,32 @@ class MergerArbAlphaAsyncBot:
                             st.last_news_id = news_id
                             st.last_news_delta_abs = abs(delta)
                             st.last_event_strength = max(st.last_event_strength * 0.55, strength)
-                            applied.append({"deal_id": did, "old_p": round(old_p, 6), "delta": round(delta, 6), "new_p": round(st.prob_news, 6)})
+                            if category == "ALT" and direction == "POS":
+                                st.alt_short_lock_until_ts = max(
+                                    st.alt_short_lock_until_ts,
+                                    now + max(0.0, ALT_POS_SHORT_LOCKOUT_SECS),
+                                )
+                            lock_left = max(0.0, st.alt_short_lock_until_ts - now)
+                            applied.append(
+                                {
+                                    "deal_id": did,
+                                    "old_p": round(old_p, 6),
+                                    "delta": round(delta, 6),
+                                    "new_p": round(st.prob_news, 6),
+                                    "alt_short_lock_left_sec": round(lock_left, 3),
+                                }
+                            )
 
                     for row in applied:
+                        lock_note = (
+                            f" alt_short_lock={row['alt_short_lock_left_sec']:.1f}s"
+                            if row.get("alt_short_lock_left_sec", 0.0) > 0
+                            else ""
+                        )
                         await log(
                             f"NEWS id={news_id} deal={row['deal_id']} cat={category} dir={direction} sev={severity} "
                             f"strength={strength:.3f} delta={row['delta']:+.4f} p:{row['old_p']:.4f}->{row['new_p']:.4f}"
+                            f"{lock_note}"
                         )
 
                     if RUN_RECORDER is not None:
@@ -1406,9 +1428,12 @@ class MergerArbAlphaAsyncBot:
                 denom = k_mid - st.standalone_value
                 p_impl = st.prob_news if abs(denom) < 1e-9 else clamp((t_mid - st.standalone_value) / denom, 0.0, 1.0)
                 p_star = st.prob_live * k_mid + (1.0 - st.prob_live) * st.standalone_value
+                lock_left = max(0.0, st.alt_short_lock_until_ts - now)
+                lock_note = f" alt_short_lock={lock_left:.1f}s" if lock_left > 0 else ""
                 await log(
                     f"MODEL {did} p_news={st.prob_news:.4f} p_live={st.prob_live:.4f} p_impl={p_impl:.4f} "
                     f"V={st.standalone_value:.2f} Kmid={k_mid:.2f} P*={p_star:.2f} bid/ask={t_bid:.2f}/{t_ask:.2f}"
+                    f"{lock_note}"
                 )
 
     async def _capacity_recycler(
@@ -1518,6 +1543,7 @@ class MergerArbAlphaAsyncBot:
                     last_risk_reduce_ts=st.last_risk_reduce_ts,
                     last_stop_ts=st.last_stop_ts,
                     last_entry_news_id=st.last_entry_news_id,
+                    alt_short_lock_until_ts=st.alt_short_lock_until_ts,
                 )
                 for did, st in self.deal_states.items()
             }
@@ -1733,6 +1759,10 @@ class MergerArbAlphaAsyncBot:
                     if action is None:
                         continue
 
+                    alt_short_lock_active = st.alt_short_lock_until_ts > now
+                    if action == "SELL" and alt_short_lock_active and target_pos <= 0:
+                        continue
+
                     friction = compute_transaction_friction(ratio, t_bid, t_ask, a_bid, a_ask)
                     base_threshold = max(MIN_ENTRY_THRESHOLD, friction + ENTRY_MARGIN_PER_SHARE)
                     dyn_threshold = inventory_adjusted_threshold(base_threshold, target_pos, action, gross_used, net_used)
@@ -1751,6 +1781,10 @@ class MergerArbAlphaAsyncBot:
                         max_hedge_by_cap = max_qty_for_position_cap(acq_pos, hedge_side, acq_cap)
                         max_target_by_acq_cap = int(max_hedge_by_cap / max(1e-9, ratio))
                         max_target_qty = min(max_target_qty, max_target_by_acq_cap)
+                    if action == "SELL" and alt_short_lock_active:
+                        max_target_qty = min(max_target_qty, max(0, target_pos))
+                    if max_target_qty <= 0:
+                        continue
 
                     target_qty, hedge_qty = scale_target_qty(ratio, seed_qty, action, target, acq, positions, max_target_qty)
                     if target_qty < MIN_ORDER_QTY:
@@ -1819,6 +1853,7 @@ class MergerArbAlphaAsyncBot:
                         "MAX_ORDER_SIZE": MAX_ORDER_SIZE,
                         "MIN_ENTRY_THRESHOLD": MIN_ENTRY_THRESHOLD,
                         "ENTRY_MARGIN_PER_SHARE": ENTRY_MARGIN_PER_SHARE,
+                        "ALT_POS_SHORT_LOCKOUT_SECS": ALT_POS_SHORT_LOCKOUT_SECS,
                         "EXIT_BUFFER": EXIT_BUFFER,
                         "STOP_BUFFER": STOP_BUFFER,
                         "MAX_HOLD_SECS": MAX_HOLD_SECS,
@@ -1885,6 +1920,7 @@ class MergerArbAlphaAsyncBot:
                             "last_risk_reduce_ts": st.last_risk_reduce_ts,
                             "last_stop_ts": st.last_stop_ts,
                             "last_entry_news_id": st.last_entry_news_id,
+                            "alt_short_lock_until_ts": st.alt_short_lock_until_ts,
                         }
                         for did, st in self.deal_states.items()
                     }
