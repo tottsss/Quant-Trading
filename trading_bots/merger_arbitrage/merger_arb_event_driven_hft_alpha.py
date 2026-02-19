@@ -118,7 +118,7 @@ RUN_RECORDER: Optional["RunRecorder"] = None
 NEWS_POLL_SECS = float(os.environ.get("RIT_MA_NEWS_POLL_SECS", "0.15"))
 TRADE_LOOP_SECS = float(os.environ.get("RIT_MA_TRADE_LOOP_SECS", "0.12"))
 CASE_POLL_SECS = float(os.environ.get("RIT_MA_CASE_POLL_SECS", "0.25"))
-TRADE_COOLDOWN_SECS = float(os.environ.get("RIT_MA_TRADE_COOLDOWN_SECS", "0.15"))
+TRADE_COOLDOWN_SECS = float(os.environ.get("RIT_MA_TRADE_COOLDOWN_SECS", "0.25"))
 SNAPSHOT_SECS = float(os.environ.get("RIT_MA_SNAPSHOT_SECS", "2.0"))
 INIT_WARMUP_SECS = float(os.environ.get("RIT_MA_INIT_WARMUP_SECS", "3.5"))
 INIT_SNAPSHOTS = int(os.environ.get("RIT_MA_INIT_SNAPSHOTS", "8"))
@@ -126,7 +126,7 @@ INIT_SAMPLE_INTERVAL_SECS = float(os.environ.get("RIT_MA_INIT_SAMPLE_INTERVAL_SE
 
 # Execution
 MAX_ORDER_SIZE = 5000
-BASE_ORDER_QTY = int(os.environ.get("RIT_MA_BASE_ORDER_QTY", "1800"))
+BASE_ORDER_QTY = int(os.environ.get("RIT_MA_BASE_ORDER_QTY", "1200"))
 MIN_ORDER_QTY = int(os.environ.get("RIT_MA_MIN_ORDER_QTY", "400"))
 ORDER_STEP = int(os.environ.get("RIT_MA_ORDER_STEP", "100"))
 MARKETABLE_LIMIT_OFFSET = float(os.environ.get("RIT_MA_LIMIT_OFFSET", "0.02"))
@@ -139,14 +139,14 @@ STALE_CANCEL_CHECK_SECS = float(os.environ.get("RIT_MA_STALE_CANCEL_CHECK_SECS",
 
 # Thresholds
 COMMISSION_PER_SHARE = float(os.environ.get("RIT_MA_COMMISSION_PER_SHARE", "0.02"))
-MIN_ENTRY_THRESHOLD = float(os.environ.get("RIT_MA_MIN_ENTRY_THRESHOLD", "0.08"))
-ENTRY_MARGIN_PER_SHARE = float(os.environ.get("RIT_MA_ENTRY_MARGIN", "0.02"))
+MIN_ENTRY_THRESHOLD = float(os.environ.get("RIT_MA_MIN_ENTRY_THRESHOLD", "0.12"))
+ENTRY_MARGIN_PER_SHARE = float(os.environ.get("RIT_MA_ENTRY_MARGIN", "0.04"))
 EXIT_BUFFER = float(os.environ.get("RIT_MA_EXIT_BUFFER", "0.01"))
 STOP_BUFFER = float(os.environ.get("RIT_MA_STOP_BUFFER", "0.30"))
 MAX_HOLD_SECS = float(os.environ.get("RIT_MA_MAX_HOLD_SECS", "60.0"))
 TIME_REDUCE_FRACTION = float(os.environ.get("RIT_MA_TIME_REDUCE_FRACTION", "0.55"))
 RISK_REDUCE_COOLDOWN_SECS = float(os.environ.get("RIT_MA_RISK_REDUCE_COOLDOWN_SECS", "2.00"))
-STOP_REENTRY_COOLDOWN_SECS = float(os.environ.get("RIT_MA_STOP_REENTRY_COOLDOWN_SECS", "2.50"))
+STOP_REENTRY_COOLDOWN_SECS = float(os.environ.get("RIT_MA_STOP_REENTRY_COOLDOWN_SECS", "4.00"))
 ADD_INVENTORY_SLOPE = float(os.environ.get("RIT_MA_ADD_INVENTORY_SLOPE", "1.20"))
 ADD_GLOBAL_SLOPE = float(os.environ.get("RIT_MA_ADD_GLOBAL_SLOPE", "0.90"))
 
@@ -158,10 +158,10 @@ P_NEWS_MAX = float(os.environ.get("RIT_MA_P_NEWS_MAX", "0.88"))
 P_NEWS_BASE = float(os.environ.get("RIT_MA_P_NEWS_BASE", "0.30"))
 P_NEWS_EVENT_WEIGHT = float(os.environ.get("RIT_MA_P_NEWS_EVENT_WEIGHT", "0.35"))
 P_NEWS_RECENCY_WEIGHT = float(os.environ.get("RIT_MA_P_NEWS_RECENCY_WEIGHT", "0.35"))
-EVENT_MIN_STRENGTH = float(os.environ.get("RIT_MA_EVENT_MIN_STRENGTH", "0.10"))
-DISLOCATION_GATE = float(os.environ.get("RIT_MA_DISLOCATION_GATE", "0.05"))
+EVENT_MIN_STRENGTH = float(os.environ.get("RIT_MA_EVENT_MIN_STRENGTH", "0.18"))
+DISLOCATION_GATE = float(os.environ.get("RIT_MA_DISLOCATION_GATE", "0.08"))
 EVENT_WINDOW_SECS = float(os.environ.get("RIT_MA_EVENT_WINDOW_SECS", "18.0"))
-MIN_NEWS_DELTA = float(os.environ.get("RIT_MA_MIN_NEWS_DELTA", "0.04"))
+MIN_NEWS_DELTA = float(os.environ.get("RIT_MA_MIN_NEWS_DELTA", "0.06"))
 ALT_POS_SHORT_LOCKOUT_SECS = float(os.environ.get("RIT_MA_ALT_POS_SHORT_LOCKOUT_SECS", "45.0"))
 
 # News jump model
