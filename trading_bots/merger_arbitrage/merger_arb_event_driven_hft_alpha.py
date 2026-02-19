@@ -148,7 +148,8 @@ MIN_ENTRY_THRESHOLD = float(os.environ.get("RIT_MA_MIN_ENTRY_THRESHOLD", "0.12")
 ENTRY_MARGIN_PER_SHARE = float(os.environ.get("RIT_MA_ENTRY_MARGIN", "0.04"))
 EXIT_BUFFER = float(os.environ.get("RIT_MA_EXIT_BUFFER", "0.01"))
 STOP_BUFFER = float(os.environ.get("RIT_MA_STOP_BUFFER", "0.30"))
-STOP_LOSS_PNL_PER_TARGET = float(os.environ.get("RIT_MA_STOP_LOSS_PNL_PER_TARGET", "0.30"))
+# Wider stop by default: allow more adverse move before forced exit.
+STOP_LOSS_PNL_PER_TARGET = float(os.environ.get("RIT_MA_STOP_LOSS_PNL_PER_TARGET", "0.45"))
 STOP_GRACE_SECS = float(os.environ.get("RIT_MA_STOP_GRACE_SECS", "0.35"))
 MAX_HOLD_SECS = float(os.environ.get("RIT_MA_MAX_HOLD_SECS", "60.0"))
 TIME_REDUCE_FRACTION = float(os.environ.get("RIT_MA_TIME_REDUCE_FRACTION", "0.55"))
@@ -156,6 +157,7 @@ RISK_REDUCE_COOLDOWN_SECS = float(os.environ.get("RIT_MA_RISK_REDUCE_COOLDOWN_SE
 STOP_REENTRY_COOLDOWN_SECS = float(os.environ.get("RIT_MA_STOP_REENTRY_COOLDOWN_SECS", "4.00"))
 ADD_INVENTORY_SLOPE = float(os.environ.get("RIT_MA_ADD_INVENTORY_SLOPE", "1.20"))
 ADD_GLOBAL_SLOPE = float(os.environ.get("RIT_MA_ADD_GLOBAL_SLOPE", "0.90"))
+IN_POSITION_ENTRY_THRESHOLD_MULT = float(os.environ.get("RIT_MA_IN_POSITION_ENTRY_THRESHOLD_MULT", "1.35"))
 
 # Probability blending
 NEWS_HALF_LIFE_SECS = float(os.environ.get("RIT_MA_NEWS_HALF_LIFE_SECS", "45.0"))
@@ -1858,6 +1860,9 @@ class MergerArbAlphaAsyncBot:
                     friction = compute_transaction_friction(ratio, t_bid, t_ask, a_bid, a_ask)
                     base_threshold = max(MIN_ENTRY_THRESHOLD, friction + ENTRY_MARGIN_PER_SHARE)
                     dyn_threshold = inventory_adjusted_threshold(base_threshold, target_pos, action, gross_used, net_used)
+                    # After we've already traded this deal and still hold exposure, require more edge to add.
+                    if (target_pos > 0 and action == "BUY") or (target_pos < 0 and action == "SELL"):
+                        dyn_threshold *= max(1.0, IN_POSITION_ENTRY_THRESHOLD_MULT)
                     if edge <= dyn_threshold:
                         continue
 
@@ -1970,6 +1975,7 @@ class MergerArbAlphaAsyncBot:
                         "ALT_POS_SHORT_LOCKOUT_SECS": ALT_POS_SHORT_LOCKOUT_SECS,
                         "STOP_LOSS_PNL_PER_TARGET": STOP_LOSS_PNL_PER_TARGET,
                         "STOP_GRACE_SECS": STOP_GRACE_SECS,
+                        "IN_POSITION_ENTRY_THRESHOLD_MULT": IN_POSITION_ENTRY_THRESHOLD_MULT,
                         "EXIT_BUFFER": EXIT_BUFFER,
                         "STOP_BUFFER": STOP_BUFFER,
                         "EXECUTION_MODE": EXECUTION_MODE,
@@ -1993,6 +1999,7 @@ class MergerArbAlphaAsyncBot:
             f"loop={TRADE_LOOP_SECS:.3f}s news={NEWS_POLL_SECS:.3f}s "
             f"min_edge={MIN_ENTRY_THRESHOLD:.3f} margin={ENTRY_MARGIN_PER_SHARE:.3f} "
             f"stop_pnl={STOP_LOSS_PNL_PER_TARGET:.3f} stop_grace={STOP_GRACE_SECS:.2f}s "
+            f"in_pos_edge_mult={IN_POSITION_ENTRY_THRESHOLD_MULT:.2f} "
             f"hold={MAX_HOLD_SECS:.1f}s exec={EXECUTION_MODE} "
             f"ping={'1' if PING_AT_TOUCH else '0'} ioc={'1' if ENABLE_IOC_EMULATION else '0'} "
             f"finbert={'ON' if self.finbert_enabled else 'OFF'}"
