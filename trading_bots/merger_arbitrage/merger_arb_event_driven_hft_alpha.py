@@ -130,9 +130,14 @@ BASE_ORDER_QTY = int(os.environ.get("RIT_MA_BASE_ORDER_QTY", "1200"))
 MIN_ORDER_QTY = int(os.environ.get("RIT_MA_MIN_ORDER_QTY", "400"))
 ORDER_STEP = int(os.environ.get("RIT_MA_ORDER_STEP", "100"))
 MARKETABLE_LIMIT_OFFSET = float(os.environ.get("RIT_MA_LIMIT_OFFSET", "0.02"))
-PING_AT_TOUCH = env_bool("RIT_MA_PING_AT_TOUCH", "1")
+EXECUTION_MODE = os.environ.get("RIT_MA_EXECUTION_MODE", "MARKETABLE_IOC").strip().upper()
+if EXECUTION_MODE not in {"MARKETABLE_IOC", "MARKETABLE_LIMIT", "PASSIVE_TOUCH"}:
+    EXECUTION_MODE = "MARKETABLE_IOC"
+_PING_DEFAULT = "1" if EXECUTION_MODE == "PASSIVE_TOUCH" else "0"
+_IOC_DEFAULT = "1" if EXECUTION_MODE == "MARKETABLE_IOC" else "0"
+PING_AT_TOUCH = env_bool("RIT_MA_PING_AT_TOUCH", _PING_DEFAULT)
 SIMULTANEOUS_LEGS = env_bool("RIT_MA_SIMULTANEOUS_LEGS", "1")
-ENABLE_IOC_EMULATION = env_bool("RIT_MA_ENABLE_IOC_EMULATION", "1")
+ENABLE_IOC_EMULATION = env_bool("RIT_MA_ENABLE_IOC_EMULATION", _IOC_DEFAULT)
 IOC_CANCEL_SECS = float(os.environ.get("RIT_MA_IOC_CANCEL_SECS", "0.20"))
 STALE_ORDER_SECS = float(os.environ.get("RIT_MA_STALE_ORDER_SECS", "0.80"))
 STALE_CANCEL_CHECK_SECS = float(os.environ.get("RIT_MA_STALE_CANCEL_CHECK_SECS", "0.15"))
@@ -143,6 +148,8 @@ MIN_ENTRY_THRESHOLD = float(os.environ.get("RIT_MA_MIN_ENTRY_THRESHOLD", "0.12")
 ENTRY_MARGIN_PER_SHARE = float(os.environ.get("RIT_MA_ENTRY_MARGIN", "0.04"))
 EXIT_BUFFER = float(os.environ.get("RIT_MA_EXIT_BUFFER", "0.01"))
 STOP_BUFFER = float(os.environ.get("RIT_MA_STOP_BUFFER", "0.30"))
+STOP_LOSS_PNL_PER_TARGET = float(os.environ.get("RIT_MA_STOP_LOSS_PNL_PER_TARGET", "0.30"))
+STOP_GRACE_SECS = float(os.environ.get("RIT_MA_STOP_GRACE_SECS", "0.35"))
 MAX_HOLD_SECS = float(os.environ.get("RIT_MA_MAX_HOLD_SECS", "60.0"))
 TIME_REDUCE_FRACTION = float(os.environ.get("RIT_MA_TIME_REDUCE_FRACTION", "0.55"))
 RISK_REDUCE_COOLDOWN_SECS = float(os.environ.get("RIT_MA_RISK_REDUCE_COOLDOWN_SECS", "2.00"))
@@ -724,6 +731,9 @@ class DealState:
     last_stop_ts: float = 0.0
     last_entry_news_id: int = 0
     alt_short_lock_until_ts: float = 0.0
+    entry_target_px: float = 0.0
+    entry_acq_px: float = 0.0
+    entry_ts: float = 0.0
 
 
 @dataclass
@@ -1226,6 +1236,33 @@ class MergerArbAlphaAsyncBot:
         p_live = clamp((1.0 - PROB_SMOOTH_ALPHA) * st.prob_live + PROB_SMOOTH_ALPHA * p_target, 0.0, 1.0)
         return p_live, p_impl
 
+    def _pair_pnl_per_target_share(
+        self,
+        st: DealState,
+        target_pos: int,
+        ratio: float,
+        t_bid: float,
+        t_ask: float,
+        a_bid: float,
+        a_ask: float,
+    ) -> Optional[float]:
+        if st.entry_target_px <= 0:
+            return None
+
+        if target_pos > 0:
+            hedge_component = 0.0
+            if ratio > 0 and st.entry_acq_px > 0:
+                hedge_component = ratio * (st.entry_acq_px - a_ask)
+            return (t_bid - st.entry_target_px) + hedge_component
+
+        if target_pos < 0:
+            hedge_component = 0.0
+            if ratio > 0 and st.entry_acq_px > 0:
+                hedge_component = ratio * (a_bid - st.entry_acq_px)
+            return (st.entry_target_px - t_ask) + hedge_component
+
+        return 0.0
+
     async def news_worker(self) -> None:
         err_count = 0
         while self.running:
@@ -1348,7 +1385,10 @@ class MergerArbAlphaAsyncBot:
             except Exception as exc:
                 err_count += 1
                 sleep_s = min(1.0, 0.05 * (2 ** min(err_count, 4)))
-                await log(f"NEWS_ERR count={err_count} sleep={sleep_s:.2f}s err={exc}", level="WARN")
+                await log(
+                    f"NEWS_ERR count={err_count} sleep={sleep_s:.2f}s err={type(exc).__name__}: {exc!r}",
+                    level="WARN",
+                )
                 await asyncio.sleep(sleep_s)
 
     async def manual_override_worker(self) -> None:
@@ -1544,6 +1584,9 @@ class MergerArbAlphaAsyncBot:
                     last_stop_ts=st.last_stop_ts,
                     last_entry_news_id=st.last_entry_news_id,
                     alt_short_lock_until_ts=st.alt_short_lock_until_ts,
+                    entry_target_px=st.entry_target_px,
+                    entry_acq_px=st.entry_acq_px,
+                    entry_ts=st.entry_ts,
                 )
                 for did, st in self.deal_states.items()
             }
@@ -1559,6 +1602,10 @@ class MergerArbAlphaAsyncBot:
                 elif t_pos == 0 and st.hold_start_ts != 0:
                     st.hold_start_ts = 0.0
                     st.last_risk_reduce_ts = 0.0
+                if t_pos == 0 and (st.entry_target_px != 0.0 or st.entry_acq_px != 0.0 or st.entry_ts != 0.0):
+                    st.entry_target_px = 0.0
+                    st.entry_acq_px = 0.0
+                    st.entry_ts = 0.0
 
     async def trade_loop(self) -> None:
         loop_errors = 0
@@ -1615,14 +1662,38 @@ class MergerArbAlphaAsyncBot:
                     acq_pos = int(positions.get(acq, 0))
                     held_secs = (now - st.hold_start_ts) if st.hold_start_ts > 0 else 0.0
                     commission_cost = COMMISSION_PER_SHARE * (1.0 + ratio)
+                    entry_age = (now - st.entry_ts) if st.entry_ts > 0 else 1e9
+                    pair_pnl = self._pair_pnl_per_target_share(st, target_pos, ratio, t_bid, t_ask, a_bid, a_ask)
+                    stop_allowed = entry_age >= max(0.0, STOP_GRACE_SECS)
 
                     # Stop loss exits
-                    if target_pos > 0 and t_bid <= p_star_buy - commission_cost - STOP_BUFFER:
+                    long_stop_hit = False
+                    if stop_allowed and target_pos > 0:
+                        if pair_pnl is not None:
+                            long_stop_hit = pair_pnl <= -max(0.01, STOP_LOSS_PNL_PER_TARGET)
+                        else:
+                            long_stop_hit = t_bid <= p_star_buy - commission_cost - STOP_BUFFER
+                    if long_stop_hit:
                         close_qty = close_qty_for_position(abs(target_pos))
                         hedge_close_qty = compute_hedge_close_qty("SELL", ratio, close_qty, acq_pos)
                         close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity("SELL", ratio, close_qty, hedge_close_qty, a_bid_qty, a_ask_qty)
                         if close_qty >= ORDER_STEP:
-                            target_ok, hedge_ok = await self._submit_pair(did, target, acq, "SELL", close_qty, hedge_close_qty, p_star_buy - t_bid, p_star_buy, t_bid, t_ask, a_bid, a_ask, "STOP_LOSS_LONG")
+                            stop_edge = max(0.0, -(pair_pnl if pair_pnl is not None else (t_bid - p_star_buy)))
+                            target_ok, hedge_ok = await self._submit_pair(
+                                did,
+                                target,
+                                acq,
+                                "SELL",
+                                close_qty,
+                                hedge_close_qty,
+                                stop_edge,
+                                p_star_buy,
+                                t_bid,
+                                t_ask,
+                                a_bid,
+                                a_ask,
+                                "STOP_LOSS_LONG",
+                            )
                             if target_ok:
                                 positions[target] = target_pos - close_qty
                             if hedge_close_qty > 0 and hedge_ok:
@@ -1635,12 +1706,33 @@ class MergerArbAlphaAsyncBot:
                                     live.hold_start_ts = 0.0 if int(positions.get(target, 0)) == 0 else now
                         continue
 
-                    if target_pos < 0 and t_ask >= p_star_sell + commission_cost + STOP_BUFFER:
+                    short_stop_hit = False
+                    if stop_allowed and target_pos < 0:
+                        if pair_pnl is not None:
+                            short_stop_hit = pair_pnl <= -max(0.01, STOP_LOSS_PNL_PER_TARGET)
+                        else:
+                            short_stop_hit = t_ask >= p_star_sell + commission_cost + STOP_BUFFER
+                    if short_stop_hit:
                         close_qty = close_qty_for_position(abs(target_pos))
                         hedge_close_qty = compute_hedge_close_qty("BUY", ratio, close_qty, acq_pos)
                         close_qty, hedge_close_qty = self._cap_target_qty_by_hedge_liquidity("BUY", ratio, close_qty, hedge_close_qty, a_bid_qty, a_ask_qty)
                         if close_qty >= ORDER_STEP:
-                            target_ok, hedge_ok = await self._submit_pair(did, target, acq, "BUY", close_qty, hedge_close_qty, t_ask - p_star_sell, p_star_sell, t_bid, t_ask, a_bid, a_ask, "STOP_LOSS_SHORT")
+                            stop_edge = max(0.0, -(pair_pnl if pair_pnl is not None else (p_star_sell - t_ask)))
+                            target_ok, hedge_ok = await self._submit_pair(
+                                did,
+                                target,
+                                acq,
+                                "BUY",
+                                close_qty,
+                                hedge_close_qty,
+                                stop_edge,
+                                p_star_sell,
+                                t_bid,
+                                t_ask,
+                                a_bid,
+                                a_ask,
+                                "STOP_LOSS_SHORT",
+                            )
                             if target_ok:
                                 positions[target] = target_pos + close_qty
                             if hedge_close_qty > 0 and hedge_ok:
@@ -1797,6 +1889,12 @@ class MergerArbAlphaAsyncBot:
                     if ratio > 0 and hedge_qty < ORDER_STEP:
                         continue
 
+                    entry_target_px = self._marketable_limit_price(action, t_bid, t_ask)
+                    entry_acq_px = 0.0
+                    if hedge_qty > 0:
+                        hedge_entry_side = "SELL" if action == "BUY" else "BUY"
+                        entry_acq_px = self._marketable_limit_price(hedge_entry_side, a_bid, a_ask)
+
                     target_ok, hedge_ok = await self._submit_pair(
                         did,
                         target,
@@ -1822,8 +1920,21 @@ class MergerArbAlphaAsyncBot:
                         gross_used, net_used = compute_gross_net(positions)
                         async with self.state_lock:
                             live = self.deal_states[did]
+                            new_target_pos = int(positions.get(target, 0))
                             live.last_trade_ts = now
-                            live.hold_start_ts = now if int(positions.get(target, 0)) != 0 else 0.0
+                            live.hold_start_ts = now if new_target_pos != 0 else 0.0
+                            # Refresh entry reference when exposure is newly opened, increased, or flipped.
+                            if target_ok:
+                                grew_abs = abs(new_target_pos) > abs(target_pos)
+                                flipped_side = target_pos != 0 and (target_pos * new_target_pos < 0)
+                                if target_pos == 0 or grew_abs or flipped_side:
+                                    live.entry_target_px = entry_target_px
+                                    live.entry_acq_px = entry_acq_px
+                                    live.entry_ts = now
+                            if new_target_pos == 0:
+                                live.entry_target_px = 0.0
+                                live.entry_acq_px = 0.0
+                                live.entry_ts = 0.0
                             live.last_entry_news_id = max(live.last_entry_news_id, st.last_news_id)
 
                 loop_errors = 0
@@ -1831,7 +1942,10 @@ class MergerArbAlphaAsyncBot:
             except Exception as exc:
                 loop_errors += 1
                 sleep_s = min(1.0, 0.05 * (2 ** min(loop_errors, 4)))
-                await log(f"TRADE_ERR count={loop_errors} sleep={sleep_s:.2f}s err={exc}", level="WARN")
+                await log(
+                    f"TRADE_ERR count={loop_errors} sleep={sleep_s:.2f}s err={type(exc).__name__}: {exc!r}",
+                    level="WARN",
+                )
                 await asyncio.sleep(sleep_s)
 
     async def run(self) -> None:
@@ -1854,8 +1968,14 @@ class MergerArbAlphaAsyncBot:
                         "MIN_ENTRY_THRESHOLD": MIN_ENTRY_THRESHOLD,
                         "ENTRY_MARGIN_PER_SHARE": ENTRY_MARGIN_PER_SHARE,
                         "ALT_POS_SHORT_LOCKOUT_SECS": ALT_POS_SHORT_LOCKOUT_SECS,
+                        "STOP_LOSS_PNL_PER_TARGET": STOP_LOSS_PNL_PER_TARGET,
+                        "STOP_GRACE_SECS": STOP_GRACE_SECS,
                         "EXIT_BUFFER": EXIT_BUFFER,
                         "STOP_BUFFER": STOP_BUFFER,
+                        "EXECUTION_MODE": EXECUTION_MODE,
+                        "PING_AT_TOUCH": PING_AT_TOUCH,
+                        "ENABLE_IOC_EMULATION": ENABLE_IOC_EMULATION,
+                        "IOC_CANCEL_SECS": IOC_CANCEL_SECS,
                         "MAX_HOLD_SECS": MAX_HOLD_SECS,
                         "USE_FINBERT": USE_FINBERT,
                         "FINBERT_ONNX_MODEL": FINBERT_ONNX_MODEL,
@@ -1866,11 +1986,16 @@ class MergerArbAlphaAsyncBot:
 
         await self._initialize_finbert()
         await self.initialize()
+        if PING_AT_TOUCH and ENABLE_IOC_EMULATION:
+            await log("EXEC_WARN ping-at-touch with IOC emulation can increase legging/orphan risk", level="WARN")
         await log(
             "Async alpha started "
             f"loop={TRADE_LOOP_SECS:.3f}s news={NEWS_POLL_SECS:.3f}s "
             f"min_edge={MIN_ENTRY_THRESHOLD:.3f} margin={ENTRY_MARGIN_PER_SHARE:.3f} "
-            f"stop={STOP_BUFFER:.3f} hold={MAX_HOLD_SECS:.1f}s finbert={'ON' if self.finbert_enabled else 'OFF'}"
+            f"stop_pnl={STOP_LOSS_PNL_PER_TARGET:.3f} stop_grace={STOP_GRACE_SECS:.2f}s "
+            f"hold={MAX_HOLD_SECS:.1f}s exec={EXECUTION_MODE} "
+            f"ping={'1' if PING_AT_TOUCH else '0'} ioc={'1' if ENABLE_IOC_EMULATION else '0'} "
+            f"finbert={'ON' if self.finbert_enabled else 'OFF'}"
         )
 
         news_task = asyncio.create_task(self.news_worker(), name="news-worker")
@@ -1921,6 +2046,9 @@ class MergerArbAlphaAsyncBot:
                             "last_stop_ts": st.last_stop_ts,
                             "last_entry_news_id": st.last_entry_news_id,
                             "alt_short_lock_until_ts": st.alt_short_lock_until_ts,
+                            "entry_target_px": st.entry_target_px,
+                            "entry_acq_px": st.entry_acq_px,
+                            "entry_ts": st.entry_ts,
                         }
                         for did, st in self.deal_states.items()
                     }
