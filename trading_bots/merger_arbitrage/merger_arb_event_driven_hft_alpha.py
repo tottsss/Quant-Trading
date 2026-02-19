@@ -158,6 +158,7 @@ STOP_REENTRY_COOLDOWN_SECS = float(os.environ.get("RIT_MA_STOP_REENTRY_COOLDOWN_
 ADD_INVENTORY_SLOPE = float(os.environ.get("RIT_MA_ADD_INVENTORY_SLOPE", "1.20"))
 ADD_GLOBAL_SLOPE = float(os.environ.get("RIT_MA_ADD_GLOBAL_SLOPE", "0.90"))
 IN_POSITION_ENTRY_THRESHOLD_MULT = float(os.environ.get("RIT_MA_IN_POSITION_ENTRY_THRESHOLD_MULT", "1.35"))
+FLAT_ENTRY_SIZE_MULT = float(os.environ.get("RIT_MA_FLAT_ENTRY_SIZE_MULT", "1.40"))
 
 # Probability blending
 NEWS_HALF_LIFE_SECS = float(os.environ.get("RIT_MA_NEWS_HALF_LIFE_SECS", "45.0"))
@@ -275,6 +276,7 @@ class RunRecorder:
         self.lock = asyncio.Lock()
         self.events: List[dict] = []
         self.news: List[dict] = []
+        self.price_snapshots: List[dict] = []
         self.context: Dict[str, object] = {}
         self.finalized = False
         self.output_path = self._resolve_output_path()
@@ -334,6 +336,25 @@ class RunRecorder:
                 }
             )
 
+    async def add_price_snapshot(
+        self,
+        tick: int,
+        period: int,
+        prices: Dict[str, dict],
+        positions: Dict[str, int],
+    ) -> None:
+        async with self.lock:
+            self.price_snapshots.append(
+                {
+                    "ts_utc": utc_iso_now(),
+                    "ts_epoch": round(time.time(), 6),
+                    "tick": tick,
+                    "period": period,
+                    "prices": prices,
+                    "positions": positions,
+                }
+            )
+
     async def flush(self, summary: Dict[str, object]) -> str:
         async with self.lock:
             if self.finalized:
@@ -349,6 +370,7 @@ class RunRecorder:
                 "summary": summary,
                 "events": self.events,
                 "news": self.news,
+                "price_snapshots": self.price_snapshots,
             }
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
             with self.output_path.open("w", encoding="utf-8") as f:
@@ -749,12 +771,16 @@ class TrackedOrder:
     cancel_after_ts: float = 0.0
 
 
+PRICE_SNAPSHOT_TICK_INTERVAL = int(os.environ.get("RIT_MA_PRICE_SNAPSHOT_TICK_INTERVAL", "5"))
+
+
 class MergerArbAlphaAsyncBot:
     def __init__(self, client: AsyncRITClient):
         self.client = client
         self.running = True
         self.last_news_id = 0
         self.last_snapshot_ts = 0.0
+        self.last_price_snapshot_tick = -999
 
         self.state_lock = asyncio.Lock()
         self.order_lock = asyncio.Lock()
@@ -1478,6 +1504,28 @@ class MergerArbAlphaAsyncBot:
                     f"{lock_note}"
                 )
 
+    async def _record_price_snapshot(
+        self,
+        tick: int,
+        period: int,
+        books: Dict[str, Tuple[float, float, float, int, int]],
+        positions: Dict[str, int],
+    ) -> None:
+        prices: Dict[str, dict] = {}
+        for ticker, (bid, ask, mid, bid_qty, ask_qty) in books.items():
+            prices[ticker] = {
+                "bid": round(bid, 4),
+                "ask": round(ask, 4),
+                "mid": round(mid, 4),
+                "bid_qty": bid_qty,
+                "ask_qty": ask_qty,
+            }
+        
+        await log(f"PRICE_SNAPSHOT tick={tick} period={period} tickers={len(prices)}")
+        
+        if RUN_RECORDER is not None:
+            await RUN_RECORDER.add_price_snapshot(tick, period, prices, dict(positions))
+
     async def _capacity_recycler(
         self,
         now: float,
@@ -1619,6 +1667,9 @@ class MergerArbAlphaAsyncBot:
                     self.running = False
                     break
 
+                tick = int(case.get("tick", 0))
+                period = int(case.get("period", 1))
+
                 live_positions = await self._safe_positions()
                 books = await self._fetch_books_parallel()
                 if len(books) < len(self.trade_tickers):
@@ -1631,6 +1682,10 @@ class MergerArbAlphaAsyncBot:
                 positions = await self._effective_positions(live_positions)
                 await self._sync_hold_starts(now, positions)
                 await self._periodic_snapshot(books, positions)
+
+                if tick - self.last_price_snapshot_tick >= PRICE_SNAPSHOT_TICK_INTERVAL:
+                    self.last_price_snapshot_tick = tick
+                    await self._record_price_snapshot(tick, period, books, positions)
 
                 states_copy = await self._state_snapshot()
                 gross_used, net_used = compute_gross_net(positions)
@@ -1867,7 +1922,9 @@ class MergerArbAlphaAsyncBot:
                         continue
 
                     edge_mult = max(1.0, min(4.0, edge / max(0.01, dyn_threshold)))
-                    seed_qty = int(BASE_ORDER_QTY * edge_mult)
+                    # Size up initial entries when flat; keep add-ons controlled.
+                    flat_mult = max(1.0, FLAT_ENTRY_SIZE_MULT) if target_pos == 0 else 1.0
+                    seed_qty = int(BASE_ORDER_QTY * edge_mult * flat_mult)
 
                     target_cap = PER_DEAL_TARGET_MAX
                     acq_cap = per_deal_acq_cap(ratio)
@@ -1976,6 +2033,7 @@ class MergerArbAlphaAsyncBot:
                         "STOP_LOSS_PNL_PER_TARGET": STOP_LOSS_PNL_PER_TARGET,
                         "STOP_GRACE_SECS": STOP_GRACE_SECS,
                         "IN_POSITION_ENTRY_THRESHOLD_MULT": IN_POSITION_ENTRY_THRESHOLD_MULT,
+                        "FLAT_ENTRY_SIZE_MULT": FLAT_ENTRY_SIZE_MULT,
                         "EXIT_BUFFER": EXIT_BUFFER,
                         "STOP_BUFFER": STOP_BUFFER,
                         "EXECUTION_MODE": EXECUTION_MODE,
@@ -2000,6 +2058,7 @@ class MergerArbAlphaAsyncBot:
             f"min_edge={MIN_ENTRY_THRESHOLD:.3f} margin={ENTRY_MARGIN_PER_SHARE:.3f} "
             f"stop_pnl={STOP_LOSS_PNL_PER_TARGET:.3f} stop_grace={STOP_GRACE_SECS:.2f}s "
             f"in_pos_edge_mult={IN_POSITION_ENTRY_THRESHOLD_MULT:.2f} "
+            f"flat_size_mult={FLAT_ENTRY_SIZE_MULT:.2f} "
             f"hold={MAX_HOLD_SECS:.1f}s exec={EXECUTION_MODE} "
             f"ping={'1' if PING_AT_TOUCH else '0'} ioc={'1' if ENABLE_IOC_EMULATION else '0'} "
             f"finbert={'ON' if self.finbert_enabled else 'OFF'}"
