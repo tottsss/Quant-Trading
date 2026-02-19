@@ -179,6 +179,14 @@ FLAT_ENTRY_SIZE_MULT = float(os.environ.get("RIT_MA_FLAT_ENTRY_SIZE_MULT", "1.40
 OPPOSITE_NEWS_FLATTEN_WINDOW_SECS = float(os.environ.get("RIT_MA_OPPOSITE_NEWS_FLATTEN_WINDOW_SECS", "30.0"))
 OPPOSITE_NEWS_MIN_DELTA = float(os.environ.get("RIT_MA_OPPOSITE_NEWS_MIN_DELTA", "0.04"))
 OPPOSITE_NEWS_MIN_STRENGTH = float(os.environ.get("RIT_MA_OPPOSITE_NEWS_MIN_STRENGTH", "0.12"))
+ENABLE_HIGH_CONVICTION_MODE = env_bool("RIT_MA_ENABLE_HIGH_CONVICTION_MODE", "1")
+HIGH_CONV_MIN_NEWS_DELTA = float(os.environ.get("RIT_MA_HIGH_CONV_MIN_NEWS_DELTA", "0.18"))
+HIGH_CONV_MIN_EVENT_STRENGTH = float(os.environ.get("RIT_MA_HIGH_CONV_MIN_EVENT_STRENGTH", "0.85"))
+HIGH_CONV_TARGET_CAP_MULT = float(os.environ.get("RIT_MA_HIGH_CONV_TARGET_CAP_MULT", "1.50"))
+HIGH_CONV_SIZE_MULT = float(os.environ.get("RIT_MA_HIGH_CONV_SIZE_MULT", "1.25"))
+HIGH_CONV_IN_POSITION_EDGE_MULT = float(os.environ.get("RIT_MA_HIGH_CONV_IN_POSITION_EDGE_MULT", "0.75"))
+HIGH_CONV_STOP_REENTRY_COOLDOWN_MULT = float(os.environ.get("RIT_MA_HIGH_CONV_STOP_REENTRY_COOLDOWN_MULT", "0.45"))
+CONTRA_NEWS_EDGE_MULT = float(os.environ.get("RIT_MA_CONTRA_NEWS_EDGE_MULT", "1.60"))
 
 # Probability blending
 NEWS_HALF_LIFE_SECS = float(os.environ.get("RIT_MA_NEWS_HALF_LIFE_SECS", "45.0"))
@@ -1364,6 +1372,37 @@ class MergerArbAlphaAsyncBot:
             return "BUY"
         return None
 
+    def _is_high_conviction_signal(self, st: DealState, now: float) -> bool:
+        if not ENABLE_HIGH_CONVICTION_MODE:
+            return False
+        if st.last_news_id <= 0:
+            return False
+        if (now - st.last_news_update_ts) > EVENT_WINDOW_SECS:
+            return False
+        if st.last_news_delta_abs < max(0.0, HIGH_CONV_MIN_NEWS_DELTA):
+            return False
+        if st.last_event_strength < max(0.0, HIGH_CONV_MIN_EVENT_STRENGTH):
+            return False
+        return True
+
+    def _is_contra_news_entry(self, st: DealState, action: str, target_pos: int, now: float) -> bool:
+        if action not in {"BUY", "SELL"}:
+            return False
+        direction = 1 if action == "BUY" else -1
+        reducing = target_pos * direction < 0
+        if reducing:
+            return False
+        if (now - st.last_news_update_ts) > EVENT_WINDOW_SECS:
+            return False
+        if st.last_news_delta_abs < MIN_NEWS_DELTA:
+            return False
+        last_dir = (st.last_news_direction or "NONE").upper()
+        if last_dir == "POS" and action == "SELL":
+            return True
+        if last_dir == "NEG" and action == "BUY":
+            return True
+        return False
+
     async def news_worker(self) -> None:
         err_count = 0
         while self.running:
@@ -2006,7 +2045,14 @@ class MergerArbAlphaAsyncBot:
                         continue
                     if st.last_news_delta_abs < MIN_NEWS_DELTA:
                         continue
-                    if (now - st.last_stop_ts) < STOP_REENTRY_COOLDOWN_SECS:
+                    high_conviction_signal = self._is_high_conviction_signal(st, now)
+                    stop_reentry_cooldown = STOP_REENTRY_COOLDOWN_SECS
+                    if high_conviction_signal:
+                        stop_reentry_cooldown = max(
+                            0.20,
+                            stop_reentry_cooldown * max(0.10, HIGH_CONV_STOP_REENTRY_COOLDOWN_MULT),
+                        )
+                    if (now - st.last_stop_ts) < stop_reentry_cooldown:
                         continue
                     if st.last_entry_news_id >= st.last_news_id:
                         continue
@@ -2032,6 +2078,7 @@ class MergerArbAlphaAsyncBot:
                     if action is None:
                         continue
 
+                    contra_news_entry = self._is_contra_news_entry(st, action, target_pos, now)
                     alt_short_lock_active = st.alt_short_lock_until_ts > now
                     if action == "SELL" and alt_short_lock_active and target_pos <= 0:
                         continue
@@ -2040,18 +2087,29 @@ class MergerArbAlphaAsyncBot:
                     base_threshold = max(MIN_ENTRY_THRESHOLD, friction + ENTRY_MARGIN_PER_SHARE)
                     dyn_threshold = inventory_adjusted_threshold(base_threshold, target_pos, action, gross_used, net_used)
                     # After we've already traded this deal and still hold exposure, require more edge to add.
-                    if (target_pos > 0 and action == "BUY") or (target_pos < 0 and action == "SELL"):
-                        dyn_threshold *= max(1.0, IN_POSITION_ENTRY_THRESHOLD_MULT)
+                    add_same_direction = (target_pos > 0 and action == "BUY") or (target_pos < 0 and action == "SELL")
+                    if add_same_direction:
+                        in_pos_mult = max(1.0, IN_POSITION_ENTRY_THRESHOLD_MULT)
+                        if high_conviction_signal:
+                            in_pos_mult = max(1.0, in_pos_mult * max(0.10, HIGH_CONV_IN_POSITION_EDGE_MULT))
+                        dyn_threshold *= in_pos_mult
+                    if contra_news_entry:
+                        dyn_threshold *= max(1.0, CONTRA_NEWS_EDGE_MULT)
                     if edge <= dyn_threshold:
                         continue
 
                     edge_mult = max(1.0, min(4.0, edge / max(0.01, dyn_threshold)))
                     # Size up initial entries when flat; keep add-ons controlled.
                     flat_mult = max(1.0, FLAT_ENTRY_SIZE_MULT) if target_pos == 0 else 1.0
-                    seed_qty = int(BASE_ORDER_QTY * edge_mult * flat_mult)
+                    conviction_size_mult = max(1.0, HIGH_CONV_SIZE_MULT) if high_conviction_signal else 1.0
+                    seed_qty = int(BASE_ORDER_QTY * edge_mult * flat_mult * conviction_size_mult)
 
                     target_cap = PER_DEAL_TARGET_MAX
+                    if high_conviction_signal:
+                        target_cap = int(round(target_cap * max(1.0, HIGH_CONV_TARGET_CAP_MULT)))
                     acq_cap = per_deal_acq_cap(ratio)
+                    if high_conviction_signal:
+                        acq_cap = int(round(acq_cap * max(1.0, HIGH_CONV_TARGET_CAP_MULT)))
                     max_target_by_target_cap = max_qty_for_position_cap(target_pos, action, target_cap)
                     max_target_qty = max_target_by_target_cap
                     if ratio > 0:
@@ -2152,9 +2210,11 @@ class MergerArbAlphaAsyncBot:
                         "NEWS_POLL_SECS": NEWS_POLL_SECS,
                         "GROSS_LIMIT": GROSS_LIMIT,
                         "NET_LIMIT": NET_LIMIT,
+                        "RISK_BUFFER": RISK_BUFFER,
                         "BASE_ORDER_QTY": BASE_ORDER_QTY,
                         "MIN_ORDER_QTY": MIN_ORDER_QTY,
                         "MAX_ORDER_SIZE": MAX_ORDER_SIZE,
+                        "PER_DEAL_TARGET_MAX": PER_DEAL_TARGET_MAX,
                         "MIN_ENTRY_THRESHOLD": MIN_ENTRY_THRESHOLD,
                         "ENTRY_MARGIN_PER_SHARE": ENTRY_MARGIN_PER_SHARE,
                         "OPPOSITE_NEWS_FLATTEN_WINDOW_SECS": OPPOSITE_NEWS_FLATTEN_WINDOW_SECS,
@@ -2163,8 +2223,17 @@ class MergerArbAlphaAsyncBot:
                         "ALT_POS_SHORT_LOCKOUT_SECS": ALT_POS_SHORT_LOCKOUT_SECS,
                         "STOP_LOSS_PNL_PER_TARGET": STOP_LOSS_PNL_PER_TARGET,
                         "STOP_GRACE_SECS": STOP_GRACE_SECS,
+                        "STOP_REENTRY_COOLDOWN_SECS": STOP_REENTRY_COOLDOWN_SECS,
                         "IN_POSITION_ENTRY_THRESHOLD_MULT": IN_POSITION_ENTRY_THRESHOLD_MULT,
                         "FLAT_ENTRY_SIZE_MULT": FLAT_ENTRY_SIZE_MULT,
+                        "ENABLE_HIGH_CONVICTION_MODE": ENABLE_HIGH_CONVICTION_MODE,
+                        "HIGH_CONV_MIN_NEWS_DELTA": HIGH_CONV_MIN_NEWS_DELTA,
+                        "HIGH_CONV_MIN_EVENT_STRENGTH": HIGH_CONV_MIN_EVENT_STRENGTH,
+                        "HIGH_CONV_TARGET_CAP_MULT": HIGH_CONV_TARGET_CAP_MULT,
+                        "HIGH_CONV_SIZE_MULT": HIGH_CONV_SIZE_MULT,
+                        "HIGH_CONV_IN_POSITION_EDGE_MULT": HIGH_CONV_IN_POSITION_EDGE_MULT,
+                        "HIGH_CONV_STOP_REENTRY_COOLDOWN_MULT": HIGH_CONV_STOP_REENTRY_COOLDOWN_MULT,
+                        "CONTRA_NEWS_EDGE_MULT": CONTRA_NEWS_EDGE_MULT,
                         "EXIT_BUFFER": EXIT_BUFFER,
                         "STOP_BUFFER": STOP_BUFFER,
                         "EXECUTION_MODE": EXECUTION_MODE,
@@ -2193,6 +2262,12 @@ class MergerArbAlphaAsyncBot:
             f"opp_flat_win={OPPOSITE_NEWS_FLATTEN_WINDOW_SECS:.1f}s "
             f"in_pos_edge_mult={IN_POSITION_ENTRY_THRESHOLD_MULT:.2f} "
             f"flat_size_mult={FLAT_ENTRY_SIZE_MULT:.2f} "
+            f"high_conv={'1' if ENABLE_HIGH_CONVICTION_MODE else '0'} "
+            f"hconv_delta>={HIGH_CONV_MIN_NEWS_DELTA:.3f} "
+            f"hconv_str>={HIGH_CONV_MIN_EVENT_STRENGTH:.2f} "
+            f"hconv_cap_mult={HIGH_CONV_TARGET_CAP_MULT:.2f} "
+            f"hconv_size_mult={HIGH_CONV_SIZE_MULT:.2f} "
+            f"contra_edge_mult={CONTRA_NEWS_EDGE_MULT:.2f} "
             f"hold={MAX_HOLD_SECS:.1f}s exec={EXECUTION_MODE} "
             f"ping={'1' if PING_AT_TOUCH else '0'} ioc={'1' if ENABLE_IOC_EMULATION else '0'} "
             f"finbert={'ON' if self.finbert_enabled else 'OFF'}"
