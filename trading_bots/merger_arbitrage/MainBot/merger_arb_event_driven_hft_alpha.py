@@ -17,7 +17,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -61,6 +61,20 @@ def _dedupe_paths(paths: Iterable[Path]) -> List[Path]:
 _THIS_FILE = Path(__file__).resolve()
 BOT_ROOT = _THIS_FILE.parent
 REPO_ROOT = _find_repo_root(_THIS_FILE)
+
+
+def _resolve_default_log_dir() -> Path:
+    # Prefer a stable project-level logs folder even if this script gets moved.
+    candidates = [
+        REPO_ROOT / "trading_bots" / "merger_arbitrage" / "logs",
+        BOT_ROOT / "logs",
+        BOT_ROOT.parent / "logs",
+        Path.cwd() / "logs",
+    ]
+    for p in candidates:
+        if p.exists() and p.is_dir():
+            return p
+    return candidates[0]
 
 DEFAULT_FINBERT_ONNX_MODEL = BOT_ROOT / "finbert_hft" / "model_opt_int8.onnx"
 DEFAULT_FINBERT_TOKENIZER_DIR = BOT_ROOT / "finbert_hft" / "local_finbert"
@@ -110,7 +124,7 @@ def _detect_finbert_assets(onnx_hint: str, tokenizer_hint: str) -> Tuple[Optiona
 
 # Logging
 WRITE_RUN_JSON = env_bool("RIT_MA_WRITE_RUN_JSON", "1")
-RUN_LOG_DIR = os.environ.get("RIT_MA_LOG_DIR", str(BOT_ROOT / "logs"))
+RUN_LOG_DIR = Path(os.environ.get("RIT_MA_LOG_DIR", str(_resolve_default_log_dir())).strip()).expanduser()
 RUN_LOG_JSON_PATH = os.environ.get("RIT_MA_LOG_JSON_PATH", "").strip()
 RUN_RECORDER: Optional["RunRecorder"] = None
 
@@ -123,6 +137,8 @@ SNAPSHOT_SECS = float(os.environ.get("RIT_MA_SNAPSHOT_SECS", "2.0"))
 INIT_WARMUP_SECS = float(os.environ.get("RIT_MA_INIT_WARMUP_SECS", "3.5"))
 INIT_SNAPSHOTS = int(os.environ.get("RIT_MA_INIT_SNAPSHOTS", "8"))
 INIT_SAMPLE_INTERVAL_SECS = float(os.environ.get("RIT_MA_INIT_SAMPLE_INTERVAL_SECS", "0.25"))
+HTTP_TIMEOUT_SECS = float(os.environ.get("RIT_MA_HTTP_TIMEOUT_SECS", "2.0"))
+HTTP_POOL_LIMIT = int(os.environ.get("RIT_MA_HTTP_POOL_LIMIT", "64"))
 
 # Execution
 MAX_ORDER_SIZE = 5000
@@ -159,6 +175,9 @@ ADD_INVENTORY_SLOPE = float(os.environ.get("RIT_MA_ADD_INVENTORY_SLOPE", "1.20")
 ADD_GLOBAL_SLOPE = float(os.environ.get("RIT_MA_ADD_GLOBAL_SLOPE", "0.90"))
 IN_POSITION_ENTRY_THRESHOLD_MULT = float(os.environ.get("RIT_MA_IN_POSITION_ENTRY_THRESHOLD_MULT", "1.35"))
 FLAT_ENTRY_SIZE_MULT = float(os.environ.get("RIT_MA_FLAT_ENTRY_SIZE_MULT", "1.40"))
+OPPOSITE_NEWS_FLATTEN_WINDOW_SECS = float(os.environ.get("RIT_MA_OPPOSITE_NEWS_FLATTEN_WINDOW_SECS", "30.0"))
+OPPOSITE_NEWS_MIN_DELTA = float(os.environ.get("RIT_MA_OPPOSITE_NEWS_MIN_DELTA", "0.04"))
+OPPOSITE_NEWS_MIN_STRENGTH = float(os.environ.get("RIT_MA_OPPOSITE_NEWS_MIN_STRENGTH", "0.12"))
 
 # Probability blending
 NEWS_HALF_LIFE_SECS = float(os.environ.get("RIT_MA_NEWS_HALF_LIFE_SECS", "45.0"))
@@ -265,7 +284,7 @@ def now_ts() -> str:
 
 
 def utc_iso_now() -> str:
-    return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 class RunRecorder:
@@ -283,9 +302,12 @@ class RunRecorder:
 
     def _resolve_output_path(self) -> Path:
         if RUN_LOG_JSON_PATH:
-            return Path(RUN_LOG_JSON_PATH).expanduser()
+            out = Path(RUN_LOG_JSON_PATH).expanduser()
+            if not out.is_absolute():
+                out = RUN_LOG_DIR / out
+            return out
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return Path(RUN_LOG_DIR).expanduser() / f"merger_arb_alpha_async_heat_{stamp}.json"
+        return RUN_LOG_DIR / f"merger_arb_alpha_async_heat_{stamp}.json"
 
     async def set_context(self, context: Dict[str, object]) -> None:
         async with self.lock:
@@ -749,6 +771,7 @@ class DealState:
     last_news_id: int = 0
     last_news_delta_abs: float = 0.0
     last_event_strength: float = 0.0
+    last_news_direction: str = "NONE"
     last_trade_ts: float = 0.0
     hold_start_ts: float = 0.0
     last_risk_reduce_ts: float = 0.0
@@ -801,14 +824,26 @@ class MergerArbAlphaAsyncBot:
         self.trade_tickers = sorted(self.deal_ticker_to_id.keys())
 
     async def initialize(self) -> None:
-        case = await self.client.get_case()
-        if case.get("status") != "ACTIVE":
-            await log(f"Case status={case.get('status')} waiting ACTIVE")
-            while self.running:
-                await asyncio.sleep(CASE_POLL_SECS)
+        err_count = 0
+        while self.running:
+            try:
                 case = await self.client.get_case()
-                if case.get("status") == "ACTIVE":
+                status = case.get("status")
+                if status == "ACTIVE":
                     break
+                err_count = 0
+                await log(f"Case status={status} waiting ACTIVE")
+                await asyncio.sleep(CASE_POLL_SECS)
+            except Exception as exc:
+                err_count += 1
+                sleep_s = min(2.0, 0.05 * (2 ** min(err_count, 5)))
+                await log(
+                    f"CASE_ERR phase=init count={err_count} sleep={sleep_s:.2f}s err={type(exc).__name__}: {exc!r}",
+                    level="WARN",
+                )
+                await asyncio.sleep(sleep_s)
+        if not self.running:
+            raise RuntimeError("Bot stopped while waiting for ACTIVE case")
 
         if INIT_WARMUP_SECS > 0:
             await log(f"INIT warmup {INIT_WARMUP_SECS:.1f}s")
@@ -858,15 +893,33 @@ class MergerArbAlphaAsyncBot:
 
     async def _average_snapshot_mid(self, tickers: Iterable[str], samples: int, sleep_s: float) -> Dict[str, float]:
         sums: Dict[str, float] = {t: 0.0 for t in tickers}
-        count = 0
-        for _ in range(max(1, samples)):
-            mids = await self._snapshot_mid(tickers)
-            for t, mid in mids.items():
-                sums[t] += mid
-            count += 1
+        target_samples = max(1, samples)
+        max_attempts = max(target_samples * 4, target_samples + 6)
+        success_count = 0
+        attempts = 0
+        while success_count < target_samples and attempts < max_attempts:
+            attempts += 1
+            try:
+                mids = await self._snapshot_mid(tickers)
+                for t, mid in mids.items():
+                    sums[t] += mid
+                success_count += 1
+            except Exception as exc:
+                await log(
+                    f"INIT_BOOK_WARN attempt={attempts}/{max_attempts} err={type(exc).__name__}: {exc!r}",
+                    level="WARN",
+                )
             if sleep_s > 0:
                 await asyncio.sleep(sleep_s)
-        return {t: sums[t] / max(1, count) for t in sums}
+
+        if success_count <= 0:
+            raise RuntimeError("Initialization failed: no valid top-of-book snapshots collected")
+        if success_count < target_samples:
+            await log(
+                f"INIT_BOOK_WARN collected={success_count}/{target_samples} valid snapshots; continuing with partial average",
+                level="WARN",
+            )
+        return {t: sums[t] / float(success_count) for t in sums}
 
     async def _safe_positions(self) -> Dict[str, int]:
         sec = await self.client.get_securities()
@@ -1291,6 +1344,25 @@ class MergerArbAlphaAsyncBot:
 
         return 0.0
 
+    def _opposite_news_flatten_action(self, st: DealState, target_pos: int, now: float) -> Optional[str]:
+        if target_pos == 0:
+            return None
+        if st.last_news_id <= st.last_entry_news_id:
+            return None
+        if (now - st.last_news_update_ts) > max(0.0, OPPOSITE_NEWS_FLATTEN_WINDOW_SECS):
+            return None
+        if st.last_news_delta_abs < max(0.0, OPPOSITE_NEWS_MIN_DELTA):
+            return None
+        if st.last_event_strength < max(0.0, OPPOSITE_NEWS_MIN_STRENGTH):
+            return None
+
+        direction = (st.last_news_direction or "NONE").upper()
+        if target_pos > 0 and direction == "NEG":
+            return "SELL"
+        if target_pos < 0 and direction == "POS":
+            return "BUY"
+        return None
+
     async def news_worker(self) -> None:
         err_count = 0
         while self.running:
@@ -1377,6 +1449,7 @@ class MergerArbAlphaAsyncBot:
                             st.last_news_id = news_id
                             st.last_news_delta_abs = abs(delta)
                             st.last_event_strength = max(st.last_event_strength * 0.55, strength)
+                            st.last_news_direction = direction
                             if category == "ALT" and direction == "POS":
                                 st.alt_short_lock_until_ts = max(
                                     st.alt_short_lock_until_ts,
@@ -1450,6 +1523,7 @@ class MergerArbAlphaAsyncBot:
                     st.last_news_id = max(st.last_news_id, self.last_news_id)
                     st.last_news_delta_abs = abs(p_new - old)
                     st.last_event_strength = max(0.2, st.last_event_strength)
+                    st.last_news_direction = "NONE"
                 await log(f"MANUAL_SET deal={did} p:{old:.4f}->{p_new:.4f}")
                 continue
 
@@ -1472,6 +1546,7 @@ class MergerArbAlphaAsyncBot:
                 st.last_news_id = max(st.last_news_id, self.last_news_id)
                 st.last_news_delta_abs = abs(delta)
                 st.last_event_strength = max(st.last_event_strength, 0.65)
+                st.last_news_direction = direction
             await log(f"MANUAL_DELTA deal={did} delta={delta:+.4f} p:{old:.4f}->{st.prob_news:.4f}")
 
     async def _periodic_snapshot(self, books: Dict[str, Tuple[float, float, float, int, int]], positions: Dict[str, int]) -> None:
@@ -1628,6 +1703,7 @@ class MergerArbAlphaAsyncBot:
                     last_news_id=st.last_news_id,
                     last_news_delta_abs=st.last_news_delta_abs,
                     last_event_strength=st.last_event_strength,
+                    last_news_direction=st.last_news_direction,
                     last_trade_ts=st.last_trade_ts,
                     hold_start_ts=st.hold_start_ts,
                     last_risk_reduce_ts=st.last_risk_reduce_ts,
@@ -1722,6 +1798,53 @@ class MergerArbAlphaAsyncBot:
                     entry_age = (now - st.entry_ts) if st.entry_ts > 0 else 1e9
                     pair_pnl = self._pair_pnl_per_target_share(st, target_pos, ratio, t_bid, t_ask, a_bid, a_ask)
                     stop_allowed = entry_age >= max(0.0, STOP_GRACE_SECS)
+
+                    opposite_flat_action = self._opposite_news_flatten_action(st, target_pos, now)
+                    if opposite_flat_action is not None:
+                        close_qty = close_qty_for_position(abs(target_pos))
+                        hedge_close_qty = compute_hedge_close_qty(opposite_flat_action, ratio, close_qty, acq_pos)
+                        liq_target_qty, liq_hedge_qty = self._cap_target_qty_by_hedge_liquidity(
+                            opposite_flat_action, ratio, close_qty, hedge_close_qty, a_bid_qty, a_ask_qty
+                        )
+                        # For opposite-news risk exit, prioritize flattening target even when hedge top-book is thin.
+                        if liq_target_qty < ORDER_STEP:
+                            liq_target_qty = close_qty
+                            liq_hedge_qty = hedge_close_qty
+                        if liq_target_qty >= ORDER_STEP:
+                            p_star_exit = p_star_sell if opposite_flat_action == "SELL" else p_star_buy
+                            news_edge = abs(st.last_news_delta_abs)
+                            target_ok, hedge_ok = await self._submit_pair(
+                                did,
+                                target,
+                                acq,
+                                opposite_flat_action,
+                                liq_target_qty,
+                                liq_hedge_qty,
+                                news_edge,
+                                p_star_exit,
+                                t_bid,
+                                t_ask,
+                                a_bid,
+                                a_ask,
+                                "OPPOSITE_NEWS_FLATTEN",
+                            )
+                            if target_ok:
+                                if opposite_flat_action == "SELL":
+                                    positions[target] = target_pos - liq_target_qty
+                                else:
+                                    positions[target] = target_pos + liq_target_qty
+                            if liq_hedge_qty > 0 and hedge_ok:
+                                if opposite_flat_action == "SELL":
+                                    positions[acq] = acq_pos + liq_hedge_qty
+                                else:
+                                    positions[acq] = acq_pos - liq_hedge_qty
+                            if target_ok or hedge_ok:
+                                async with self.state_lock:
+                                    live = self.deal_states[did]
+                                    live.last_trade_ts = now
+                                    live.last_stop_ts = now
+                                    live.hold_start_ts = 0.0 if int(positions.get(target, 0)) == 0 else now
+                        continue
 
                     # Stop loss exits
                     long_stop_hit = False
@@ -2020,6 +2143,10 @@ class MergerArbAlphaAsyncBot:
                     "deals": DEALS,
                     "config": {
                         "BASE_URL": BASE_URL,
+                        "RUN_LOG_DIR": str(RUN_LOG_DIR),
+                        "RUN_LOG_JSON_PATH": RUN_LOG_JSON_PATH,
+                        "HTTP_TIMEOUT_SECS": HTTP_TIMEOUT_SECS,
+                        "HTTP_POOL_LIMIT": HTTP_POOL_LIMIT,
                         "TRADE_LOOP_SECS": TRADE_LOOP_SECS,
                         "NEWS_POLL_SECS": NEWS_POLL_SECS,
                         "GROSS_LIMIT": GROSS_LIMIT,
@@ -2029,6 +2156,9 @@ class MergerArbAlphaAsyncBot:
                         "MAX_ORDER_SIZE": MAX_ORDER_SIZE,
                         "MIN_ENTRY_THRESHOLD": MIN_ENTRY_THRESHOLD,
                         "ENTRY_MARGIN_PER_SHARE": ENTRY_MARGIN_PER_SHARE,
+                        "OPPOSITE_NEWS_FLATTEN_WINDOW_SECS": OPPOSITE_NEWS_FLATTEN_WINDOW_SECS,
+                        "OPPOSITE_NEWS_MIN_DELTA": OPPOSITE_NEWS_MIN_DELTA,
+                        "OPPOSITE_NEWS_MIN_STRENGTH": OPPOSITE_NEWS_MIN_STRENGTH,
                         "ALT_POS_SHORT_LOCKOUT_SECS": ALT_POS_SHORT_LOCKOUT_SECS,
                         "STOP_LOSS_PNL_PER_TARGET": STOP_LOSS_PNL_PER_TARGET,
                         "STOP_GRACE_SECS": STOP_GRACE_SECS,
@@ -2050,6 +2180,8 @@ class MergerArbAlphaAsyncBot:
 
         await self._initialize_finbert()
         await self.initialize()
+        if RUN_RECORDER is not None:
+            await log(f"RUN_LOG target={RUN_RECORDER.output_path}")
         if PING_AT_TOUCH and ENABLE_IOC_EMULATION:
             await log("EXEC_WARN ping-at-touch with IOC emulation can increase legging/orphan risk", level="WARN")
         await log(
@@ -2057,6 +2189,7 @@ class MergerArbAlphaAsyncBot:
             f"loop={TRADE_LOOP_SECS:.3f}s news={NEWS_POLL_SECS:.3f}s "
             f"min_edge={MIN_ENTRY_THRESHOLD:.3f} margin={ENTRY_MARGIN_PER_SHARE:.3f} "
             f"stop_pnl={STOP_LOSS_PNL_PER_TARGET:.3f} stop_grace={STOP_GRACE_SECS:.2f}s "
+            f"opp_flat_win={OPPOSITE_NEWS_FLATTEN_WINDOW_SECS:.1f}s "
             f"in_pos_edge_mult={IN_POSITION_ENTRY_THRESHOLD_MULT:.2f} "
             f"flat_size_mult={FLAT_ENTRY_SIZE_MULT:.2f} "
             f"hold={MAX_HOLD_SECS:.1f}s exec={EXECUTION_MODE} "
@@ -2106,6 +2239,7 @@ class MergerArbAlphaAsyncBot:
                             "last_news_id": st.last_news_id,
                             "last_news_delta_abs": st.last_news_delta_abs,
                             "last_event_strength": st.last_event_strength,
+                            "last_news_direction": st.last_news_direction,
                             "last_trade_ts": st.last_trade_ts,
                             "hold_start_ts": st.hold_start_ts,
                             "last_risk_reduce_ts": st.last_risk_reduce_ts,
@@ -2148,7 +2282,7 @@ async def _async_main() -> None:
     if WRITE_RUN_JSON:
         RUN_RECORDER = RunRecorder(base_url=BASE_URL)
 
-    async with AsyncRITClient(api_key=API_KEY, base_url=BASE_URL, timeout_s=1.2, pool_limit=64,
+    async with AsyncRITClient(api_key=API_KEY, base_url=BASE_URL, timeout_s=HTTP_TIMEOUT_SECS, pool_limit=HTTP_POOL_LIMIT,
                                use_dma_auth=USE_DMA_AUTH, dma_user=DMA_USER, dma_pass=DMA_PASS) as client:
         bot = MergerArbAlphaAsyncBot(client)
         await bot.run()

@@ -1,0 +1,621 @@
+{
+  "meta": {
+    "captured_at_utc": "2026-02-19T16:52:18.476Z",
+    "duration_sec": 1.359,
+    "base_url": "http://flserver.rotman.utoronto.ca:16550/v1"
+  },
+  "config": {
+    "tickers": [
+      "TGX",
+      "PHR",
+      "BYL",
+      "CLD",
+      "GGD",
+      "PNR",
+      "FSR",
+      "ATB",
+      "SPK",
+      "EEC"
+    ],
+    "levels": 2,
+    "interval": 0.2,
+    "duration": 1.0,
+    "wait_active": true,
+    "capture_preactive": false,
+    "until_case_end": false,
+    "track_fills": false,
+    "fills_poll_every": 0.5
+  },
+  "snapshots": [],
+  "fills": [],
+  "errors": [
+    {
+      "ts_utc": "2026-02-19T16:52:17.306Z",
+      "ts_epoch": 1771519937.306827,
+      "where": "get_case",
+      "error_type": "RuntimeError",
+      "error_repr": "RuntimeError(\"REQUEST_FAIL method=GET path=/case retries=4 last=ClientConnectorError: ClientConnectorError(ConnectionKey(host='flserver.rotman.utoronto.ca', port=16550, is_ssl=False, ssl=True, proxy=None, proxy_auth=None, proxy_headers_hash=3148944291564527606), gaierror(8, 'nodename nor servname provided, or not known'))\")"
+    },
+    {
+      "ts_utc": "2026-02-19T16:52:17.693Z",
+      "ts_epoch": 1771519937.693754,
+      "where": "get_case",
+      "error_type": "RuntimeError",
+      "error_repr": "RuntimeError(\"REQUEST_FAIL method=GET path=/case retries=4 last=ClientConnectorError: ClientConnectorError(ConnectionKey(host='flserver.rotman.utoronto.ca', port=16550, is_ssl=False, ssl=True, proxy=None, proxy_auth=None, proxy_headers_hash=3148944291564527606), gaierror(8, 'nodename nor servname provided, or not known'))\")"
+    },
+    {
+      "ts_utc": "2026-02-19T16:52:18.083Z",
+      "ts_epoch": 1771519938.083786,
+      "where": "get_case",
+      "error_type": "RuntimeError",
+      "error_repr": "RuntimeError(\"REQUEST_FAIL method=GET path=/case retries=4 last=ClientConnectorError: ClientConnectorError(ConnectionKey(host='flserver.rotman.utoronto.ca', port=16550, is_ssl=False, ssl=True, proxy=None, proxy_auth=None, proxy_headers_hash=3148944291564527606), gaierror(8, 'nodename nor servname provided, or not known'))\")"
+    },
+    {
+      "ts_utc": "2026-02-19T16:52:18.476Z",
+      "ts_epoch": 1771519938.476509,
+      "where": "get_case",
+      "error_type": "RuntimeError",
+      "error_repr": "RuntimeError(\"REQUEST_FAIL method=GET path=/case retries=4 last=ClientConnectorError: ClientConnectorError(ConnectionKey(host='flserver.rotman.utoronto.ca', port=16550, is_ssl=False, ssl=True, proxy=None, proxy_auth=None, proxy_headers_hash=3148944291564527606), gaierror(8, 'nodename nor servname provided, or not known'))\")"
+    }
+  ],
+  "analysis": {
+    "snapshot_count": 0,
+    "fill_event_count": 0,
+    "error_count": 4,
+    "missing_book_counts": {
+      "TGX": 0,
+      "PHR": 0,
+      "BYL": 0,
+      "CLD": 0,
+      "GGD": 0,
+      "PNR": 0,
+      "FSR": 0,
+      "ATB": 0,
+      "SPK": 0,
+      "EEC": 0
+    },
+    "per_ticker": {
+      "TGX": {
+        "snapshot_count": 0,
+        "valid_book_count": 0,
+        "book_coverage_ratio": null,
+        "quote_change_rate": null,
+        "locked_or_crossed_count": 0,
+        "spread_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "spread_bps_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "top_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "depth_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "mid_return_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        }
+      },
+      "PHR": {
+        "snapshot_count": 0,
+        "valid_book_count": 0,
+        "book_coverage_ratio": null,
+        "quote_change_rate": null,
+        "locked_or_crossed_count": 0,
+        "spread_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "spread_bps_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "top_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "depth_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "mid_return_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        }
+      },
+      "BYL": {
+        "snapshot_count": 0,
+        "valid_book_count": 0,
+        "book_coverage_ratio": null,
+        "quote_change_rate": null,
+        "locked_or_crossed_count": 0,
+        "spread_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "spread_bps_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "top_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "depth_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "mid_return_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        }
+      },
+      "CLD": {
+        "snapshot_count": 0,
+        "valid_book_count": 0,
+        "book_coverage_ratio": null,
+        "quote_change_rate": null,
+        "locked_or_crossed_count": 0,
+        "spread_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "spread_bps_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "top_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "depth_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "mid_return_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        }
+      },
+      "GGD": {
+        "snapshot_count": 0,
+        "valid_book_count": 0,
+        "book_coverage_ratio": null,
+        "quote_change_rate": null,
+        "locked_or_crossed_count": 0,
+        "spread_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "spread_bps_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "top_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "depth_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "mid_return_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        }
+      },
+      "PNR": {
+        "snapshot_count": 0,
+        "valid_book_count": 0,
+        "book_coverage_ratio": null,
+        "quote_change_rate": null,
+        "locked_or_crossed_count": 0,
+        "spread_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "spread_bps_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "top_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "depth_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "mid_return_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        }
+      },
+      "FSR": {
+        "snapshot_count": 0,
+        "valid_book_count": 0,
+        "book_coverage_ratio": null,
+        "quote_change_rate": null,
+        "locked_or_crossed_count": 0,
+        "spread_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "spread_bps_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "top_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "depth_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "mid_return_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        }
+      },
+      "ATB": {
+        "snapshot_count": 0,
+        "valid_book_count": 0,
+        "book_coverage_ratio": null,
+        "quote_change_rate": null,
+        "locked_or_crossed_count": 0,
+        "spread_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "spread_bps_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "top_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "depth_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "mid_return_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        }
+      },
+      "SPK": {
+        "snapshot_count": 0,
+        "valid_book_count": 0,
+        "book_coverage_ratio": null,
+        "quote_change_rate": null,
+        "locked_or_crossed_count": 0,
+        "spread_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "spread_bps_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "top_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "depth_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "mid_return_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        }
+      },
+      "EEC": {
+        "snapshot_count": 0,
+        "valid_book_count": 0,
+        "book_coverage_ratio": null,
+        "quote_change_rate": null,
+        "locked_or_crossed_count": 0,
+        "spread_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "spread_bps_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "top_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "depth_imbalance_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        },
+        "mid_return_stats": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p95": null,
+          "max": null,
+          "stdev": null
+        }
+      }
+    },
+    "fill_impact": {
+      "fill_count_considered": 0,
+      "signed_mid_delta_stats": {
+        "count": 0,
+        "mean": null,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "max": null,
+        "stdev": null
+      },
+      "suggested_no_impact_hint": null
+    },
+    "interesting_checks": [
+      "spread regime by ticker (mean/p95 spread and spread_bps)",
+      "book health (coverage ratio, missing counts, locked/crossed count)",
+      "liquidity pressure (top/depth imbalance distributions)",
+      "quote refresh speed (quote_change_rate)",
+      "price stability (mid_return_stats)",
+      "self-impact hint from fills (signed_mid_delta_stats)"
+    ]
+  }
+}
