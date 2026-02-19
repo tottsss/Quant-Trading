@@ -126,6 +126,7 @@ def _detect_finbert_assets(onnx_hint: str, tokenizer_hint: str) -> Tuple[Optiona
 WRITE_RUN_JSON = env_bool("RIT_MA_WRITE_RUN_JSON", "1")
 RUN_LOG_DIR = Path(os.environ.get("RIT_MA_LOG_DIR", str(_resolve_default_log_dir())).strip()).expanduser()
 RUN_LOG_JSON_PATH = os.environ.get("RIT_MA_LOG_JSON_PATH", "").strip()
+RUN_LOG_BASENAME = os.environ.get("RIT_MA_LOG_BASENAME", "merger_arb_alpha_heat").strip() or "merger_arb_alpha_heat"
 RUN_RECORDER: Optional["RunRecorder"] = None
 
 # Timing
@@ -307,7 +308,7 @@ class RunRecorder:
                 out = RUN_LOG_DIR / out
             return out
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return RUN_LOG_DIR / f"merger_arb_alpha_async_heat_{stamp}.json"
+        return RUN_LOG_DIR / f"{RUN_LOG_BASENAME}_{stamp}.json"
 
     async def set_context(self, context: Dict[str, object]) -> None:
         async with self.lock:
