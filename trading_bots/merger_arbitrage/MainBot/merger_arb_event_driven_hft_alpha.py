@@ -130,16 +130,16 @@ RUN_LOG_BASENAME = os.environ.get("RIT_MA_LOG_BASENAME", "merger_arb_alpha_heat"
 RUN_RECORDER: Optional["RunRecorder"] = None
 
 # Timing
-NEWS_POLL_SECS = float(os.environ.get("RIT_MA_NEWS_POLL_SECS", "0.15"))
-TRADE_LOOP_SECS = float(os.environ.get("RIT_MA_TRADE_LOOP_SECS", "0.12"))
+NEWS_POLL_SECS = float(os.environ.get("RIT_MA_NEWS_POLL_SECS", "0.25"))
+TRADE_LOOP_SECS = float(os.environ.get("RIT_MA_TRADE_LOOP_SECS", "0.20"))
 CASE_POLL_SECS = float(os.environ.get("RIT_MA_CASE_POLL_SECS", "0.25"))
 TRADE_COOLDOWN_SECS = float(os.environ.get("RIT_MA_TRADE_COOLDOWN_SECS", "0.25"))
 SNAPSHOT_SECS = float(os.environ.get("RIT_MA_SNAPSHOT_SECS", "2.0"))
 INIT_WARMUP_SECS = float(os.environ.get("RIT_MA_INIT_WARMUP_SECS", "3.5"))
 INIT_SNAPSHOTS = int(os.environ.get("RIT_MA_INIT_SNAPSHOTS", "8"))
 INIT_SAMPLE_INTERVAL_SECS = float(os.environ.get("RIT_MA_INIT_SAMPLE_INTERVAL_SECS", "0.25"))
-HTTP_TIMEOUT_SECS = float(os.environ.get("RIT_MA_HTTP_TIMEOUT_SECS", "2.0"))
-HTTP_POOL_LIMIT = int(os.environ.get("RIT_MA_HTTP_POOL_LIMIT", "64"))
+HTTP_TIMEOUT_SECS = float(os.environ.get("RIT_MA_HTTP_TIMEOUT_SECS", "3.0"))
+HTTP_POOL_LIMIT = int(os.environ.get("RIT_MA_HTTP_POOL_LIMIT", "32"))
 
 # Execution
 MAX_ORDER_SIZE = 5000
@@ -157,7 +157,7 @@ SIMULTANEOUS_LEGS = env_bool("RIT_MA_SIMULTANEOUS_LEGS", "1")
 ENABLE_IOC_EMULATION = env_bool("RIT_MA_ENABLE_IOC_EMULATION", _IOC_DEFAULT)
 IOC_CANCEL_SECS = float(os.environ.get("RIT_MA_IOC_CANCEL_SECS", "0.20"))
 STALE_ORDER_SECS = float(os.environ.get("RIT_MA_STALE_ORDER_SECS", "0.80"))
-STALE_CANCEL_CHECK_SECS = float(os.environ.get("RIT_MA_STALE_CANCEL_CHECK_SECS", "0.15"))
+STALE_CANCEL_CHECK_SECS = float(os.environ.get("RIT_MA_STALE_CANCEL_CHECK_SECS", "0.50"))
 
 # Thresholds
 COMMISSION_PER_SHARE = float(os.environ.get("RIT_MA_COMMISSION_PER_SHARE", "0.02"))
