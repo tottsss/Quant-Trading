@@ -143,21 +143,27 @@ HTTP_POOL_LIMIT = int(os.environ.get("RIT_MA_HTTP_POOL_LIMIT", "32"))
 
 # Execution
 MAX_ORDER_SIZE = 5000
-BASE_ORDER_QTY = int(os.environ.get("RIT_MA_BASE_ORDER_QTY", "1200"))
+BASE_ORDER_QTY = int(os.environ.get("RIT_MA_BASE_ORDER_QTY", "2200"))
 MIN_ORDER_QTY = int(os.environ.get("RIT_MA_MIN_ORDER_QTY", "400"))
 ORDER_STEP = int(os.environ.get("RIT_MA_ORDER_STEP", "100"))
 MARKETABLE_LIMIT_OFFSET = float(os.environ.get("RIT_MA_LIMIT_OFFSET", "0.02"))
-EXECUTION_MODE = os.environ.get("RIT_MA_EXECUTION_MODE", "MARKETABLE_IOC").strip().upper()
+INFINITE_LIQUIDITY_MODE = env_bool("RIT_MA_INFINITE_LIQUIDITY_MODE", "1")
+_EXEC_MODE_DEFAULT = "MARKETABLE_LIMIT" if INFINITE_LIQUIDITY_MODE else "MARKETABLE_IOC"
+EXECUTION_MODE = os.environ.get("RIT_MA_EXECUTION_MODE", _EXEC_MODE_DEFAULT).strip().upper()
 if EXECUTION_MODE not in {"MARKETABLE_IOC", "MARKETABLE_LIMIT", "PASSIVE_TOUCH"}:
-    EXECUTION_MODE = "MARKETABLE_IOC"
-_PING_DEFAULT = "1" if EXECUTION_MODE == "PASSIVE_TOUCH" else "0"
-_IOC_DEFAULT = "1" if EXECUTION_MODE == "MARKETABLE_IOC" else "0"
+    EXECUTION_MODE = _EXEC_MODE_DEFAULT
+_PING_DEFAULT = "0" if INFINITE_LIQUIDITY_MODE else ("1" if EXECUTION_MODE == "PASSIVE_TOUCH" else "0")
+_IOC_DEFAULT = "0" if INFINITE_LIQUIDITY_MODE else ("1" if EXECUTION_MODE == "MARKETABLE_IOC" else "0")
 PING_AT_TOUCH = env_bool("RIT_MA_PING_AT_TOUCH", _PING_DEFAULT)
 SIMULTANEOUS_LEGS = env_bool("RIT_MA_SIMULTANEOUS_LEGS", "1")
 ENABLE_IOC_EMULATION = env_bool("RIT_MA_ENABLE_IOC_EMULATION", _IOC_DEFAULT)
+USE_MARKET_ORDERS = env_bool("RIT_MA_USE_MARKET_ORDERS", "0")
 IOC_CANCEL_SECS = float(os.environ.get("RIT_MA_IOC_CANCEL_SECS", "0.20"))
 STALE_ORDER_SECS = float(os.environ.get("RIT_MA_STALE_ORDER_SECS", "0.80"))
-STALE_CANCEL_CHECK_SECS = float(os.environ.get("RIT_MA_STALE_CANCEL_CHECK_SECS", "0.50"))
+_STALE_CHECK_DEFAULT = "0.50" if INFINITE_LIQUIDITY_MODE else "0.15"
+STALE_CANCEL_CHECK_SECS = float(os.environ.get("RIT_MA_STALE_CANCEL_CHECK_SECS", _STALE_CHECK_DEFAULT))
+_IDLE_ORDER_POLL_DEFAULT = "1.50" if INFINITE_LIQUIDITY_MODE else "0.50"
+ORDER_STATUS_POLL_IDLE_SECS = float(os.environ.get("RIT_MA_ORDER_STATUS_POLL_IDLE_SECS", _IDLE_ORDER_POLL_DEFAULT))
 
 # Thresholds
 COMMISSION_PER_SHARE = float(os.environ.get("RIT_MA_COMMISSION_PER_SHARE", "0.02"))
@@ -182,10 +188,10 @@ OPPOSITE_NEWS_MIN_STRENGTH = float(os.environ.get("RIT_MA_OPPOSITE_NEWS_MIN_STRE
 ENABLE_HIGH_CONVICTION_MODE = env_bool("RIT_MA_ENABLE_HIGH_CONVICTION_MODE", "1")
 HIGH_CONV_MIN_NEWS_DELTA = float(os.environ.get("RIT_MA_HIGH_CONV_MIN_NEWS_DELTA", "0.18"))
 HIGH_CONV_MIN_EVENT_STRENGTH = float(os.environ.get("RIT_MA_HIGH_CONV_MIN_EVENT_STRENGTH", "0.85"))
-HIGH_CONV_TARGET_CAP_MULT = float(os.environ.get("RIT_MA_HIGH_CONV_TARGET_CAP_MULT", "1.50"))
-HIGH_CONV_SIZE_MULT = float(os.environ.get("RIT_MA_HIGH_CONV_SIZE_MULT", "1.25"))
-HIGH_CONV_IN_POSITION_EDGE_MULT = float(os.environ.get("RIT_MA_HIGH_CONV_IN_POSITION_EDGE_MULT", "0.75"))
-HIGH_CONV_STOP_REENTRY_COOLDOWN_MULT = float(os.environ.get("RIT_MA_HIGH_CONV_STOP_REENTRY_COOLDOWN_MULT", "0.45"))
+HIGH_CONV_TARGET_CAP_MULT = float(os.environ.get("RIT_MA_HIGH_CONV_TARGET_CAP_MULT", "2.00"))
+HIGH_CONV_SIZE_MULT = float(os.environ.get("RIT_MA_HIGH_CONV_SIZE_MULT", "2.00"))
+HIGH_CONV_IN_POSITION_EDGE_MULT = float(os.environ.get("RIT_MA_HIGH_CONV_IN_POSITION_EDGE_MULT", "0.60"))
+HIGH_CONV_STOP_REENTRY_COOLDOWN_MULT = float(os.environ.get("RIT_MA_HIGH_CONV_STOP_REENTRY_COOLDOWN_MULT", "0.35"))
 CONTRA_NEWS_EDGE_MULT = float(os.environ.get("RIT_MA_CONTRA_NEWS_EDGE_MULT", "1.60"))
 
 # Probability blending
@@ -215,6 +221,7 @@ PER_DEAL_TARGET_MAX = int(os.environ.get("RIT_MA_PER_DEAL_TARGET_MAX", "25000"))
 PER_DEAL_ACQ_CAP_MULT = float(os.environ.get("RIT_MA_PER_DEAL_ACQ_CAP_MULT", "1.30"))
 HEDGE_MIN_TOP_SIZE = int(os.environ.get("RIT_MA_HEDGE_MIN_TOP_SIZE", "600"))
 HEDGE_TOP_BOOK_MULT = float(os.environ.get("RIT_MA_HEDGE_TOP_BOOK_MULT", "1.15"))
+LIQUIDITY_GATING_ENABLED = env_bool("RIT_MA_LIQUIDITY_GATING_ENABLED", "0" if INFINITE_LIQUIDITY_MODE else "1")
 CAPACITY_RECYCLE_TRIGGER_UTIL = float(os.environ.get("RIT_MA_CAPACITY_RECYCLE_TRIGGER_UTIL", "0.95"))
 CAPACITY_RECYCLE_TARGET_UTIL = float(os.environ.get("RIT_MA_CAPACITY_RECYCLE_TARGET_UTIL", "0.88"))
 CAPACITY_RECYCLE_REDUCE_FRACTION = float(os.environ.get("RIT_MA_CAPACITY_RECYCLE_REDUCE_FRACTION", "0.50"))
@@ -1010,6 +1017,10 @@ class MergerArbAlphaAsyncBot:
         return raw * damp
 
     def _marketable_limit_price(self, action: str, bid: float, ask: float) -> float:
+        if INFINITE_LIQUIDITY_MODE:
+            if action == "BUY":
+                return round(ask + MARKETABLE_LIMIT_OFFSET, 2)
+            return round(max(0.01, bid - MARKETABLE_LIMIT_OFFSET), 2)
         if PING_AT_TOUCH:
             return round(ask if action == "BUY" else bid, 2)
         if action == "BUY":
@@ -1067,7 +1078,13 @@ class MergerArbAlphaAsyncBot:
         return merged
 
     async def _cancel_stale_orders(self, now: float) -> None:
-        if now - self.last_stale_check_ts < STALE_CANCEL_CHECK_SECS:
+        async with self.order_lock:
+            tracked_open = len(self.open_order_meta)
+        if tracked_open <= 0 and not ENABLE_IOC_EMULATION:
+            return
+
+        poll_gap = STALE_CANCEL_CHECK_SECS if tracked_open > 0 else max(0.10, ORDER_STATUS_POLL_IDLE_SECS)
+        if now - self.last_stale_check_ts < poll_gap:
             return
         self.last_stale_check_ts = now
 
@@ -1151,6 +1168,9 @@ class MergerArbAlphaAsyncBot:
         target_px = self._marketable_limit_price(signal_action, t_bid, t_ask)
         hedge_side = "SELL" if signal_action == "BUY" else "BUY"
         hedge_px = self._marketable_limit_price(hedge_side, a_bid, a_ask) if hedge_qty > 0 else None
+        order_type = "MARKET" if USE_MARKET_ORDERS else "LIMIT"
+        target_price = None if order_type == "MARKET" else target_px
+        hedge_price = None if order_type == "MARKET" else hedge_px
 
         start = time.perf_counter()
         tgt_resp: Optional[dict] = None
@@ -1162,8 +1182,8 @@ class MergerArbAlphaAsyncBot:
                     ticker=target,
                     action=signal_action,
                     quantity=target_qty,
-                    order_type="LIMIT",
-                    price=target_px,
+                    order_type=order_type,
+                    price=target_price,
                 )
             )
             hedge_task = asyncio.create_task(
@@ -1171,8 +1191,8 @@ class MergerArbAlphaAsyncBot:
                     ticker=acquirer,
                     action=hedge_side,
                     quantity=hedge_qty,
-                    order_type="LIMIT",
-                    price=hedge_px,
+                    order_type=order_type,
+                    price=hedge_price,
                 )
             )
             tgt_res, hedge_res = await asyncio.gather(tgt_task, hedge_task, return_exceptions=True)
@@ -1180,7 +1200,7 @@ class MergerArbAlphaAsyncBot:
             if isinstance(tgt_res, Exception):
                 await log(
                     f"ORDER_FAIL {deal_id} reason={reason} target={target} side={signal_action} "
-                    f"qty={target_qty} px={target_px:.2f} err={tgt_res}",
+                    f"qty={target_qty} px={'MKT' if order_type == 'MARKET' else f'{target_px:.2f}'} err={tgt_res}",
                     level="WARN",
                 )
             else:
@@ -1190,7 +1210,7 @@ class MergerArbAlphaAsyncBot:
             if isinstance(hedge_res, Exception):
                 await log(
                     f"HEDGE_FAIL {deal_id} reason={reason} acq={acquirer} side={hedge_side} "
-                    f"qty={hedge_qty} px={hedge_px:.2f} err={hedge_res}",
+                    f"qty={hedge_qty} px={'MKT' if order_type == 'MARKET' else f'{hedge_px:.2f}'} err={hedge_res}",
                     level="WARN",
                 )
             else:
@@ -1202,14 +1222,14 @@ class MergerArbAlphaAsyncBot:
                     ticker=target,
                     action=signal_action,
                     quantity=target_qty,
-                    order_type="LIMIT",
-                    price=target_px,
+                    order_type=order_type,
+                    price=target_price,
                 )
                 await self._track_order(tgt_resp, target, reason, signal_action, target_qty)
             except Exception as exc:
                 await log(
                     f"ORDER_FAIL {deal_id} reason={reason} target={target} side={signal_action} "
-                    f"qty={target_qty} px={target_px:.2f} err={exc}",
+                    f"qty={target_qty} px={'MKT' if order_type == 'MARKET' else f'{target_px:.2f}'} err={exc}",
                     level="WARN",
                 )
                 return False, False
@@ -1220,22 +1240,24 @@ class MergerArbAlphaAsyncBot:
                         ticker=acquirer,
                         action=hedge_side,
                         quantity=hedge_qty,
-                        order_type="LIMIT",
-                        price=hedge_px,
+                        order_type=order_type,
+                        price=hedge_price,
                     )
                     await self._track_order(hedge_resp, acquirer, reason, hedge_side, hedge_qty)
                 except Exception as exc:
                     await log(
                         f"HEDGE_FAIL {deal_id} reason={reason} acq={acquirer} side={hedge_side} "
-                        f"qty={hedge_qty} px={hedge_px:.2f} err={exc}",
+                        f"qty={hedge_qty} px={'MKT' if order_type == 'MARKET' else f'{hedge_px:.2f}'} err={exc}",
                         level="WARN",
                     )
 
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         await log(
-            f"TRADE {deal_id} reason={reason} side={signal_action} tgt={target} qty={target_qty}@{target_px:.2f} "
+            f"TRADE {deal_id} reason={reason} side={signal_action} type={order_type} "
+            f"tgt={target} qty={target_qty}"
+            f"{'@MKT' if order_type == 'MARKET' else f'@{target_px:.2f}'} "
             f"hedge={acquirer}:{hedge_side if hedge_qty > 0 else 'NONE'}:{hedge_qty}"
-            f"{f'@{hedge_px:.2f}' if hedge_qty > 0 and hedge_px is not None else ''} "
+            f"{('@MKT' if order_type == 'MARKET' else f'@{hedge_px:.2f}') if hedge_qty > 0 and hedge_px is not None else ''} "
             f"edge={edge:.3f} p*={p_star:.3f} bid/ask={t_bid:.2f}/{t_ask:.2f} lat={elapsed_ms:.1f}ms "
             f"tgt_id={(tgt_resp or {}).get('order_id')} hedge_id={(hedge_resp or {}).get('order_id')}"
         )
@@ -1254,20 +1276,26 @@ class MergerArbAlphaAsyncBot:
         if qty <= 0:
             return False
         px = self._marketable_limit_price(action, bid, ask)
+        order_type = "MARKET" if USE_MARKET_ORDERS else "LIMIT"
+        order_price = None if order_type == "MARKET" else px
         try:
             resp = await self.client.place_order(
                 ticker=ticker,
                 action=action,
                 quantity=qty,
-                order_type="LIMIT",
-                price=px,
+                order_type=order_type,
+                price=order_price,
             )
             await self._track_order(resp, ticker, reason, action, qty)
-            await log(f"TRADE {deal_id} reason={reason} side={action} single={ticker} qty={qty}@{px:.2f} id={resp.get('order_id')}")
+            await log(
+                f"TRADE {deal_id} reason={reason} side={action} type={order_type} single={ticker} "
+                f"qty={qty}{'@MKT' if order_type == 'MARKET' else f'@{px:.2f}'} id={resp.get('order_id')}"
+            )
             return True
         except Exception as exc:
             await log(
-                f"ORDER_FAIL {deal_id} reason={reason} single={ticker} side={action} qty={qty} px={px:.2f} err={exc}",
+                f"ORDER_FAIL {deal_id} reason={reason} single={ticker} side={action} qty={qty} "
+                f"px={'MKT' if order_type == 'MARKET' else f'{px:.2f}'} err={exc}",
                 level="WARN",
             )
             return False
@@ -1281,6 +1309,8 @@ class MergerArbAlphaAsyncBot:
         a_bid_qty: int,
         a_ask_qty: int,
     ) -> Tuple[int, int]:
+        if not LIQUIDITY_GATING_ENABLED:
+            return target_qty, hedge_qty
         if ratio <= 0 or hedge_qty <= 0 or target_qty <= 0:
             return target_qty, hedge_qty
 
@@ -2208,6 +2238,7 @@ class MergerArbAlphaAsyncBot:
                         "HTTP_POOL_LIMIT": HTTP_POOL_LIMIT,
                         "TRADE_LOOP_SECS": TRADE_LOOP_SECS,
                         "NEWS_POLL_SECS": NEWS_POLL_SECS,
+                        "INFINITE_LIQUIDITY_MODE": INFINITE_LIQUIDITY_MODE,
                         "GROSS_LIMIT": GROSS_LIMIT,
                         "NET_LIMIT": NET_LIMIT,
                         "RISK_BUFFER": RISK_BUFFER,
@@ -2239,7 +2270,11 @@ class MergerArbAlphaAsyncBot:
                         "EXECUTION_MODE": EXECUTION_MODE,
                         "PING_AT_TOUCH": PING_AT_TOUCH,
                         "ENABLE_IOC_EMULATION": ENABLE_IOC_EMULATION,
+                        "USE_MARKET_ORDERS": USE_MARKET_ORDERS,
                         "IOC_CANCEL_SECS": IOC_CANCEL_SECS,
+                        "STALE_CANCEL_CHECK_SECS": STALE_CANCEL_CHECK_SECS,
+                        "ORDER_STATUS_POLL_IDLE_SECS": ORDER_STATUS_POLL_IDLE_SECS,
+                        "LIQUIDITY_GATING_ENABLED": LIQUIDITY_GATING_ENABLED,
                         "MAX_HOLD_SECS": MAX_HOLD_SECS,
                         "USE_FINBERT": USE_FINBERT,
                         "FINBERT_ONNX_MODEL": FINBERT_ONNX_MODEL,
@@ -2269,7 +2304,10 @@ class MergerArbAlphaAsyncBot:
             f"hconv_size_mult={HIGH_CONV_SIZE_MULT:.2f} "
             f"contra_edge_mult={CONTRA_NEWS_EDGE_MULT:.2f} "
             f"hold={MAX_HOLD_SECS:.1f}s exec={EXECUTION_MODE} "
+            f"infinite_liq={'1' if INFINITE_LIQUIDITY_MODE else '0'} "
             f"ping={'1' if PING_AT_TOUCH else '0'} ioc={'1' if ENABLE_IOC_EMULATION else '0'} "
+            f"mkt_orders={'1' if USE_MARKET_ORDERS else '0'} "
+            f"liq_gate={'1' if LIQUIDITY_GATING_ENABLED else '0'} "
             f"finbert={'ON' if self.finbert_enabled else 'OFF'}"
         )
 
